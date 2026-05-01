@@ -276,4 +276,4 @@ Start with `--skill` propagation to test before going all-in.
 1. **Review** the exclusive skills via `gcodex list`
 2. **Decide**: Keep isolated (Option A), consolidate (Option B), or selective (Option C)?
 3. **Act**: Run the appropriate command above
-4. **Document**: Add the choice to team conventions in `skill-triggers.md`
+4. **Document**: Add the choice to team conventions in `docs/skill-triggers.md`
