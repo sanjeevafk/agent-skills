@@ -46,6 +46,25 @@ This repo's scripts manage skills, not rules.
 
 ---
 
+## Included Skills from mattpocock/skills
+
+For reproducibility and as a source of truth, this repo now includes **6 new skills** from [mattpocock/skills](https://github.com/mattpocock/skills):
+
+| Skill | Purpose |
+|-------|---------|
+| **caveman** | Ultra-compressed communication mode (~75% token reduction) |
+| **diagnose** | Disciplined debugging: reproduce → minimize → hypothesize → instrument → fix → test |
+| **grill-with-docs** | Enhanced grilling with domain model & ADR updates |
+| **qa** | Quality assurance workflow management |
+| **setup-matt-pocock-skills** | Configuration setup for mattpocock ecosystem |
+| **zoom-out** | Get broader architectural context on unfamiliar code |
+
+Location: `./skills/mattpocock/`
+
+These are synced to all agent directories (`~/.copilot/skills`, `~/.cursor/skills`, `~/.agents/skills`, etc.) and available immediately.
+
+---
+
 Your helper script is intended to live in Downloads (outside project repos):
 
 - `~/Downloads/global-skills.sh`
