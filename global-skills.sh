@@ -1,36 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Global skill roots across your installed agent environments.
-ROOT_COPILOT="${HOME}/.copilot/skills"
-ROOT_AGENTS="${HOME}/.agents/skills"
-ROOT_CURSOR="${HOME}/.cursor/skills"
-ROOT_ANTIGRAVITY="${HOME}/.gemini/antigravity/skills"
-ROOT_CODEX="${HOME}/.codex/skills"
+CONFIG_FILE="${GLOBAL_SKILLS_CONFIG:-$HOME/.global-skills.conf}"
 
-CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY")
-ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")
+# Defaults (used if config file is missing)
+DEFAULT_ROOT_AGENTS="${HOME}/.agents/skills"
+DEFAULT_ROOT_COPILOT="${HOME}/.copilot/skills"
+DEFAULT_ROOT_CURSOR="${HOME}/.cursor/skills"
+DEFAULT_ROOT_ANTIGRAVITY="${HOME}/.gemini/antigravity/skills"
+DEFAULT_ROOT_CODEX="${HOME}/.codex/skills"
+DEFAULT_BACKUP_BASE_DIR="${HOME}/.skills/backups"
+
+ROOT_AGENTS="$DEFAULT_ROOT_AGENTS"
+ROOT_COPILOT="$DEFAULT_ROOT_COPILOT"
+ROOT_CURSOR="$DEFAULT_ROOT_CURSOR"
+ROOT_ANTIGRAVITY="$DEFAULT_ROOT_ANTIGRAVITY"
+ROOT_CODEX="$DEFAULT_ROOT_CODEX"
+BACKUP_BASE_DIR="$DEFAULT_BACKUP_BASE_DIR"
+
+# Arrays are rebuilt after optional config load.
+CANONICAL_ROOTS=()
+ALL_ROOTS=()
+
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+
+  CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY")
+  ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")
+}
+
+write_default_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    echo "Config already exists: $CONFIG_FILE"
+    return 0
+  fi
+
+  cat > "$CONFIG_FILE" <<CFG_EOF
+# global-skills configuration
+# Edit these paths to match your installed agent environments.
+
+ROOT_AGENTS="${DEFAULT_ROOT_AGENTS}"
+ROOT_COPILOT="${DEFAULT_ROOT_COPILOT}"
+ROOT_CURSOR="${DEFAULT_ROOT_CURSOR}"
+ROOT_ANTIGRAVITY="${DEFAULT_ROOT_ANTIGRAVITY}"
+ROOT_CODEX="${DEFAULT_ROOT_CODEX}"
+
+# Backup base directory used by: global-skills backup
+BACKUP_BASE_DIR="${DEFAULT_BACKUP_BASE_DIR}"
+CFG_EOF
+
+  echo "Created default config: $CONFIG_FILE"
+}
 
 usage() {
-  cat <<'EOF'
+  cat <<USAGE_EOF
 Usage:
-  global-skills.sh backup [backup_dir]
-  global-skills.sh add <owner/repo> [--skill <name> ...]
-  global-skills.sh sync
-  global-skills.sh status
+  global-skills backup [backup_dir]
+  global-skills add <owner/repo> [--skill <name> ...]
+  global-skills sync
+  global-skills status
+  global-skills init-config
+
+Config:
+  Uses: $CONFIG_FILE
+  Override file path with: GLOBAL_SKILLS_CONFIG=/path/to/file
 
 Examples:
-  global-skills.sh backup
-  global-skills.sh add mattpocock/skills
-  global-skills.sh add obra/superpowers --skill systematic-debugging
-  global-skills.sh sync
+  global-skills init-config
+  global-skills backup
+  global-skills add mattpocock/skills
+  global-skills add obra/superpowers --skill systematic-debugging
+  global-skills sync
 
 What each command does:
-  backup  Creates tar.gz backups for each global skill root + a manifest.
-  add     Runs Skills CLI install globally, then syncs skills to all roots.
-  sync    Copies all discovered SKILL.md-based skills to all roots.
-  status  Prints skill counts per root and missing-in-codex summary.
-EOF
+  backup       Creates tar.gz backups for each global skill root + a manifest.
+  add          Runs Skills CLI install globally, then syncs skills to all roots.
+  sync         Copies all discovered SKILL.md-based skills to all roots.
+  status       Prints skill counts per root and missing-in-codex summary.
+  init-config  Creates $CONFIG_FILE with editable default root paths.
+USAGE_EOF
 }
 
 ensure_roots() {
@@ -102,7 +153,7 @@ backup_all() {
   if [ "${1:-}" != "" ]; then
     backup_dir="$1"
   else
-    backup_dir="${HOME}/.skills/backups/skills-$(date +%Y%m%d-%H%M%S)"
+    backup_dir="${BACKUP_BASE_DIR}/skills-$(date +%Y%m%d-%H%M%S)"
   fi
 
   mkdir -p "$backup_dir"
@@ -111,6 +162,7 @@ backup_all() {
   {
     echo "Global skills backup"
     echo "Created: $(date -Iseconds)"
+    echo "Config: $CONFIG_FILE"
     echo
   } > "$backup_dir/manifest.txt"
 
@@ -130,6 +182,7 @@ status() {
   ensure_roots
 
   local root count
+  echo "Using config: $CONFIG_FILE"
   for root in "${ALL_ROOTS[@]}"; do
     count="$(find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
     echo "$root: $count entries"
@@ -144,6 +197,8 @@ status() {
 
   echo "Missing SKILL.md entries in Codex vs canonical roots: $missing"
 }
+
+load_config
 
 cmd="${1:-}"
 case "$cmd" in
@@ -170,6 +225,9 @@ case "$cmd" in
     ;;
   status)
     status
+    ;;
+  init-config)
+    write_default_config
     ;;
   *)
     usage

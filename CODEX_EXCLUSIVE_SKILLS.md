@@ -69,17 +69,17 @@ This separation may be intentional because:
 
 ```bash
 # Make the script executable
-chmod +x ~/Downloads/agent-skills/codex-exclusive-skills.sh
+chmod +x <repo-root>/codex-exclusive-skills.sh
 
 # Add to .bashrc for convenience
-echo "alias gcodex='~/Downloads/agent-skills/codex-exclusive-skills.sh'" >> ~/.bashrc
+echo "alias gcodex='<repo-root>/codex-exclusive-skills.sh'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ### See all Codex-exclusive skills with descriptions
 
 ```bash
-~/Downloads/agent-skills/codex-exclusive-skills.sh list
+<repo-root>/codex-exclusive-skills.sh list
 # or via alias:
 gcodex list
 ```
@@ -87,7 +87,7 @@ gcodex list
 ### Propagate ALL Codex-exclusive skills to canonical roots
 
 ```bash
-~/Downloads/agent-skills/codex-exclusive-skills.sh propagate
+<repo-root>/codex-exclusive-skills.sh propagate
 ```
 
 After this runs:
@@ -177,7 +177,7 @@ gcodex list
 gcodex propagate --skill security-threat-model
 
 # Run normal sync to keep canonical in sync:
-~/Downloads/global-skills.sh sync
+global-skills sync
 ```
 
 ---
@@ -189,7 +189,7 @@ After running `gcodex propagate`, the skills are in all canonical roots. To keep
 ```bash
 # Modify global-skills.sh to include Codex in canonical discovery:
 sed -i 's/CANONICAL_ROOTS=(.*$/CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")/' \
-  ~/Downloads/global-skills.sh
+  global-skills
 ```
 
 Or manually edit `~/.../agent-skills/global-skills.sh` line 11.
@@ -208,7 +208,7 @@ echo "Cursor: $(ls ~/.cursor/skills | wc -l)"
 echo "Antigravity: $(ls ~/.gemini/antigravity/skills | wc -l)"
 echo "Codex: $(ls ~/.codex/skills | wc -l)"
 echo ""
-echo "Exclusive to Codex: $(~/Downloads/agent-skills/codex-exclusive-skills.sh list | grep '[a-z]' | wc -l)"
+echo "Exclusive to Codex: $(<repo-root>/codex-exclusive-skills.sh list | grep '[a-z]' | wc -l)"
 ```
 
 ---
@@ -221,16 +221,16 @@ A: By design—it allows Codex to be a test channel for new/experimental skills 
 
 ### Q: If I propagate a skill, does `global-skills.sh sync` keep it synced?
 
-A: **Only if** you add `$ROOT_CODEX` to `CANONICAL_ROOTS` in `global-skills.sh`. Otherwise, propagated skills stay static.
+A: **Only if** the operator add `$ROOT_CODEX` to `CANONICAL_ROOTS` in `global-skills.sh`. Otherwise, propagated skills stay static.
 
 ### Q: Can I undo a propagate?
 
 A: Yes, manually delete from other roots or restore from backup:
 ```bash
-~/Downloads/global-skills.sh backup  # create backup first
+global-skills backup  # create backup first
 # ...later...
-tar -xzf ~/.skills/backups/<snapshot>/home_sanjeev_.agents_skills.tar.gz -C /
-~/Downloads/global-skills.sh sync
+tar -xzf ~/.skills/backups/<snapshot><root-archive>.tar.gz -C /
+global-skills sync
 ```
 
 ### Q: What if a Codex-exclusive skill gets overwritten when I sync with global-skills.sh?
@@ -254,19 +254,19 @@ Start with `--skill` propagation to test before going all-in.
 
 ```bash
 # List descriptions of all Codex-exclusive skills
-~/Downloads/agent-skills/codex-exclusive-skills.sh list
+<repo-root>/codex-exclusive-skills.sh list
 
 # Propagate all Codex-exclusive skills to canonical roots
-~/Downloads/agent-skills/codex-exclusive-skills.sh propagate
+<repo-root>/codex-exclusive-skills.sh propagate
 
 # Propagate specific skills only
-~/Downloads/agent-skills/codex-exclusive-skills.sh propagate --skill cloudflare-deploy --skill security-threat-model
+<repo-root>/codex-exclusive-skills.sh propagate --skill cloudflare-deploy --skill security-threat-model
 
 # Remove skills from Codex
-~/Downloads/agent-skills/codex-exclusive-skills.sh remove-from-codex gh-fix-ci yeet
+<repo-root>/codex-exclusive-skills.sh remove-from-codex gh-fix-ci yeet
 
 # Compare skill distribution
-~/Downloads/agent-skills/codex-exclusive-skills.sh compare
+<repo-root>/codex-exclusive-skills.sh compare
 ```
 
 ---
@@ -276,4 +276,4 @@ Start with `--skill` propagation to test before going all-in.
 1. **Review** the exclusive skills via `gcodex list`
 2. **Decide**: Keep isolated (Option A), consolidate (Option B), or selective (Option C)?
 3. **Act**: Run the appropriate command above
-4. **Document**: Add your choice to team conventions in `skill-triggers.md`
+4. **Document**: Add the choice to team conventions in `skill-triggers.md`

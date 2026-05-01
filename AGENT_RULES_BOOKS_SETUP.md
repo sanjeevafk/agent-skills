@@ -43,8 +43,8 @@ Agent rules books are **reference documentation** that guide agents in making ar
 ### One-time install to canonical root
 
 ```bash
-chmod +x ~/Downloads/agent-skills/install-rules-books.sh
-~/Downloads/agent-skills/install-rules-books.sh install
+chmod +x <repo-root>/install-rules-books.sh
+<repo-root>/install-rules-books.sh install
 ```
 
 This downloads agent-rules-books from GitHub to `~/.agents/agent-rules-books/`.
@@ -52,7 +52,7 @@ This downloads agent-rules-books from GitHub to `~/.agents/agent-rules-books/`.
 ### Install and sync to all agent environments
 
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh install --sync
+<repo-root>/install-rules-books.sh install --sync
 ```
 
 Installs rules to:
@@ -65,7 +65,7 @@ Installs rules to:
 ### Sync existing rules to other agents (after update)
 
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh sync
+<repo-root>/install-rules-books.sh sync
 ```
 
 ---
@@ -135,7 +135,7 @@ Checklist:
 
 ### In Agents' Context/Instructions
 
-When you install rules, they become available as **reference context**. Agents can:
+When the operator install rules, they become available as **reference context**. Agents can:
 
 1. **Be configured** to load rules into their instruction context:
    ```bash
@@ -161,13 +161,13 @@ Unlike skills (which are executable and need syncing with `global-skills.sh`), r
 
 **Use this for managing rules:**
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh install --sync
+<repo-root>/install-rules-books.sh install --sync
 ```
 
 **Use this for managing skills:**
 ```bash
-~/Downloads/agent-skills/global-skills.sh add mattpocock/skills
-~/Downloads/agent-skills/global-skills.sh sync
+<repo-root>/global-skills.sh add mattpocock/skills
+<repo-root>/global-skills.sh sync
 ```
 
 ---
@@ -177,24 +177,24 @@ Unlike skills (which are executable and need syncing with `global-skills.sh`), r
 ### Are rules installed?
 
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh status
+<repo-root>/install-rules-books.sh status
 ```
 
 Output:
 ```
 === agent-rules-books Installation Status ===
 
-✓ /home/sanjeev/.agents/agent-rules-books (13 rules)
-✓ /home/sanjeev/.copilot/agent-rules-books (13 rules)
-✓ /home/sanjeev/.cursor/agent-rules-books (13 rules)
-✓ /home/sanjeev/.gemini/antigravity/agent-rules-books (13 rules)
-✓ /home/sanjeev/.codex/agent-rules-books (13 rules)
+✓ $HOME/.agents/agent-rules-books (13 rules)
+✓ $HOME/.copilot/agent-rules-books (13 rules)
+✓ $HOME/.cursor/agent-rules-books (13 rules)
+✓ $HOME/.gemini/antigravity/agent-rules-books (13 rules)
+✓ $HOME/.codex/agent-rules-books (13 rules)
 ```
 
 ### List available rules
 
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh list
+<repo-root>/install-rules-books.sh list
 ```
 
 ---
@@ -253,7 +253,7 @@ Before refactoring, consult "refactoring" rules:
 
 ## Updating Rules
 
-Rules are tracked in git (if you installed with the script). To get the latest:
+Rules are tracked in git (if the operator installed with the script). To get the latest:
 
 ```bash
 # Manual update (if installed directly)
@@ -261,7 +261,7 @@ cd ~/.agents/agent-rules-books
 git pull origin main
 
 # Re-sync to other agents
-~/Downloads/agent-skills/install-rules-books.sh sync
+<repo-root>/install-rules-books.sh sync
 ```
 
 ---
@@ -278,7 +278,7 @@ cat > ~/.agents/agent-rules-books/my-team-practices.md << 'EOF'
 # My Team Practices
 
 ## When to use
-[your guidance here]
+[the guidance here]
 
 ## Decision rules
 - rule 1
@@ -292,7 +292,7 @@ cat > ~/.agents/agent-rules-books/my-team-practices.md << 'EOF'
 EOF
 
 # Sync to other agents
-~/Downloads/agent-skills/install-rules-books.sh sync
+<repo-root>/install-rules-books.sh sync
 ```
 
 ---
@@ -318,7 +318,7 @@ rm -rf ~/.cursor/agent-rules-books
 
 Then re-sync if needed:
 ```bash
-~/Downloads/agent-skills/install-rules-books.sh sync
+<repo-root>/install-rules-books.sh sync
 ```
 
 ---
@@ -327,19 +327,19 @@ Then re-sync if needed:
 
 ```bash
 # Install to canonical root only
-~/Downloads/agent-skills/install-rules-books.sh install
+<repo-root>/install-rules-books.sh install
 
 # Install and sync to all agents
-~/Downloads/agent-skills/install-rules-books.sh install --sync
+<repo-root>/install-rules-books.sh install --sync
 
 # Sync existing rules to all agents (after updates)
-~/Downloads/agent-skills/install-rules-books.sh sync
+<repo-root>/install-rules-books.sh sync
 
 # Check installation status
-~/Downloads/agent-skills/install-rules-books.sh status
+<repo-root>/install-rules-books.sh status
 
 # List all available rules
-~/Downloads/agent-skills/install-rules-books.sh list
+<repo-root>/install-rules-books.sh list
 ```
 
 ---
@@ -348,13 +348,13 @@ Then re-sync if needed:
 
 ```bash
 # 1. Install and sync
-~/Downloads/agent-skills/install-rules-books.sh install --sync
+<repo-root>/install-rules-books.sh install --sync
 
 # 2. Verify
-~/Downloads/agent-skills/install-rules-books.sh status
+<repo-root>/install-rules-books.sh status
 
 # 3. List available
-~/Downloads/agent-skills/install-rules-books.sh list
+<repo-root>/install-rules-books.sh list
 
 # 4. Use in prompts (reference specific rules when asking agents for decisions)
 ```
@@ -368,4 +368,4 @@ Use "clean-code" and "code-complete" rules to review this function for:
 - Defensive programming
 ```
 
-The agent will consult those rules and apply them to your code.
+The agent will consult those rules and apply them to the codebase.
