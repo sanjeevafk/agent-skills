@@ -67,7 +67,7 @@ show_descriptions() {
   echo ""
   list_codex_exclusive | nl
   echo ""
-  echo "For details on each skill, see CODEX_EXCLUSIVE_SKILLS.md or run:"
+  echo "For details on each skill, see docs/CODEX_EXCLUSIVE_SKILLS.md or run:"
   echo "  ~/Downloads/agent-skills/codex-exclusive-skills.sh compare"
 }
 
