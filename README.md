@@ -13,6 +13,7 @@ It does NOT store skills—it manages them across these locations:
 ### What This Repo Contains
 - `global-skills.sh` — Sync, install, backup, and monitor skills across agents
 - `codex-exclusive-skills.sh` — Manage the 14 Codex-only skills
+- `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template for any repo
 - `skill-triggers.md` — Reference for prompting skills
 - Documentation and scripts only (not the skills themselves)
 
@@ -100,6 +101,12 @@ tirith explain --rule pipe_to_interpreter
 
 ### Full Documentation
 See `TIRITH_SETUP.md` in this repo for deployment details, agent integration paths, policy configuration, and troubleshooting.
+
+### Portable System-Security Setup Template
+For reproducible project+system monitoring scaffolding, use:
+
+- `scripts/security/system/setup-system-monitoring.sh`
+- `SYSTEM_SECURITY_SETUP.md`
 
 ---
 
