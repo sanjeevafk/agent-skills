@@ -73,7 +73,7 @@ chmod +x <repo-root>/codex-exclusive-skills.sh
 
 # Add to .bashrc for convenience
 echo "alias gcodex='<repo-root>/codex-exclusive-skills.sh'" >> ~/.bashrc
-source ~/.bashrc
+exec "$SHELL"  # or reload shell config
 ```
 
 ### See all Codex-exclusive skills with descriptions

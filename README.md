@@ -227,7 +227,7 @@ Add this once to `~/.bashrc`:
 
 ```bash
 echo "alias gskills='global-skills'" >> ~/.bashrc
-source ~/.bashrc
+exec "$SHELL"  # or reload shell config
 ```
 
 Then use:
