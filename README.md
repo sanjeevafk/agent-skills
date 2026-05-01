@@ -1,8 +1,7 @@
 # Agent Skills Toolkit
 
-[![GitHub stars](https://img.shields.io/github/stars/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/stargazers)
 [![License](https://img.shields.io/github/license/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/blob/main/LICENSE)
-[![Last commit](https://img.shields.io/github/last-commit/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/commits/main)
+![Agentic Engineering](https://img.shields.io/badge/Agentic-Engineering-1F8A70?style=flat-square)
 
 Manage and sync skills across multiple AI agent environments from one source of truth.
 
