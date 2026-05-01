@@ -1,8 +1,8 @@
 # Global Skills Setup Guide
 
-This guide explains how to use your global multi-agent skills setup.
+**This is a management CLI tool for syncing skills across multiple agent environments.**
 
-It works across these agent environments:
+It does NOT store skills—it manages them across these locations:
 
 - `~/.agents/skills`
 - `~/.copilot/skills`
@@ -10,7 +10,41 @@ It works across these agent environments:
 - `~/.gemini/antigravity/skills`
 - `~/.codex/skills`
 
-## 1) Script Location
+### What This Repo Contains
+- `global-skills.sh` — Sync, install, backup, and monitor skills across agents
+- `codex-exclusive-skills.sh` — Manage the 14 Codex-only skills
+- `skill-triggers.md` — Reference for prompting skills
+- Documentation and scripts only (not the skills themselves)
+
+### What Skills Come From
+Skills are fetched from external sources via the `add` command:
+```bash
+~/Downloads/global-skills.sh add mattpocock/skills        # Installs from GitHub
+~/Downloads/global-skills.sh add ciembor/agent-rules-books # Installs from GitHub
+```
+
+Once installed, they live in the `~/.*/skills/` directories and this repo's scripts keep them in sync.
+
+---
+
+## About agent-rules-books
+
+`agent-rules-books` (https://github.com/ciembor/agent-rules-books) is a separate collection of **engineering guidelines and decision rules** for agents (Clean Code, DDD, etc.). It is **not a skills package**—it's policy/reference documentation.
+
+When installed:
+```bash
+~/Downloads/global-skills.sh add ciembor/agent-rules-books
+```
+
+It places rule files in `~/.agents/agent-rules-books/` (reference docs like `clean-code.md`, `ddd.md`, etc.), not executable skills. These files provide context and governance for how agents should approach tasks.
+
+**Key distinction**: 
+- **Skills** (gsd-execute-phase, cloudflare-deploy, etc.) = executable implementations, stored in `~/.agents/skills/` + `~/.copilot/skills/` + etc.
+- **Rules** (agent-rules-books) = guidelines and policies, stored in `~/.agents/agent-rules-books/`
+
+This repo's scripts manage skills, not rules.
+
+---
 
 Your helper script is intended to live in Downloads (outside project repos):
 
