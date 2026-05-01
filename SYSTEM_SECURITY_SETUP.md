@@ -1,6 +1,6 @@
 # System Security Setup (Portable Template)
 
-This repo includes a portable system-security setup script:
+This repository includes a portable system-security setup script:
 
 - `scripts/security/system/setup-system-monitoring.sh`
 

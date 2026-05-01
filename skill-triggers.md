@@ -98,7 +98,7 @@ Use explicit wording. This is the most reliable pattern:
 
 ```text
 Use the <skill-name> skill for this task.
-Task: <what you want>.
+Task: <what the operator want>.
 Output: <expected format>.
 Constraints: <important rules>.
 ```

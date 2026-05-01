@@ -1,9 +1,9 @@
 # Tirith Terminal Security Setup
 
-**Installation Date:** 1 May 2026  
+**Installation Date:** <set-by-deployment>
 **Version:** 0.3.0  
 **Source:** https://github.com/sheeki03/tirith  
-**Status:** ✅ Operational
+**Status:** Deployment-specific
 
 ## Overview
 
@@ -133,9 +133,9 @@ tirith explain --list --category terminal
 tirith explain --list --category config
 ```
 
-### Policy Management (Per-Repo)
+### Policy Management (Per-Repository)
 ```bash
-# Initialize a policy for this repo
+# Initialize a policy for this repository
 tirith policy init
 # Creates: .tirith/policy.yaml
 
@@ -209,7 +209,7 @@ tirith warnings
 
 ## Integration with Your Stack
 
-This complements your wider agent infrastructure:
+This complements the wider agent infrastructure:
 
 | Component | Purpose | Deployment |
 |-----------|---------|------------|
@@ -233,7 +233,7 @@ Together: **Rules guide thinking** → **Skills organize work** → **Tirith gua
 ```
 
 ### Recovery Docs
-- Full setup guide: `/home/sanjeev/TIRITH_INSTALLATION_COMPLETE.md`
+- Full setup guide: `$HOME/TIRITH_INSTALLATION_COMPLETE.md`
 - Extended reference: `~/.local/share/tirith/TIRITH_SETUP.md`
 - Official docs: https://tirith.sh/docs
 
@@ -283,7 +283,7 @@ tirith mcp-server &
 
 1. **Open new terminal** — Activates hooks (zsh/bash)
 2. **Test it works** — `tirith check -- "curl | bash"`
-3. **Scan your configs** — `tirith scan ~/.cursorrules`
+3. **Scan the configs** — `tirith scan ~/.cursorrules`
 4. **Set policy** (optional) — `tirith policy init` for per-repo rules
 
 ---

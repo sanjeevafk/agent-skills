@@ -21,7 +21,7 @@ From **22 available skills** in mattpocock/skills, **6 new ones were selected** 
 
 ### Skipped (Already Installed)
 
-These 16 mattpocock skills were already in your environment:
+These 16 mattpocock skills were already in the environment:
 - `grill-me` (have grill-with-docs + enhanced version)
 - `tdd` (have test-driven-development)
 - `improve-codebase-architecture` (have exact skill)

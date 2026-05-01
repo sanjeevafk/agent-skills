@@ -10,21 +10,21 @@ It does NOT store skills—it manages them across these locations:
 - `~/.gemini/antigravity/skills`
 - `~/.codex/skills`
 
-### What This Repo Contains
+### What This Repository Contains
 - `global-skills.sh` — Sync, install, backup, and monitor skills across agents
 - `codex-exclusive-skills.sh` — Manage the 14 Codex-only skills
-- `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template for any repo
+- `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template for any repository
 - `skill-triggers.md` — Reference for prompting skills
 - Documentation and scripts only (not the skills themselves)
 
 ### What Skills Come From
 Skills are fetched from external sources via the `add` command:
 ```bash
-~/Downloads/global-skills.sh add mattpocock/skills        # Installs from GitHub
-~/Downloads/global-skills.sh add ciembor/agent-rules-books # Installs from GitHub
+global-skills add mattpocock/skills        # Installs from GitHub
+global-skills add ciembor/agent-rules-books # Installs from GitHub
 ```
 
-Once installed, they live in the `~/.*/skills/` directories and this repo's scripts keep them in sync.
+Once installed, they live in the `~/.*/skills/` directories and this repository's scripts keep them in sync.
 
 ---
 
@@ -34,7 +34,7 @@ Once installed, they live in the `~/.*/skills/` directories and this repo's scri
 
 When installed:
 ```bash
-~/Downloads/global-skills.sh add ciembor/agent-rules-books
+global-skills add ciembor/agent-rules-books
 ```
 
 It places rule files in `~/.agents/agent-rules-books/` (reference docs like `clean-code.md`, `ddd.md`, etc.), not executable skills. These files provide context and governance for how agents should approach tasks.
@@ -43,13 +43,13 @@ It places rule files in `~/.agents/agent-rules-books/` (reference docs like `cle
 - **Skills** (gsd-execute-phase, cloudflare-deploy, etc.) = executable implementations, stored in `~/.agents/skills/` + `~/.copilot/skills/` + etc.
 - **Rules** (agent-rules-books) = guidelines and policies, stored in `~/.agents/agent-rules-books/`
 
-This repo's scripts manage skills, not rules.
+This repository's scripts manage skills, not rules.
 
 ---
 
 ## Included Skills from mattpocock/skills
 
-For reproducibility and as a source of truth, this repo now includes **6 new skills** from [mattpocock/skills](https://github.com/mattpocock/skills):
+For reproducibility and as a source of truth, this repository now includes **6 new skills** from [mattpocock/skills](https://github.com/mattpocock/skills):
 
 | Skill | Purpose |
 |-------|---------|
@@ -100,7 +100,7 @@ tirith explain --rule pipe_to_interpreter
 ```
 
 ### Full Documentation
-See `TIRITH_SETUP.md` in this repo for deployment details, agent integration paths, policy configuration, and troubleshooting.
+See `TIRITH_SETUP.md` in this repository for deployment details, agent integration paths, policy configuration, and troubleshooting.
 
 ### Portable System-Security Setup Template
 For reproducible project+system monitoring scaffolding, use:
@@ -110,41 +110,56 @@ For reproducible project+system monitoring scaffolding, use:
 
 ---
 
-Your helper script is intended to live in Downloads (outside project repos):
+Install once to a PATH directory using:
 
-- `~/Downloads/global-skills.sh`
+```bash
+./install-global-skills.sh
+```
 
-This keeps your project clean and gives you one reusable command for any repo.
+This installs `global-skills` into `~/.local/bin`, creates `~/.global-skills.conf`, and configures alias/path lines in shell rc files.
 
 ## 2) What The Script Does
 
-`global-skills.sh` supports four commands:
+`global-skills` supports five commands:
 
 - `backup`: Creates compressed backups of all global skill roots.
 - `add`: Installs a new skill repo with `npx skills add` and syncs to all roots.
 - `sync`: Syncs all discovered `SKILL.md` skills to all roots.
 - `status`: Shows skill counts per root and Codex gap status.
+- `init-config`: Creates `~/.global-skills.conf` with editable root paths.
+
+## Config File
+
+Global root paths are loaded from:
+
+- `~/.global-skills.conf`
+
+It is possible to override the config location per command:
+
+```bash
+GLOBAL_SKILLS_CONFIG=/path/to/custom.conf global-skills status
+```
 
 ## 3) Basic Usage
 
 Run from anywhere:
 
 ```bash
-~/Downloads/global-skills.sh status
-~/Downloads/global-skills.sh backup
-~/Downloads/global-skills.sh sync
+global-skills status
+global-skills backup
+global-skills sync
 ```
 
 Install a full skill repo globally:
 
 ```bash
-~/Downloads/global-skills.sh add mattpocock/skills
+global-skills add mattpocock/skills
 ```
 
 Install a specific skill from a repo:
 
 ```bash
-~/Downloads/global-skills.sh add obra/superpowers --skill systematic-debugging
+global-skills add obra/superpowers --skill systematic-debugging
 ```
 
 ## 4) Backup and Restore
@@ -152,7 +167,7 @@ Install a specific skill from a repo:
 ### Create backup (default path)
 
 ```bash
-~/Downloads/global-skills.sh backup
+global-skills backup
 ```
 
 Default backup path format:
@@ -167,7 +182,7 @@ Each backup contains:
 ### Create backup in custom folder
 
 ```bash
-~/Downloads/global-skills.sh backup ~/.skills/backups/manual-snapshot
+global-skills backup ~/.skills/backups/manual-snapshot
 ```
 
 ### Restore from backup (manual)
@@ -177,13 +192,13 @@ Example (restore one root archive):
 ```bash
 mkdir -p ~/.agents
 
-tar -xzf ~/.skills/backups/<snapshot>/home_sanjeev_.agents_skills.tar.gz -C /
+tar -xzf ~/.skills/backups/<snapshot><root-archive>.tar.gz -C /
 ```
 
 Then run sync:
 
 ```bash
-~/Downloads/global-skills.sh sync
+global-skills sync
 ```
 
 ## 5) Recommended Workflow When You Discover a New Skill
@@ -191,19 +206,19 @@ Then run sync:
 1. Install it:
 
 ```bash
-~/Downloads/global-skills.sh add <owner/repo> [--skill <name>]
+global-skills add <owner/repo> [--skill <name>]
 ```
 
 2. Verify:
 
 ```bash
-~/Downloads/global-skills.sh status
+global-skills status
 ```
 
 3. Optional safety snapshot:
 
 ```bash
-~/Downloads/global-skills.sh backup
+global-skills backup
 ```
 
 ## 6) Optional Alias (Short Command)
@@ -211,7 +226,7 @@ Then run sync:
 Add this once to `~/.bashrc`:
 
 ```bash
-echo "alias gskills='~/Downloads/global-skills.sh'" >> ~/.bashrc
+echo "alias gskills='global-skills'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -231,8 +246,8 @@ gskills status
 Run:
 
 ```bash
-~/Downloads/global-skills.sh sync
-~/Downloads/global-skills.sh status
+global-skills sync
+global-skills status
 ```
 
 Then restart the IDE/session.
@@ -246,7 +261,7 @@ Then restart the IDE/session.
 If not `0`, run:
 
 ```bash
-~/Downloads/global-skills.sh sync
+global-skills sync
 ```
 
 ### `npx skills add` fails
