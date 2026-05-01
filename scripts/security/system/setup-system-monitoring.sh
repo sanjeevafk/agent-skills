@@ -42,6 +42,13 @@ NORMAL = p+i+n+u+g+s+m+c+sha256
 @@{PROJECT_ROOT}/package-lock.json NORMAL
 @@{PROJECT_ROOT}/yarn.lock NORMAL
 @@{PROJECT_ROOT}/pnpm-lock.yaml NORMAL
+@@{PROJECT_ROOT}/requirements.txt NORMAL
+@@{PROJECT_ROOT}/requirements-dev.txt NORMAL
+@@{PROJECT_ROOT}/requirements-prod.txt NORMAL
+@@{PROJECT_ROOT}/pyproject.toml NORMAL
+@@{PROJECT_ROOT}/poetry.lock NORMAL
+@@{PROJECT_ROOT}/Pipfile NORMAL
+@@{PROJECT_ROOT}/Pipfile.lock NORMAL
 @@{PROJECT_ROOT}/app/ NORMAL
 @@{PROJECT_ROOT}/lib/ NORMAL
 @@{PROJECT_ROOT}/scripts/ NORMAL
@@ -57,7 +64,12 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 INTEGRITY_DIR="$PROJECT_ROOT/.security/project/hashes"
 mkdir -p "$INTEGRITY_DIR"
-FILES=(package.json package-lock.json yarn.lock pnpm-lock.yaml config/env.ts)
+FILES=(
+  package.json package-lock.json yarn.lock pnpm-lock.yaml
+  requirements.txt requirements-dev.txt requirements-prod.txt
+  pyproject.toml poetry.lock Pipfile Pipfile.lock
+  config/env.ts
+)
 
 if [ "${1:-}" = "init" ]; then
   for f in "${FILES[@]}"; do
@@ -134,7 +146,7 @@ PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 BACKUP="$PROJECT_ROOT/.git/hooks/pre-commit.security.backup"
 EXIT_CODE=0
 [ -f "$BACKUP" ] && bash "$BACKUP" || true
-if git diff --cached --name-only | grep -Eq '(^|/)package.json$|(^|/)package-lock.json$|(^|/)yarn.lock$|(^|/)pnpm-lock.yaml$'; then
+if git diff --cached --name-only | grep -Eq '(^|/)package.json$|(^|/)package-lock.json$|(^|/)yarn.lock$|(^|/)pnpm-lock.yaml$|(^|/)requirements.*\.txt$|(^|/)pyproject.toml$|(^|/)poetry.lock$|(^|/)Pipfile$|(^|/)Pipfile.lock$'; then
   echo "agent-skills supply-chain security check"
   bash "$PROJECT_ROOT/scripts/security/supply-chain-check.sh" || EXIT_CODE=$?
 fi

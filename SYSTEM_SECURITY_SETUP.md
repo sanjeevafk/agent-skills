@@ -7,6 +7,7 @@ This repo includes a portable system-security setup script:
 ## Purpose
 
 Generate reproducible security monitoring assets for any target project while keeping machine-specific runtime state out of git.
+Supports both Node and Python dependency manifests for integrity and change-trigger coverage.
 
 ## Run
 
@@ -32,6 +33,10 @@ bash /path/to/agent-skills/scripts/security/system/setup-system-monitoring.sh /a
 - `scripts/security/project/check-integrity.sh`
 - `scripts/security/project/monitor-processes.sh`
 - `.git/hooks/pre-commit` (chains existing hook, non-destructive)
+
+Dependency-change trigger in pre-commit covers:
+- Node: `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`
+- Python: `requirements*.txt`, `pyproject.toml`, `poetry.lock`, `Pipfile`, `Pipfile.lock`
 
 ## Cron Recommendation
 
