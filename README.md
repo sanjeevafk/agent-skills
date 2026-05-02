@@ -19,7 +19,7 @@ Compared to raw `npx skills add`, desktop apps, or manual copying:
 ## Installation (One-Liner)
 
 ```bash
-git clone https://github.com/sanjeevafk/agent-skills.git && cd agent-skills && ./install-global-skills.sh
+git clone https://github.com/sanjeevafk/agent-skills.git && cd agent-skills && ./scripts/install-global-skills.sh
 ```
 
 After opening a new shell:
@@ -32,9 +32,9 @@ gskills status
 
 ## What This Repository Contains
 
-- `global-skills.sh` — Sync, install, backup, and monitor skills across agents
-- `install-global-skills.sh` — Installer for PATH-based setup + config bootstrapping
-- `codex-exclusive-skills.sh` — Manage Codex-only skills and optionally propagate
+- `scripts/global-skills.sh` — Sync, install, backup, and monitor skills across agents
+- `scripts/install-global-skills.sh` — Installer for PATH-based setup + config bootstrapping
+- `scripts/codex-exclusive-skills.sh` — Manage Codex-only skills and optionally propagate
 - `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template
 - `docs/skill-triggers.md` — Reference for prompting skills
 - `docs/` — Setup and operational documentation
@@ -101,6 +101,8 @@ Location: `./skills/mattpocock/`
 
 ## Related Docs
 
+- `docs/.agent.md` — Contributor guide and workspace governance model
+- `docs/ENGINEERING_PRINCIPLES.md` — Engineering principles and response style standards
 - `docs/AGENT_RULES_BOOKS_SETUP.md`
 - `docs/CODEX_EXCLUSIVE_SKILLS.md`
 - `docs/MATTPOCOCK_SKILLS_SELECTION.md`
@@ -108,7 +110,72 @@ Location: `./skills/mattpocock/`
 - `docs/TIRITH_SETUP.md`
 - `docs/skill-triggers.md`
 
-## Contributing
+## Workspace Governance & Model Harness Framework
+
+This repository **experiments with** a model harness approach — systematic governance and resource management designed to improve non-frontier AI code generation.
+
+### Components
+
+1. **Engineering Principles** (`docs/ENGINEERING_PRINCIPLES.md`)
+   - Lightweight reference (500 tokens vs 35K for full rule books)
+   - File-type-specific loading instead of global pollution
+   - Core philosophy, decision trees, and tech-specific patterns
+
+2. **Contributor Guide** (`docs/.agent.md`)
+   - Quality standards for skill contributions
+   - Response style enforcement (no emojis, clear formatting)  
+   - Skill discovery optimization through precise when-to-use descriptions
+
+3. **Security Harness** (`scripts/security/`, `docs/TIRITH_SETUP.md`)
+   - Pre-deploy vulnerability scanning
+   - Supply chain integrity checks
+   - Code pattern auditing
+
+### Honest Assessment: Partial Implementation
+
+**What the setup accomplishes:**
+
+- Token efficiency: 80-93% reduction in overhead rules (35K → 2K per session)
+- Consistency: Canonical rules enforced across all agents
+- Governance: Clear quality standards and security practices
+- Structure: Reproducible across multiple agent environments (Copilot, Cursor, Claude)
+
+**What's actually unproven:**
+
+- No baseline metrics for code quality (before/after)
+- No A/B testing framework to measure improvement
+- No model-agnostic validation across different LLMs
+- No performance benchmarks (error rates, hallucination patterns)
+- No automated feedback loops to validate harness effectiveness
+- No regression detection if governance changes degrade performance
+
+**Claims we CANNOT make:**
+
+We cannot claim this helps non-frontier models "punch above their weight" without data. The setup has good structure and efficiency, but we lack:
+1. Comparative testing (same task with/without harness)
+2. Baseline measurements (code quality metrics before deployment)
+3. Model variance analysis (does it help Haiku vs Sonnet vs others differently?)
+4. Ablation studies (which components actually matter?)
+
+### What This Actually Is
+
+A **governance and efficiency framework** that:
+- Reduces token waste (proven: 35K → 2K)
+- Establishes clear quality standards (process-level, not outcome-level)
+- Scales across multiple agent contexts (infrastructure win)
+
+**Not yet:** A validated model harness with measured impact on code generation quality.
+
+### To Become a Robust Harness
+
+Would need:
+1. Baseline test suite (measure code quality without harness)
+2. A/B testing framework (same prompts, measure delta)
+3. Model-specific profiling (how does it impact different models?)
+4. Automated metrics (error patterns, hallucination rate, code coverage)
+5. Regression gates (changes must improve or hold metrics)
+
+---
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
