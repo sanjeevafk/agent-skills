@@ -86,10 +86,16 @@ global-skills add obra/superpowers --skill systematic-debugging
 - Use `docs/skill-triggers.md` for repeatable prompt structure
 - Keep periodic backups: `global-skills backup`
 
-## Included Matt Pocock Skills
+## Included Curated Skills
 
-The repository includes these curated skills from [mattpocock/skills](https://github.com/mattpocock/skills):
+The repository includes a highly curated set of specialized skills:
 
+### Engineering & Reliability
+- `google-eng-practices` — Codifies Google's Code Health philosophy for reviewers and authors
+- `nasa-jpl-power-of-ten-python` — Adapts NASA's safety-critical coding rules for Python/FastAPI
+
+### Matt Pocock Skills
+Selected from [mattpocock/skills](https://github.com/mattpocock/skills):
 - `caveman`
 - `diagnose`
 - `grill-with-docs`
@@ -97,7 +103,7 @@ The repository includes these curated skills from [mattpocock/skills](https://gi
 - `setup-matt-pocock-skills`
 - `zoom-out`
 
-Location: `./skills/mattpocock/`
+Location: `./skills/`
 
 ## Related Docs
 
