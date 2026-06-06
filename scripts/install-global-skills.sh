@@ -44,6 +44,15 @@ for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   fi
 done
 
+# Automatically import repository's bundled skills during first installation
+REPO_SKILLS_DIR="$(dirname "$SCRIPT_DIR")/skills"
+if [ -d "$REPO_SKILLS_DIR" ]; then
+  echo
+  echo "Found bundled skills in $REPO_SKILLS_DIR. Importing..."
+  # Run through the installed binary to guarantee config settings are loaded
+  "$TARGET_BIN" import "$REPO_SKILLS_DIR"
+fi
+
 echo
 echo "Installation complete."
 echo "1) Open a new shell (or run: source ~/.bashrc / source ~/.zshrc)"
