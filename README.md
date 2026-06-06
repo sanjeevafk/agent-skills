@@ -18,6 +18,8 @@ Compared to raw `npx skills add`, desktop apps, or manual copying:
 
 ## Installation (One-Liner)
 
+Clone the repository and run the installation script. The installer will copy the `global-skills` utility to your `~/.local/bin`, write a configuration file, add standard aliases/PATH values to your shell config, and **automatically import and sync all curated repository skills** into your agent environments:
+
 ```bash
 git clone https://github.com/sanjeevafk/agent-skills.git && cd agent-skills && ./scripts/install-global-skills.sh
 ```
@@ -32,12 +34,16 @@ gskills status
 
 ## What This Repository Contains
 
-- `scripts/global-skills.sh` — Sync, install, backup, and monitor skills across agents
+- `scripts/global-skills.sh` — Sync, install, backup, monitor, and **export** skills across agents
 - `scripts/install-global-skills.sh` — Installer for PATH-based setup + config bootstrapping
 - `scripts/codex-exclusive-skills.sh` — Manage Codex-only skills and optionally propagate
+- `scripts/export_skills.py` — Compile skills into `.cursorrules`, `.windsurfrules`, or `copilot-instructions.md`
+- `scripts/convert_html_guide.py` — Convert upstream HTML style guides to agent-readable Markdown
 - `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template
+- `.github/workflows/sync-styleguides.yml` — Weekly auto-sync of Google Style Guides from upstream
 - `docs/skill-triggers.md` — Reference for prompting skills
 - `docs/` — Setup and operational documentation
+- `exports/` — Auto-generated client-specific rule files (do not edit manually)
 
 ## Config File
 
@@ -65,6 +71,9 @@ global-skills sync
 global-skills backup
 global-skills add mattpocock/skills
 global-skills add obra/superpowers --skill systematic-debugging
+global-skills export --format all
+global-skills export --format cursor --include google-style-python,google-style-typescript
+global-skills export --format copilot --output-dir ~/my-project
 ```
 
 ## Recommended Skill Combinations
@@ -94,6 +103,18 @@ The repository includes a highly curated set of specialized skills:
 - `google-eng-practices` — Codifies Google's Code Health philosophy for reviewers and authors
 - `nasa-jpl-power-of-ten-python` — Adapts NASA's safety-critical coding rules for Python/FastAPI
 
+### Google Style Guides (Language-Specific)
+- `google-style-common` — Cross-language principles: naming philosophy, comment standards
+- `google-style-python` — Full Python style guide with Review and Writing modes
+- `google-style-typescript` — TypeScript-specific rules (types, enums, visibility, `any` avoidance)
+- `google-style-javascript` — JavaScript rules (ES modules, JSDoc, `const`/`let`, arrow functions)
+- `google-style-go` — Go guide across three layers: rules, best practices, and decisions
+- `google-style-java` — Java guide (2-space indent, K&R braces, Javadoc, import ordering)
+- `google-style-cpp` — C++ guide (no exceptions, smart pointers, naming, header hygiene)
+
+### Type & Architecture
+- `type-architecture-analyzer` — Expert TypeScript type system design and refactoring
+
 ### Matt Pocock Skills
 Selected from [mattpocock/skills](https://github.com/mattpocock/skills):
 - `caveman`
@@ -104,6 +125,49 @@ Selected from [mattpocock/skills](https://github.com/mattpocock/skills):
 - `zoom-out`
 
 Location: `./skills/`
+
+## Exporting Skills to Other Clients
+
+Compile all local skills into formats consumable by Cursor, Copilot, and Windsurf:
+
+```bash
+# Export all formats at once
+global-skills export --format all
+
+# Export only for Cursor, into a specific project
+global-skills export --format cursor --output-dir ~/my-project
+
+# Export a subset of skills
+global-skills export --format copilot --include google-style-python,google-style-typescript,google-eng-practices
+```
+
+Or run the script directly:
+
+```bash
+python3 scripts/export_skills.py --format all --skills-dir ./skills --output-dir ./exports
+python3 scripts/export_skills.py --list   # see all available skills
+```
+
+Output files:
+
+| Format | File |
+|---|---|
+| Cursor | `.cursorrules` |
+| GitHub Copilot | `.github/copilot-instructions.md` |
+| Windsurf | `.windsurfrules` |
+
+## Upstream Style Guide Sync
+
+Google Style Guides in `skills/google-style-*/references/full_guide.md` are kept
+in sync with [google/styleguide](https://github.com/google/styleguide) via a
+weekly GitHub Action (`.github/workflows/sync-styleguides.yml`).
+
+To trigger a manual sync:
+1. Go to **Actions → Sync Google Style Guides → Run workflow**
+2. Optionally specify which guides: `js,ts,cpp,java,go`
+
+The workflow opens a PR with diffs if upstream guides have changed. `quick_reference.md`
+files are **not** auto-updated — manual review is required when core rules change.
 
 ## Related Docs
 
