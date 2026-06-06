@@ -1,6 +1,6 @@
 ---
 description: Lightweight engineering principles reference (optimized for token efficiency)
-applyTo: "/home/sanjeev/agent-skills/**/*.{ts,tsx,js,jsx,py,md}"
+applyTo: "**/*.{ts,tsx,js,jsx,py,md}"
 ---
 
 # Engineering Principles Quick Reference
