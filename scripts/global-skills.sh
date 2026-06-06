@@ -63,6 +63,8 @@ Usage:
   global-skills sync
   global-skills status
   global-skills init-config
+  global-skills export [--format cursor|copilot|windsurf|all] [--include skill1,skill2] [--output-dir DIR]
+  global-skills import [skills_dir]
 
 Config:
   Uses: $CONFIG_FILE
@@ -74,6 +76,10 @@ Examples:
   global-skills add mattpocock/skills
   global-skills add obra/superpowers --skill systematic-debugging
   global-skills sync
+  global-skills export --format all
+  global-skills export --format cursor --include google-style-python,google-style-typescript
+  global-skills export --format copilot --output-dir ~/my-project
+  global-skills import ./skills
 
 What each command does:
   backup       Creates tar.gz backups for each global skill root + a manifest.
@@ -81,6 +87,8 @@ What each command does:
   sync         Copies all discovered SKILL.md-based skills to all roots.
   status       Prints skill counts per root and missing-in-codex summary.
   init-config  Creates $CONFIG_FILE with editable default root paths.
+  export       Compile skills into .cursorrules, copilot-instructions.md, or .windsurfrules.
+  import       Import local skills from a directory (defaults to ./skills) and sync them.
 USAGE_EOF
 }
 
@@ -228,6 +236,80 @@ case "$cmd" in
     ;;
   init-config)
     write_default_config
+    ;;
+  import)
+    shift || true
+    
+    # Locate import source
+    SRC_DIR="${1:-}"
+    if [ -z "$SRC_DIR" ]; then
+      # If run from within repository root, default to ./skills
+      if [ -d "./skills" ]; then
+        SRC_DIR="./skills"
+      else
+        # Fallback to look relative to this script's parent directory
+        SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        if [ -d "$SCRIPT_PARENT/skills" ]; then
+          SRC_DIR="$SCRIPT_PARENT/skills"
+        fi
+      fi
+    fi
+
+    if [ -z "$SRC_DIR" ] || [ ! -d "$SRC_DIR" ]; then
+      echo "Error: Directory not found. Please specify local skills directory."
+      exit 1
+    fi
+
+    # Destination is the first canonical root
+    DEST_ROOT=""
+    for r in "${CANONICAL_ROOTS[@]}"; do
+      if [ -n "$r" ]; then
+        DEST_ROOT="$r"
+        break
+      fi
+    done
+
+    if [ -z "$DEST_ROOT" ]; then
+      echo "Error: No canonical roots defined in configuration."
+      exit 1
+    fi
+
+    echo "Importing skills from $SRC_DIR to $DEST_ROOT..."
+    mkdir -p "$DEST_ROOT"
+
+    count=0
+    for d in "$SRC_DIR"/*; do
+      [ -d "$d" ] || continue
+      [ -f "$d/SKILL.md" ] || continue
+      sname="$(basename "$d")"
+      echo "  -> Importing $sname"
+      rm -rf "$DEST_ROOT/$sname"
+      mkdir -p "$DEST_ROOT/$sname"
+      cp -a "$d/." "$DEST_ROOT/$sname/"
+      count=$((count + 1))
+    done
+
+    echo "Import complete ($count skills imported)."
+    echo "Syncing imported skills across all environments..."
+    sync_all
+    ;;
+  export)
+    shift || true
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    EXPORT_SCRIPT="$SCRIPT_DIR/export_skills.py"
+    if [ ! -f "$EXPORT_SCRIPT" ]; then
+      echo "Error: export_skills.py not found at $EXPORT_SCRIPT"
+      exit 1
+    fi
+    # Default skills dir: the canonical first root that has skills
+    SKILLS_SOURCE=""
+    for root in "${CANONICAL_ROOTS[@]}"; do
+      if [ -d "$root" ]; then
+        SKILLS_SOURCE="$root"
+        break
+      fi
+    done
+    python3 "$EXPORT_SCRIPT" --skills-dir "${SKILLS_SOURCE}" "$@"
     ;;
   *)
     usage
