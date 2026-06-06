@@ -64,18 +64,53 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 INTEGRITY_DIR="$PROJECT_ROOT/.security/project/hashes"
 mkdir -p "$INTEGRITY_DIR"
+
+# Full dependency tree — lockfiles are the actual attack surface
 FILES=(
   package.json package-lock.json yarn.lock pnpm-lock.yaml
   requirements.txt requirements-dev.txt requirements-prod.txt
   pyproject.toml poetry.lock Pipfile Pipfile.lock
+  Gemfile Gemfile.lock go.sum go.mod cargo.lock
   config/env.ts
 )
 
+# ---------------------------------------------------------------------------
+# Signing helpers — prefer minisign > gpg > plain sha256 (fallback)
+# ---------------------------------------------------------------------------
+sign_file() {
+  local src="$1" out="$2"
+  if command -v minisign >/dev/null 2>&1 && [ -f "$HOME/.minisign/minisign.key" ]; then
+    minisign -S -m "$src" -s "$HOME/.minisign/minisign.key" -x "${out}.minisig" -q
+  elif command -v gpg >/dev/null 2>&1; then
+    gpg --batch --yes --detach-sign --armor -o "${out}.asc" "$src"
+  else
+    sha256sum "$src" > "$out"
+  fi
+}
+
+verify_file() {
+  local src="$1" out="$2"
+  if [ -f "${out}.minisig" ] && command -v minisign >/dev/null 2>&1; then
+    minisign -V -m "$src" -x "${out}.minisig" -p "$HOME/.minisign/minisign.pub" -q
+  elif [ -f "${out}.asc" ] && command -v gpg >/dev/null 2>&1; then
+    gpg --batch --verify "${out}.asc" "$src" 2>/dev/null
+  else
+    # Plain sha256 fallback
+    local now old
+    now=$(sha256sum "$src" | awk '{print $1}')
+    old=$(awk '{print $1}' "$out" 2>/dev/null || echo "")
+    [ "$now" = "$old" ]
+  fi
+}
+
 if [ "${1:-}" = "init" ]; then
   for f in "${FILES[@]}"; do
-    [ -f "$PROJECT_ROOT/$f" ] && sha256sum "$PROJECT_ROOT/$f" > "$INTEGRITY_DIR/${f//\//-}.sha256"
+    [ -f "$PROJECT_ROOT/$f" ] || continue
+    out="$INTEGRITY_DIR/${f//\//-}.sha256"
+    sha256sum "$PROJECT_ROOT/$f" > "$out"
+    sign_file "$PROJECT_ROOT/$f" "$out"
   done
-  echo "baseline initialized"
+  echo "baseline initialized ($(ls "$INTEGRITY_DIR" | wc -l) files signed)"
   exit 0
 fi
 
@@ -83,11 +118,17 @@ changed=0
 for f in "${FILES[@]}"; do
   [ -f "$PROJECT_ROOT/$f" ] || continue
   hf="$INTEGRITY_DIR/${f//\//-}.sha256"
-  [ -f "$hf" ] || { echo "no baseline for $f"; continue; }
-  now=$(sha256sum "$PROJECT_ROOT/$f" | awk '{print $1}')
-  old=$(awk '{print $1}' "$hf")
-  if [ "$now" != "$old" ]; then
-    echo "MODIFIED: $f"
+  if [ ! -f "$hf" ] && [ ! -f "${hf}.asc" ] && [ ! -f "${hf}.minisig" ]; then
+    echo "NO BASELINE: $f — run: bash scripts/security/project/check-integrity.sh init"
+    continue
+  fi
+  if ! verify_file "$PROJECT_ROOT/$f" "$hf"; then
+    echo "TAMPERED: $f"
+    # Show a meaningful diff for lockfiles and structured files
+    if command -v diff >/dev/null 2>&1 && [ -f "$hf" ]; then
+      echo "  --- baseline hash    : $(awk '{print $1}' "$hf")"
+      echo "  +++ current hash     : $(sha256sum "$PROJECT_ROOT/$f" | awk '{print $1}')"
+    fi
     changed=$((changed+1))
   fi
 done
@@ -122,12 +163,41 @@ mkdir -p "\$LOG_DIR"
 TS=\$(date '+%Y-%m-%d_%H-%M-%S')
 LOG="\$LOG_DIR/security-\$TS.log"
 {
-  echo "start: \$(date)"
+  echo "=== security scan: \$(date) ==="
   cd "\$PROJECT_ROOT"
-  bash scripts/security/security-check.sh || true
-  bash scripts/security/supply-chain-check.sh || true
+
+  # 1. Tirith — agent runtime: prompt injection, homograph, pipe-to-shell
+  if command -v tirith >/dev/null 2>&1; then
+    echo "--- tirith"
+    tirith scan || true
+  elif command -v npx >/dev/null 2>&1; then
+    echo "--- tirith (npx)"
+    npx --yes @agent-skills/tirith scan || true
+  else
+    echo "WARN: tirith not installed"
+  fi
+
+  # 2. Gitleaks — secret & credential detection (highest ROI)
+  if command -v gitleaks >/dev/null 2>&1; then
+    echo "--- gitleaks"
+    gitleaks detect --source . --no-banner || true
+  else
+    echo "WARN: gitleaks not installed — brew install gitleaks / https://github.com/gitleaks/gitleaks"
+  fi
+
+  # 3. Semgrep — SAST (code-level vulnerability patterns)
+  if command -v semgrep >/dev/null 2>&1; then
+    echo "--- semgrep"
+    semgrep scan --config auto --quiet --error || true
+  else
+    echo "WARN: semgrep not installed — pip install semgrep / https://semgrep.dev"
+  fi
+
+  # 4. Signed dependency-tree integrity
+  echo "--- integrity"
   bash scripts/security/project/check-integrity.sh || true
-  echo "end: \$(date)"
+
+  echo "=== end: \$(date) ==="
 } | tee "\$LOG"
 CRON
 chmod +x "$PROJ_DIR/cron-security-checks.sh"
@@ -146,10 +216,26 @@ PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 BACKUP="$PROJECT_ROOT/.git/hooks/pre-commit.security.backup"
 EXIT_CODE=0
 [ -f "$BACKUP" ] && bash "$BACKUP" || true
-if git diff --cached --name-only | grep -Eq '(^|/)package.json$|(^|/)package-lock.json$|(^|/)yarn.lock$|(^|/)pnpm-lock.yaml$|(^|/)requirements.*\.txt$|(^|/)pyproject.toml$|(^|/)poetry.lock$|(^|/)Pipfile$|(^|/)Pipfile.lock$'; then
-  echo "agent-skills supply-chain security check"
-  bash "$PROJECT_ROOT/scripts/security/supply-chain-check.sh" || EXIT_CODE=$?
+
+STAGED=$(git diff --cached --name-only)
+
+# Gitleaks — scan staged changes for secrets before they land in history
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --no-banner || EXIT_CODE=$?
+else
+  echo "WARN: gitleaks not installed — secrets scan skipped (brew install gitleaks)"
 fi
+
+# Tirith — agent config integrity check on dependency file changes
+if echo "$STAGED" | grep -Eq '(^|/)package.json$|(^|/)package-lock.json$|(^|/)yarn.lock$|(^|/)pnpm-lock.yaml$|(^|/)requirements.*\.txt$|(^|/)pyproject.toml$|(^|/)poetry.lock$|(^|/)Pipfile(\.lock)?$|(^|/)(go\.sum|go\.mod|Cargo\.lock|Gemfile\.lock)$'; then
+  echo "agent-skills: dependency file changed — running security scan"
+  if command -v tirith >/dev/null 2>&1; then
+    tirith scan || EXIT_CODE=$?
+  else
+    echo "WARN: tirith not installed — install via docs/TIRITH_SETUP.md"
+  fi
+fi
+
 exit $EXIT_CODE
 HOOK
   chmod +x "$HOOK"
