@@ -3,13 +3,14 @@
 export_skills.py — Compile agent skills into multi-client instruction formats.
 
 Supported formats:
+  --format agentrules  → .agentrules (project root, default agnostic target)
   --format cursor      → .cursorrules (project root)
   --format copilot     → .github/copilot-instructions.md
   --format windsurf    → .windsurfrules (project root)
-  --format all         → all three
+  --format all         → all formats
 
 Usage:
-  python3 scripts/export_skills.py --format cursor
+  python3 scripts/export_skills.py --format agentrules
   python3 scripts/export_skills.py --format all --skills-dir ./skills --output-dir ./exports
   python3 scripts/export_skills.py --format copilot --include google-style-python,google-style-typescript
   python3 scripts/export_skills.py --list
@@ -61,27 +62,46 @@ def strip_frontmatter(content: str) -> tuple[dict, str]:
 
 # ── Skill discovery ────────────────────────────────────────────────────────────
 
-def discover_skills(skills_dir: Path, include: list[str] | None = None) -> list[dict]:
-    """Return list of skill dicts sorted by name."""
+def discover_skills(skills_dirs: list[Path], include: list[str] | None = None) -> list[dict]:
+    """Return list of skill dicts sorted by name, ensuring no duplicates.
+    Recursively scans each directory for any files named SKILL.md.
+    """
     skills = []
-    for skill_path in sorted(skills_dir.iterdir()):
-        if not skill_path.is_dir():
+    seen_names = set()
+    for skills_dir in skills_dirs:
+        if not skills_dir.exists():
             continue
-        skill_md = skill_path / 'SKILL.md'
-        if not skill_md.exists():
-            continue
-        name = skill_path.name
-        if include and name not in include:
-            continue
-        content = skill_md.read_text(encoding='utf-8')
-        meta, body = strip_frontmatter(content)
-        skills.append({
-            'name': name,
-            'path': skill_path,
-            'meta': meta,
-            'description': meta.get('description', '').replace('\n', ' ').strip(),
-            'body': body,
-        })
+        # Recursively find all SKILL.md files and sort them for deterministic order
+        skill_mds = sorted(list(skills_dir.rglob("SKILL.md")))
+        for skill_md in skill_mds:
+            skill_path = skill_md.parent
+            name = skill_path.name
+            if include and name not in include:
+                continue
+            try:
+                content = skill_md.read_text(encoding='utf-8')
+            except Exception as e:
+                print(f"Error reading {skill_md}: {e}", file=sys.stderr)
+                continue
+            meta, body = strip_frontmatter(content)
+            
+            # Use frontmatter name if present, fallback to folder name
+            skill_name = str(meta.get('name') or name).strip()
+            
+            if skill_name in seen_names:
+                print(f"Warning: Skipping duplicate skill '{skill_name}' found at {skill_path}", file=sys.stderr)
+                continue
+            
+            seen_names.add(skill_name)
+            skills.append({
+                'name': skill_name,
+                'path': skill_path,
+                'meta': meta,
+                'description': meta.get('description', '').replace('\n', ' ').strip(),
+                'body': body,
+            })
+    # Sort skills alphabetically by name for consistency
+    skills.sort(key=lambda s: s['name'].lower())
     return skills
 
 
@@ -99,15 +119,15 @@ HEADER_BANNER = """\
 # ─────────────────────────────────────────────────────────────────────────────
 """
 
-def render_cursor(skills: list[dict]) -> str:
-    """Render .cursorrules format — plain-text rules Cursor can parse."""
-    parts = [HEADER_BANNER.format(fmt='cursor', count=len(skills))]
+def render_generic(skills: list[dict], fmt: str) -> str:
+    """Render generic instruction format — plain-text rules."""
+    parts = [HEADER_BANNER.format(fmt=fmt, count=len(skills))]
     for s in skills:
         parts.append(f"## Skill: {s['name']}")
         if s['description']:
             parts.append(f"When to use: {s['description']}\n")
         # Include only the first section of the body (up to 80 lines)
-        # to keep the cursorrules file manageable
+        # to keep the rules file manageable
         lines = s['body'].splitlines()
         preview_lines = []
         heading_count = 0
@@ -121,6 +141,21 @@ def render_cursor(skills: list[dict]) -> str:
         parts.append('\n'.join(preview_lines))
         parts.append('\n---\n')
     return '\n'.join(parts)
+
+
+def render_agentrules(skills: list[dict]) -> str:
+    """Render generic .agentrules format."""
+    return render_generic(skills, 'agentrules')
+
+
+def render_cursor(skills: list[dict]) -> str:
+    """Render .cursorrules format."""
+    return render_generic(skills, 'cursor')
+
+
+def render_windsurf(skills: list[dict]) -> str:
+    """Render .windsurfrules format."""
+    return render_generic(skills, 'windsurf')
 
 
 def render_copilot(skills: list[dict]) -> str:
@@ -156,18 +191,13 @@ def render_copilot(skills: list[dict]) -> str:
     return '\n'.join(parts)
 
 
-def render_windsurf(skills: list[dict]) -> str:
-    """Render .windsurfrules — same format as cursor but with Windsurf header."""
-    content = render_cursor(skills)
-    return content.replace(
-        '# Agent Skills — Compiled Instructions',
-        '# Agent Skills — Windsurf Rules'
-    ).replace('--format cursor', '--format windsurf')
-
-
 # ── Output targets ─────────────────────────────────────────────────────────────
 
 FORMATS = {
+    'agentrules': {
+        'render': render_agentrules,
+        'filename': '.agentrules',
+    },
     'cursor': {
         'render': render_cursor,
         'filename': '.cursorrules',
@@ -195,15 +225,15 @@ def main():
     )
     parser.add_argument(
         '--format', '-f',
-        choices=['cursor', 'copilot', 'windsurf', 'all'],
+        choices=['agentrules', 'cursor', 'copilot', 'windsurf', 'all'],
         default='all',
         help='Output format (default: all)',
     )
     parser.add_argument(
         '--skills-dir',
-        type=Path,
-        default=repo_root / 'skills',
-        help='Path to skills directory (default: ./skills)',
+        type=str,
+        default=None,
+        help='Comma-separated paths to skills directories (default: ./skills, ./davidondrej-skills/skills, ./agent-scripts/skills)',
     )
     parser.add_argument(
         '--output-dir',
@@ -228,15 +258,26 @@ def main():
 
     args = parser.parse_args()
 
+    # Determine skills directories to scan
+    if args.skills_dir:
+        skills_dirs = [Path(p.strip()).resolve() for p in args.skills_dir.split(',')]
+    else:
+        # Default scan logic only checks local skills/ folder
+        skills_dirs = [repo_root / 'skills']
+        # Only keep directories that exist
+        skills_dirs = [p for p in skills_dirs if p.exists()]
+
     include = [s.strip() for s in args.include.split(',')] if args.include else None
-    skills = discover_skills(args.skills_dir, include)
+    skills = discover_skills(skills_dirs, include)
 
     if not skills:
-        print(f"No skills found in: {args.skills_dir}", file=sys.stderr)
+        dirs_str = ", ".join(str(p) for p in skills_dirs)
+        print(f"No skills found in: {dirs_str}", file=sys.stderr)
         sys.exit(1)
 
     if args.list:
-        print(f"Discovered {len(skills)} skills in {args.skills_dir}:\n")
+        rel_dirs_str = ", ".join(str(p.relative_to(repo_root)) if repo_root in p.parents or p == repo_root else str(p) for p in skills_dirs)
+        print(f"Discovered {len(skills)} skills in [{rel_dirs_str}]:\n")
         for s in skills:
             print(f"  {s['name']:<40}  {s['description'][:80]}")
         return
