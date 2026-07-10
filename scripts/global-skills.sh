@@ -63,7 +63,7 @@ Usage:
   global-skills sync
   global-skills status
   global-skills init-config
-  global-skills export [--format cursor|copilot|windsurf|all] [--include skill1,skill2] [--output-dir DIR]
+  global-skills export [--format agentrules|cursor|copilot|windsurf|all] [--include skill1,skill2] [--output-dir DIR]
   global-skills import [skills_dir]
 
 Config:
@@ -77,6 +77,7 @@ Examples:
   global-skills add obra/superpowers --skill systematic-debugging
   global-skills sync
   global-skills export --format all
+  global-skills export --format agentrules --output-dir ~/my-project
   global-skills export --format cursor --include google-style-python,google-style-typescript
   global-skills export --format copilot --output-dir ~/my-project
   global-skills import ./skills
@@ -87,7 +88,7 @@ What each command does:
   sync         Copies all discovered SKILL.md-based skills to all roots.
   status       Prints skill counts per root and missing-in-codex summary.
   init-config  Creates $CONFIG_FILE with editable default root paths.
-  export       Compile skills into .cursorrules, copilot-instructions.md, or .windsurfrules.
+  export       Compile skills into .agentrules, .cursorrules, copilot-instructions.md, or .windsurfrules.
   import       Import local skills from a directory (defaults to ./skills) and sync them.
 USAGE_EOF
 }
@@ -301,15 +302,33 @@ case "$cmd" in
       echo "Error: export_skills.py not found at $EXPORT_SCRIPT"
       exit 1
     fi
-    # Default skills dir: the canonical first root that has skills
-    SKILLS_SOURCE=""
-    for root in "${CANONICAL_ROOTS[@]}"; do
-      if [ -d "$root" ]; then
-        SKILLS_SOURCE="$root"
-        break
+
+    # Check if --skills-dir is explicitly passed
+    local has_skills_dir=0
+    for arg in "$@"; do
+      if [[ "$arg" == "--skills-dir"* ]]; then
+        has_skills_dir=1
       fi
     done
-    python3 "$EXPORT_SCRIPT" --skills-dir "${SKILLS_SOURCE}" "$@"
+
+    if [ "$has_skills_dir" -eq 1 ]; then
+      python3 "$EXPORT_SCRIPT" "$@"
+    else
+      # Default: find the first active canonical root with actual skills
+      SKILLS_SOURCE=""
+      for root in "${CANONICAL_ROOTS[@]}"; do
+        if [ -d "$root" ] && [ -n "$(find "$root" -name SKILL.md 2>/dev/null)" ]; then
+          SKILLS_SOURCE="$root"
+          break
+        fi
+      done
+
+      if [ -n "$SKILLS_SOURCE" ]; then
+        python3 "$EXPORT_SCRIPT" --skills-dir "${SKILLS_SOURCE}" "$@"
+      else
+        python3 "$EXPORT_SCRIPT" "$@"
+      fi
+    fi
     ;;
   *)
     usage

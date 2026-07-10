@@ -37,7 +37,7 @@ gskills status
 - `scripts/global-skills.sh` — Sync, install, backup, monitor, and **export** skills across agents
 - `scripts/install-global-skills.sh` — Installer for PATH-based setup + config bootstrapping
 - `scripts/codex-exclusive-skills.sh` — Manage Codex-only skills and optionally propagate
-- `scripts/export_skills.py` — Compile skills into `.cursorrules`, `.windsurfrules`, or `copilot-instructions.md`
+- `scripts/export_skills.py` — Compile skills into `.agentrules`, `.cursorrules`, `.windsurfrules`, or `copilot-instructions.md`
 - `scripts/convert_html_guide.py` — Convert upstream HTML style guides to agent-readable Markdown
 - `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template
 - `.github/workflows/sync-styleguides.yml` — Weekly auto-sync of Google Style Guides from upstream
@@ -128,14 +128,14 @@ Location: `./skills/`
 
 ## Exporting Skills to Other Clients
 
-Compile all local skills into formats consumable by Cursor, Copilot, and Windsurf:
+Compile all local skills into formats consumable by Cursor, Copilot, Windsurf, or any generic agent:
 
 ```bash
 # Export all formats at once
 global-skills export --format all
 
-# Export only for Cursor, into a specific project
-global-skills export --format cursor --output-dir ~/my-project
+# Export as the agnostic/versatile rulebook (.agentrules)
+global-skills export --format agentrules --output-dir ~/my-project
 
 # Export a subset of skills
 global-skills export --format copilot --include google-style-python,google-style-typescript,google-eng-practices
@@ -150,11 +150,12 @@ python3 scripts/export_skills.py --list   # see all available skills
 
 Output files:
 
-| Format | File |
-|---|---|
-| Cursor | `.cursorrules` |
-| GitHub Copilot | `.github/copilot-instructions.md` |
-| Windsurf | `.windsurfrules` |
+| Format | File | Target Editor/Agent |
+|---|---|---|
+| Agnostic | `.agentrules` | Grok, KimiCode, OpenCode, Codex, custom agents |
+| Cursor | `.cursorrules` | Cursor IDE |
+| GitHub Copilot | `.github/copilot-instructions.md` | GitHub Copilot |
+| Windsurf | `.windsurfrules` | Windsurf IDE |
 
 ## Upstream Style Guide Sync
 
