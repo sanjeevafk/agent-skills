@@ -324,40 +324,57 @@ case "$cmd" in
     python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
     python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
     ;;
-  index)
-    python3 "$PY_SCRIPT_DIR/build_index.py"
-    ;;
-  generate-commands)
-    python3 "$PY_SCRIPT_DIR/generate_commands.py"
-    ;;
-  graph)
-    python3 "$PY_SCRIPT_DIR/dependency_graph.py"
-    ;;
-  lint)
-    python3 "$PY_SCRIPT_DIR/lint_skills.py"
-    ;;
-  telemetry)
+  search)
     shift || true
-    python3 "$PY_SCRIPT_DIR/telemetry.py" "$@"
+    python3 "$PY_SCRIPT_DIR/search_skills.py" "$@"
     ;;
-  generate-docs)
-    python3 "$PY_SCRIPT_DIR/generate_docs.py"
+  compose)
+    python3 "$PY_SCRIPT_DIR/playbooks.py"
+    ;;
+  doctor)
+    python3 "$PY_SCRIPT_DIR/doctor.py"
+    ;;
+  explain)
+    shift || true
+    python3 "$PY_SCRIPT_DIR/doctor.py" explain "$@"
+    ;;
+  test)
+    shift || true
+    python3 "$PY_SCRIPT_DIR/test_skills.py" "$@"
+    ;;
+  orchestrate)
+    shift || true
+    python3 "$PY_SCRIPT_DIR/orchestrate.py" "$@"
+    ;;
+  knowledge-graph)
+    python3 "$PY_SCRIPT_DIR/build_knowledge_graph.py"
+    ;;
+  portal)
+    python3 "$PY_SCRIPT_DIR/generate_portal.py"
     ;;
   build-all)
-    echo "=== [1/6] Building skills.json index... ==="
+    echo "=== [1/9] Building skills.json index... ==="
     python3 "$PY_SCRIPT_DIR/build_index.py"
-    echo "=== [2/6] Auto-generating command wrappers... ==="
+    echo "=== [2/9] Generating playbooks & compositions... ==="
+    python3 "$PY_SCRIPT_DIR/playbooks.py"
+    echo "=== [3/9] Auto-generating command wrappers... ==="
     python3 "$PY_SCRIPT_DIR/generate_commands.py"
-    echo "=== [3/6] Building dependency graph... ==="
+    echo "=== [4/9] Building dependency graph... ==="
     python3 "$PY_SCRIPT_DIR/dependency_graph.py"
-    echo "=== [4/6] Running quality & duplicate linter... ==="
+    echo "=== [5/9] Building knowledge graph... ==="
+    python3 "$PY_SCRIPT_DIR/build_knowledge_graph.py"
+    echo "=== [6/9] Running quality & duplicate linter... ==="
     python3 "$PY_SCRIPT_DIR/lint_skills.py"
-    echo "=== [5/6] Auto-generating documentation artifacts... ==="
+    python3 "$PY_SCRIPT_DIR/quality_scorer.py"
+    echo "=== [7/9] Auto-generating documentation artifacts & portal... ==="
     python3 "$PY_SCRIPT_DIR/generate_docs.py"
-    echo "=== [6/6] Exporting multi-client rule files... ==="
+    python3 "$PY_SCRIPT_DIR/generate_portal.py"
+    echo "=== [8/9] Exporting multi-client rule files... ==="
     python3 "$PY_SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
     python3 "$PY_SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
-    echo "=== Build All Complete! ==="
+    echo "=== [9/9] Running System Doctor Verification... ==="
+    python3 "$PY_SCRIPT_DIR/doctor.py"
+    echo "=== Platform Build Complete! ==="
     ;;
   *)
     usage
