@@ -6,6 +6,7 @@ build_index.py — Parse all skills, normalize metadata, and generate skills.jso
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -142,6 +143,10 @@ def build_index():
 
         meta, body = strip_frontmatter(content)
         name = str(meta.get('name') or dir_name).strip()
+        if name in skills_registry:
+            raise ValueError(
+                f"Duplicate skill name '{name}': {skills_registry[name]['rel_path']} and {skill_md.relative_to(REPO_ROOT)}"
+            )
         description = str(meta.get('description') or '').replace('\n', ' ').strip()
         category = str(meta.get('category') or infer_category(name, description, body)).strip()
         tags = meta.get('tags') if isinstance(meta.get('tags'), list) else infer_tags(name, category, body)
@@ -189,7 +194,7 @@ def build_index():
         "metadata": {
             "total_skills": len(skills_registry),
             "total_categories": len(CATEGORY_MAP),
-            "generated_at": "2026-07-27T21:50:00Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "schema_version": "2.0.0",
         },
         "categories": CATEGORY_MAP,

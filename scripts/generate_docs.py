@@ -12,6 +12,11 @@ INDEX_FILE = REPO_ROOT / 'skills.json'
 DOCS_DIR = REPO_ROOT / 'docs'
 
 
+def markdown_cell(value: str) -> str:
+    """Escape values embedded in Markdown table cells."""
+    return str(value).replace('\\', '\\\\').replace('|', '\\|').replace('\n', ' ')
+
+
 def load_index():
     if not INDEX_FILE.exists():
         print("skills.json not found. Run build_index.py first.")
@@ -49,7 +54,9 @@ def generate_catalog(data):
         md_lines.append("| Skill | Namespace Command | Description |")
         md_lines.append("|---|---|---|")
         for s in sorted(cat_skills, key=lambda x: x['name']):
-            md_lines.append(f"| `{s['name']}` | `{s['namespace_command']}` | {s['description']} |")
+            md_lines.append(
+                f"| `{markdown_cell(s['name'])}` | `{markdown_cell(s['namespace_command'])}` | {markdown_cell(s['description'])} |"
+            )
         md_lines.append("\n---\n")
 
     catalog_file = DOCS_DIR / 'SKILLS_CATALOG.md'
