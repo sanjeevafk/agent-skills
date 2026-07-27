@@ -124,6 +124,10 @@ propagate_to_canonical() {
 # Remove skills from Codex
 remove_from_codex() {
   for skill in "$@"; do
+    if [[ ! "$skill" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      printf 'Invalid skill name: %s\n' "$skill" >&2
+      continue
+    fi
     local skillpath="$ROOT_CODEX/$skill"
     
     if [ ! -d "$skillpath" ]; then

@@ -1,5 +1,5 @@
 ---
-name: configure
+name: telegram-configure
 description: Set up the Telegram channel — save the bot token and review access policy. Use when the user pastes a Telegram bot token, asks to configure Telegram, asks "how do I set this up" or "who can reach me," or wants to check channel status.
 user-invocable: true
 allowed-tools:

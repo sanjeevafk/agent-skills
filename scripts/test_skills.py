@@ -19,11 +19,14 @@ def test_skill(name: str, meta: dict) -> tuple[bool, str]:
 
     content = skill_file.read_text(encoding='utf-8')
     
-    # Assertions
     if len(content) < 50:
         return False, "Content too short"
-    if 'name:' not in content and '---' not in content:
-        return False, "Missing frontmatter"
+    if not content.startswith('---') or '\n---' not in content[3:]:
+        return False, "Missing or unterminated frontmatter"
+    if f"name: {name}" not in content and f'name: "{name}"' not in content:
+        return False, "Indexed name does not match frontmatter"
+    if not meta.get('description', '').strip():
+        return False, "Missing description"
     
     return True, "Passed (Frontmatter valid, structure clean, prompts present)"
 
@@ -34,7 +37,18 @@ def run_all_tests(target_skill: str = None):
         sys.exit(1)
 
     with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        skills = json.load(f).get('skills', {})
+        index = json.load(f)
+        skills = index.get('skills', {})
+
+    # Keep the smoke test from masking repository-integrity failures.
+    import subprocess
+    validator = subprocess.run(
+        [sys.executable, str(REPO_ROOT / 'scripts' / 'validate_skills.py')],
+        capture_output=True, text=True,
+    )
+    if validator.returncode:
+        print(validator.stderr, file=sys.stderr)
+        return False
 
     if target_skill:
         if target_skill not in skills:

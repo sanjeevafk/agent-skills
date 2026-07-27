@@ -26,8 +26,28 @@ ALL_ROOTS=()
 
 load_config() {
   if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
+    # Parse only the documented KEY=value format; never execute config contents.
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      if [[ "$line" =~ ^[[:space:]]*(ROOT_AGENTS|ROOT_COPILOT|ROOT_CURSOR|ROOT_ANTIGRAVITY|ROOT_CODEX|BACKUP_BASE_DIR|REPO_DIR)[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#\"}"; value="${value%\"}"
+        value="${value#\'}"; value="${value%\'}"
+        case "$key" in
+          ROOT_AGENTS) ROOT_AGENTS="$value" ;;
+          ROOT_COPILOT) ROOT_COPILOT="$value" ;;
+          ROOT_CURSOR) ROOT_CURSOR="$value" ;;
+          ROOT_ANTIGRAVITY) ROOT_ANTIGRAVITY="$value" ;;
+          ROOT_CODEX) ROOT_CODEX="$value" ;;
+          BACKUP_BASE_DIR) BACKUP_BASE_DIR="$value" ;;
+          REPO_DIR) REPO_DIR="$value" ;;
+        esac
+      else
+        echo "Invalid config line in $CONFIG_FILE" >&2
+        exit 1
+      fi
+    done < "$CONFIG_FILE"
   fi
 
   if [ -z "${REPO_DIR:-}" ] || [ ! -d "$REPO_DIR" ]; then
@@ -37,6 +57,23 @@ load_config() {
 
   CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY")
   ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")
+}
+
+validate_safe_root() {
+  local path="$1"
+  local label="$2"
+  [ -n "$path" ] || { echo "Error: $label is empty" >&2; exit 1; }
+  [[ "$path" = /* ]] || { echo "Error: $label must be absolute: $path" >&2; exit 1; }
+  [ "$path" != "/" ] || { echo "Error: refusing to use / as $label" >&2; exit 1; }
+  [ "$path" != "$HOME" ] || { echo "Error: refusing to use HOME as $label" >&2; exit 1; }
+  [ "$path" != "$REPO_DIR" ] || { echo "Error: refusing to use repository root as $label" >&2; exit 1; }
+}
+
+validate_skill_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+    echo "Error: invalid skill name: $1" >&2
+    exit 1
+  }
 }
 
 write_default_config() {
@@ -143,6 +180,7 @@ sync_all() {
 
   local skill src dest_path dest_root src_real dst_real
   while IFS= read -r skill; do
+    validate_skill_name "$skill"
     src="$(first_skill_source "$skill")"
     src_real="$(readlink -f "$src" || printf '%s' "$src")"
 
@@ -229,6 +267,11 @@ status() {
 
 load_config
 
+for configured_root in "$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX"; do
+  validate_safe_root "$configured_root" "skill root"
+done
+validate_safe_root "$BACKUP_BASE_DIR" "backup directory"
+
 cmd="${1:-}"
 case "$cmd" in
   backup)
@@ -303,6 +346,7 @@ case "$cmd" in
       [ -d "$d" ] || continue
       [ -f "$d/SKILL.md" ] || continue
       sname="$(basename "$d")"
+      validate_skill_name "$sname"
       echo "  -> Importing $sname"
       rm -rf "$DEST_ROOT/$sname"
       mkdir -p "$DEST_ROOT/$sname"
@@ -323,6 +367,24 @@ case "$cmd" in
     fi
     python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
     python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
+    ;;
+  index)
+    python3 "$PY_SCRIPT_DIR/build_index.py"
+    ;;
+  generate-commands)
+    python3 "$PY_SCRIPT_DIR/generate_commands.py"
+    ;;
+  graph)
+    python3 "$PY_SCRIPT_DIR/dependency_graph.py"
+    ;;
+  lint)
+    python3 "$PY_SCRIPT_DIR/lint_skills.py"
+    ;;
+  telemetry)
+    python3 "$PY_SCRIPT_DIR/telemetry.py" "${2:-report}"
+    ;;
+  generate-docs)
+    python3 "$PY_SCRIPT_DIR/generate_docs.py"
     ;;
   search)
     shift || true
