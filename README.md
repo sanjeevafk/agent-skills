@@ -2,14 +2,14 @@
 
 [![License](https://img.shields.io/github/license/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/blob/main/LICENSE)
 ![Agentic Engineering](https://img.shields.io/badge/Agentic-Engineering-1F8A70?style=flat-square)
-![Skills Count](https://img.shields.io/badge/Skills-388-blue?style=flat-square)
+![Skills Count](https://img.shields.io/badge/Skills-390-blue?style=flat-square)
 ![Rules Count](https://img.shields.io/badge/Rules-16-purple?style=flat-square)
 
 A telemetry-driven, self-documenting AI capability framework. Manage, sync, and export skills, command namespaces, subagents, and 14 classic software engineering book standards across **Claude Code, Antigravity, Cursor, Windsurf, GitHub Copilot, and Codex**.
 
 ---
 
-## ⚡ Quick 1-Command Setup
+## Quick 1-Command Setup
 
 Clone the repository and run the automated installer. The installer sets up PATH configuration, shell aliases (`gskills`), builds all command wrappers, indexes, dependency graphs, and automatically syncs skills across all installed AI agent runtimes (`~/.gemini`, `~/.agents`, `~/.cursor`, `~/.copilot`):
 
@@ -29,25 +29,25 @@ gskills build-all
 
 ---
 
-## 🎯 Architecture: Single Source of Truth
+## Architecture: Single Source of Truth
 
 The repository enforces strict separation between **canonical sources of truth** and **auto-generated artifacts**:
 
 ```
 agent-skills/
-│
-├── 🧠 skills/               [CANONICAL] 388 Modular Capability Manuals
-├── 📜 rules/                [CANONICAL] 16 Always-On Standards & 14 Book Guidelines
-│
-├── ⚡ commands/             [GENERATED] Namespaced & Flat Command Wrappers
-├── 🔍 skills.json           [GENERATED] Complete Reverse-Indexed Metadata Registry
-├── 📦 exports/              [GENERATED] Multi-Client IDE Rules (.cursorrules, .agentrules, etc.)
-└── 📖 docs/                 [GENERATED] Catalog, Dependency Graphs & Analytics Dashboards
+|
+|-- skills/                 [CANONICAL] 390 Modular Capability Manuals
+|-- rules/                  [CANONICAL] 16 Always-On Standards & 14 Book Guidelines
+|
+|-- commands/               [GENERATED] Namespaced & Flat Command Wrappers
+|-- skills.json             [GENERATED] Complete Reverse-Indexed Metadata Registry
+|-- exports/                [GENERATED] Multi-Client IDE Rules (.cursorrules, .agentrules, etc.)
+`-- docs/                   [GENERATED] Catalog, Dependency Graphs & Analytics Dashboards
 ```
 
 ---
 
-## 🚀 Command Namespaces & Slash Commands
+## Command Namespaces & Slash Commands
 
 Every skill and rule automatically receives a namespaced slash command, flat command, and shorthand alias:
 
@@ -65,7 +65,7 @@ Every skill and rule automatically receives a namespaced slash command, flat com
 
 ---
 
-## 📚 What are the Files in `docs/` For?
+## What are the Files in `docs/` For?
 
 The `docs/` folder contains both **auto-generated operational artifacts** and **core architecture policies**:
 
@@ -84,7 +84,7 @@ The `docs/` folder contains both **auto-generated operational artifacts** and **
 
 ---
 
-## 📦 Multi-Client Rule Exports
+## Multi-Client Rule Exports
 
 Export your entire skills collection and 14 book standards into single-file rulesets for any editor:
 
@@ -98,7 +98,7 @@ gskills export --format cursor --output-dir ~/my-project
 
 ---
 
-## 🛠️ `gskills` CLI Reference
+## `gskills` CLI Reference
 
 ```bash
 gskills build-all         # Run full index, command generation, graph, lint, docs, and exports
@@ -113,3 +113,5 @@ gskills telemetry        # Record and generate skill usage analytics
 gskills generate-docs    # Regenerate catalog & metrics dashboards
 gskills backup           # Create timestamped tar.gz backups of all agent roots
 ```
+
+> **Test coverage note:** `gskills verify` currently validates all 390 skills, generated command coverage, repository integrity, filesystem safety, shell syntax, and Python compilation. Rules and custom commands are included in generation checks but are not yet behaviorally evaluated in depth. The benchmark currently measures framework build speed; AI response quality and rule/command behavior benchmarks are planned next.
