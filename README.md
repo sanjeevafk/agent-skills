@@ -1,24 +1,17 @@
-# Agent Skills Toolkit
+# Agent Skills Framework
 
 [![License](https://img.shields.io/github/license/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/blob/main/LICENSE)
 ![Agentic Engineering](https://img.shields.io/badge/Agentic-Engineering-1F8A70?style=flat-square)
+![Skills Count](https://img.shields.io/badge/Skills-388-blue?style=flat-square)
+![Rules Count](https://img.shields.io/badge/Rules-16-purple?style=flat-square)
 
-Manage and sync skills across multiple AI agent environments from one source of truth.
+A telemetry-driven, self-documenting AI capability framework. Manage, sync, and export skills, command namespaces, subagents, and 14 classic software engineering book standards across **Claude Code, Antigravity, Cursor, Windsurf, GitHub Copilot, and Codex**.
 
-If copying skill folders between five different directories is annoying: ⭐ star this repo.
+---
 
-## Why Use This?
+## ⚡ Quick 1-Command Setup
 
-Compared to raw `npx skills add`, desktop apps, or manual copying:
-
-- One command syncs all configured agent skill roots.
-- Config-driven roots (`~/.global-skills.conf`) make the setup portable and customizable.
-- Repeatable backup/sync workflow with predictable structure.
-- Supports curated + reproducible team conventions from version control.
-
-## Installation (One-Liner)
-
-Clone the repository and run the installation script. The installer will copy the `global-skills` utility to your `~/.local/bin`, write a configuration file, add standard aliases/PATH values to your shell config, and **automatically import and sync all curated repository skills** into your agent environments:
+Clone the repository and run the automated installer. The installer sets up PATH configuration, shell aliases (`gskills`), builds all command wrappers, indexes, dependency graphs, and automatically syncs skills across all installed AI agent runtimes (`~/.gemini`, `~/.agents`, `~/.cursor`, `~/.copilot`):
 
 ```bash
 git clone https://github.com/sanjeevafk/agent-skills.git && cd agent-skills && ./scripts/install-global-skills.sh
@@ -27,229 +20,94 @@ git clone https://github.com/sanjeevafk/agent-skills.git && cd agent-skills && .
 After opening a new shell:
 
 ```bash
-global-skills status
-# or
+# Verify installation
 gskills status
+
+# Run full framework build
+gskills build-all
 ```
-
-## What This Repository Contains
-
-- `scripts/global-skills.sh` — Sync, install, backup, monitor, and **export** skills across agents
-- `scripts/install-global-skills.sh` — Installer for PATH-based setup + config bootstrapping
-- `scripts/codex-exclusive-skills.sh` — Manage Codex-only skills and optionally propagate
-- `scripts/export_skills.py` — Compile skills into `.agentrules`, `.cursorrules`, `.windsurfrules`, or `copilot-instructions.md`
-- `scripts/convert_html_guide.py` — Convert upstream HTML style guides to agent-readable Markdown
-- `scripts/security/system/setup-system-monitoring.sh` — Portable system-security setup template
-- `.github/workflows/sync-styleguides.yml` — Weekly auto-sync of Google Style Guides from upstream
-- `docs/skill-triggers.md` — Reference for prompting skills
-- `docs/` — Setup and operational documentation
-- `exports/` — Auto-generated client-specific rule files (do not edit manually)
-
-## Config File
-
-Global root paths are loaded from:
-
-- `~/.global-skills.conf`
-
-Initialize default config:
-
-```bash
-global-skills init-config
-```
-
-Override config file location for a command:
-
-```bash
-GLOBAL_SKILLS_CONFIG=/path/to/custom.conf global-skills status
-```
-
-## Commands
-
-```bash
-global-skills status
-global-skills sync
-global-skills backup
-global-skills add mattpocock/skills
-global-skills add obra/superpowers --skill systematic-debugging
-global-skills export --format all
-global-skills export --format cursor --include google-style-python,google-style-typescript
-global-skills export --format copilot --output-dir ~/my-project
-```
-
-## Recommended Skill Combinations
-
-### Minimal Viable Setup
-
-- `global-skills add mattpocock/skills --skill caveman --skill diagnose --skill zoom-out`
-- `global-skills sync`
-
-### Security-First Setup
-
-- `global-skills add mattpocock/skills --skill qa --skill diagnose`
-- Use repository security template: `scripts/security/system/setup-system-monitoring.sh`
-- Pair with docs: `docs/SYSTEM_SECURITY_SETUP.md` and `docs/TIRITH_SETUP.md`
-
-### Senior Engineer Mode
-
-- `global-skills add mattpocock/skills --skill grill-with-docs --skill qa --skill diagnose --skill zoom-out`
-- Use `docs/skill-triggers.md` for repeatable prompt structure
-- Keep periodic backups: `global-skills backup`
-
-## Included Curated Skills
-
-The repository includes a highly curated set of specialized skills:
-
-### Engineering & Reliability
-- `google-eng-practices` — Codifies Google's Code Health philosophy for reviewers and authors
-- `nasa-jpl-power-of-ten-python` — Adapts NASA's safety-critical coding rules for Python/FastAPI
-
-### Google Style Guides (Language-Specific)
-- `google-style-common` — Cross-language principles: naming philosophy, comment standards
-- `google-style-python` — Full Python style guide with Review and Writing modes
-- `google-style-typescript` — TypeScript-specific rules (types, enums, visibility, `any` avoidance)
-- `google-style-javascript` — JavaScript rules (ES modules, JSDoc, `const`/`let`, arrow functions)
-- `google-style-go` — Go guide across three layers: rules, best practices, and decisions
-- `google-style-java` — Java guide (2-space indent, K&R braces, Javadoc, import ordering)
-- `google-style-cpp` — C++ guide (no exceptions, smart pointers, naming, header hygiene)
-
-### Type & Architecture
-- `type-architecture-analyzer` — Expert TypeScript type system design and refactoring
-
-### Matt Pocock Skills
-Selected from [mattpocock/skills](https://github.com/mattpocock/skills):
-- `caveman`
-- `diagnose`
-- `grill-with-docs`
-- `qa`
-- `setup-matt-pocock-skills`
-- `zoom-out`
-
-Location: `./skills/`
-
-## Exporting Skills to Other Clients
-
-Compile all local skills into formats consumable by Cursor, Copilot, Windsurf, or any generic agent:
-
-```bash
-# Export all formats at once
-global-skills export --format all
-
-# Export as the agnostic/versatile rulebook (.agentrules)
-global-skills export --format agentrules --output-dir ~/my-project
-
-# Export a subset of skills
-global-skills export --format copilot --include google-style-python,google-style-typescript,google-eng-practices
-```
-
-Or run the script directly:
-
-```bash
-python3 scripts/export_skills.py --format all --skills-dir ./skills --output-dir ./exports
-python3 scripts/export_skills.py --list   # see all available skills
-```
-
-Output files:
-
-| Format | File | Target Editor/Agent |
-|---|---|---|
-| Agnostic | `.agentrules` | Grok, KimiCode, OpenCode, Codex, custom agents |
-| Cursor | `.cursorrules` | Cursor IDE |
-| GitHub Copilot | `.github/copilot-instructions.md` | GitHub Copilot |
-| Windsurf | `.windsurfrules` | Windsurf IDE |
-
-## Upstream Style Guide Sync
-
-Google Style Guides in `skills/google-style-*/references/full_guide.md` are kept
-in sync with [google/styleguide](https://github.com/google/styleguide) via a
-weekly GitHub Action (`.github/workflows/sync-styleguides.yml`).
-
-To trigger a manual sync:
-1. Go to **Actions → Sync Google Style Guides → Run workflow**
-2. Optionally specify which guides: `js,ts,cpp,java,go`
-
-The workflow opens a PR with diffs if upstream guides have changed. `quick_reference.md`
-files are **not** auto-updated — manual review is required when core rules change.
-
-## Related Docs
-
-- `docs/.agent.md` — Contributor guide and workspace governance model
-- `docs/ENGINEERING_PRINCIPLES.md` — Engineering principles and response style standards
-- `docs/AGENT_RULES_BOOKS_SETUP.md`
-- `docs/CODEX_EXCLUSIVE_SKILLS.md`
-- `docs/MATTPOCOCK_SKILLS_SELECTION.md`
-- `docs/SYSTEM_SECURITY_SETUP.md`
-- `docs/TIRITH_SETUP.md`
-- `docs/skill-triggers.md`
-
-## Workspace Governance & Model Harness Framework
-
-This repository **experiments with** a model harness approach — systematic governance and resource management designed to improve non-frontier AI code generation.
-
-### Components
-
-1. **Engineering Principles** (`docs/ENGINEERING_PRINCIPLES.md`)
-   - Lightweight reference (500 tokens vs 35K for full rule books)
-   - File-type-specific loading instead of global pollution
-   - Core philosophy, decision trees, and tech-specific patterns
-
-2. **Contributor Guide** (`docs/.agent.md`)
-   - Quality standards for skill contributions
-   - Response style enforcement (no emojis, clear formatting)  
-   - Skill discovery optimization through precise when-to-use descriptions
-
-3. **Security Harness** (`scripts/security/`, `docs/TIRITH_SETUP.md`)
-   - Pre-deploy vulnerability scanning
-   - Supply chain integrity checks
-   - Code pattern auditing
-
-### Honest Assessment: Partial Implementation
-
-**What the setup accomplishes:**
-
-- Token efficiency: 80-93% reduction in overhead rules (35K → 2K per session)
-- Consistency: Canonical rules enforced across all agents
-- Governance: Clear quality standards and security practices
-- Structure: Reproducible across multiple agent environments (Copilot, Cursor, Claude)
-
-**What's actually unproven:**
-
-- No baseline metrics for code quality (before/after)
-- No A/B testing framework to measure improvement
-- No model-agnostic validation across different LLMs
-- No performance benchmarks (error rates, hallucination patterns)
-- No automated feedback loops to validate harness effectiveness
-- No regression detection if governance changes degrade performance
-
-**Claims we CANNOT make:**
-
-We cannot claim this helps non-frontier models "punch above their weight" without data. The setup has good structure and efficiency, but we lack:
-1. Comparative testing (same task with/without harness)
-2. Baseline measurements (code quality metrics before deployment)
-3. Model variance analysis (does it help Haiku vs Sonnet vs others differently?)
-4. Ablation studies (which components actually matter?)
-
-### What This Actually Is
-
-A **governance and efficiency framework** that:
-- Reduces token waste (proven: 35K → 2K)
-- Establishes clear quality standards (process-level, not outcome-level)
-- Scales across multiple agent contexts (infrastructure win)
-
-**Not yet:** A validated model harness with measured impact on code generation quality.
-
-### To Become a Robust Harness
-
-Would need:
-1. Baseline test suite (measure code quality without harness)
-2. A/B testing framework (same prompts, measure delta)
-3. Model-specific profiling (how does it impact different models?)
-4. Automated metrics (error patterns, hallucination rate, code coverage)
-5. Regression gates (changes must improve or hold metrics)
 
 ---
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+## 🎯 Architecture: Single Source of Truth
 
-## License
+The repository enforces strict separation between **canonical sources of truth** and **auto-generated artifacts**:
 
-MIT. See [LICENSE](LICENSE).
+```
+agent-skills/
+│
+├── 🧠 skills/               [CANONICAL] 388 Modular Capability Manuals
+├── 📜 rules/                [CANONICAL] 16 Always-On Standards & 14 Book Guidelines
+│
+├── ⚡ commands/             [GENERATED] Namespaced & Flat Command Wrappers
+├── 🔍 skills.json           [GENERATED] Complete Reverse-Indexed Metadata Registry
+├── 📦 exports/              [GENERATED] Multi-Client IDE Rules (.cursorrules, .agentrules, etc.)
+└── 📖 docs/                 [GENERATED] Catalog, Dependency Graphs & Analytics Dashboards
+```
+
+---
+
+## 🚀 Command Namespaces & Slash Commands
+
+Every skill and rule automatically receives a namespaced slash command, flat command, and shorthand alias:
+
+| Namespace | Example Commands | Target Capability |
+| :--- | :--- | :--- |
+| **`/debug/`** | `/debug/systematic`, `/debug/root-cause` | Root-cause isolation, test failure diagnosis |
+| **`/web/`** | `/web/nextjs-15-expert`, `/web/supabase-expert` | Frontend, App Router, RLS, Tailwind & Radix UI |
+| **`/lang/`** | `/lang/python-ts-interop-mcp-builder` | Language systems & multi-language interop |
+| **`/style/`** | `/style/google-style-python`, `/style/google-ts` | Google Style Guides & NASA JPL coding rules |
+| **`/gsd/`** | `/gsd/plan-phase`, `/gsd/execute-phase` | GSD milestone roadmap & phase planning |
+| **`/devops/`** | `/devops/docker-patterns`, `/devops/vercel-deploy` | Containerization, deployment & CI/CD |
+| **`/rule/`** | `/rule/clean-code`, `/rule/user-global-rules` | 14 Classic software books & `/learn` directives |
+
+> **Backward Compatibility**: Flat commands (e.g. `/systematic-debugging`, `/nextjs-15-expert`) and shorthand aliases (`/google-ts`, `/noslop`, `/adhd`) remain 100% supported.
+
+---
+
+## 📚 What are the Files in `docs/` For?
+
+The `docs/` folder contains both **auto-generated operational artifacts** and **core architecture policies**:
+
+### Auto-Generated Reports & Dashboards (Derived via `gskills build-all`):
+* **`docs/SKILLS_CATALOG.md`**: Complete, searchable directory of all 388 skills categorized by domain.
+* **`docs/NAMESPACE_REFERENCE.md`**: Complete mapping matrix of namespaced commands to target skills and flat aliases.
+* **`docs/DEPENDENCY_GRAPH.md`**: Prerequisite dependency resolution matrix and visual Mermaid graph.
+* **`docs/HEALTH_DASHBOARD.md`**: System health metrics, token budget estimations, and category statistics.
+* **`docs/DUPLICATE_REPORT.md`**: Similarity linter report identifying near-identical skills and alias conflicts.
+* **`docs/TELEMETRY_REPORT.md`**: Usage metrics tracking invocation counts, success rates, and token usage.
+
+### Core Architecture Policies (Hand-Curated):
+* **`docs/ENGINEERING_PRINCIPLES.md`**: Core engineering philosophy and coding standards.
+* **`docs/OPERATIONS.md`**: Operational guide for managing skills, syncing, and running builds.
+* **`docs/SECURITY.md`**: Security architecture and Tirith guardrail configuration.
+
+---
+
+## 📦 Multi-Client Rule Exports
+
+Export your entire skills collection and 14 book standards into single-file rulesets for any editor:
+
+```bash
+# Export all client rule formats at once (.agentrules, .cursorrules, .windsurfrules, copilot-instructions.md)
+gskills export --format all --output-dir ~/my-project
+
+# Export specific format
+gskills export --format cursor --output-dir ~/my-project
+```
+
+---
+
+## 🛠️ `gskills` CLI Reference
+
+```bash
+gskills build-all         # Run full index, command generation, graph, lint, docs, and exports
+gskills sync              # Copy skills across ~/.gemini, ~/.agents, ~/.cursor, ~/.copilot, ~/.codex
+gskills index             # Rebuild skills.json index
+gskills generate-commands # Auto-generate namespaced & flat command wrappers
+gskills graph            # Build skill dependency tree & Mermaid graph
+gskills lint             # Audit repository for duplicates and description similarities
+gskills telemetry        # Record and generate skill usage analytics
+gskills generate-docs    # Regenerate catalog & metrics dashboards
+gskills backup           # Create timestamped tar.gz backups of all agent roots
+```
