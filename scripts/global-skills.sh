@@ -30,6 +30,11 @@ load_config() {
     source "$CONFIG_FILE"
   fi
 
+  if [ -z "${REPO_DIR:-}" ] || [ ! -d "$REPO_DIR" ]; then
+    REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+  fi
+  PY_SCRIPT_DIR="$REPO_DIR/scripts"
+
   CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY")
   ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")
 }
@@ -311,47 +316,47 @@ case "$cmd" in
     ;;
   export)
     shift || true
-    EXPORT_SCRIPT="/export_skills.py"
-    if [ ! -f "" ]; then
-      echo "Error: export_skills.py not found at "
+    EXPORT_SCRIPT="$PY_SCRIPT_DIR/export_skills.py"
+    if [ ! -f "$EXPORT_SCRIPT" ]; then
+      echo "Error: export_skills.py not found at $EXPORT_SCRIPT"
       exit 1
     fi
-    python3 "" --format all --skills-dir "/skills" --output-dir "/exports"
-    python3 "" --format all --skills-dir "/skills" --output-dir ""
+    python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
+    python3 "$EXPORT_SCRIPT" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
     ;;
   index)
-    python3 "$SCRIPT_DIR/build_index.py"
+    python3 "$PY_SCRIPT_DIR/build_index.py"
     ;;
   generate-commands)
-    python3 "$SCRIPT_DIR/generate_commands.py"
+    python3 "$PY_SCRIPT_DIR/generate_commands.py"
     ;;
   graph)
-    python3 "$SCRIPT_DIR/dependency_graph.py"
+    python3 "$PY_SCRIPT_DIR/dependency_graph.py"
     ;;
   lint)
-    python3 "$SCRIPT_DIR/lint_skills.py"
+    python3 "$PY_SCRIPT_DIR/lint_skills.py"
     ;;
   telemetry)
     shift || true
-    python3 "$SCRIPT_DIR/telemetry.py" ""
+    python3 "$PY_SCRIPT_DIR/telemetry.py" "$@"
     ;;
   generate-docs)
-    python3 "$SCRIPT_DIR/generate_docs.py"
+    python3 "$PY_SCRIPT_DIR/generate_docs.py"
     ;;
   build-all)
     echo "=== [1/6] Building skills.json index... ==="
-    python3 "$SCRIPT_DIR/build_index.py"
+    python3 "$PY_SCRIPT_DIR/build_index.py"
     echo "=== [2/6] Auto-generating command wrappers... ==="
-    python3 "$SCRIPT_DIR/generate_commands.py"
+    python3 "$PY_SCRIPT_DIR/generate_commands.py"
     echo "=== [3/6] Building dependency graph... ==="
-    python3 "$SCRIPT_DIR/dependency_graph.py"
+    python3 "$PY_SCRIPT_DIR/dependency_graph.py"
     echo "=== [4/6] Running quality & duplicate linter... ==="
-    python3 "$SCRIPT_DIR/lint_skills.py"
+    python3 "$PY_SCRIPT_DIR/lint_skills.py"
     echo "=== [5/6] Auto-generating documentation artifacts... ==="
-    python3 "$SCRIPT_DIR/generate_docs.py"
+    python3 "$PY_SCRIPT_DIR/generate_docs.py"
     echo "=== [6/6] Exporting multi-client rule files... ==="
-    python3 "$SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
-    python3 "$SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
+    python3 "$PY_SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
+    python3 "$PY_SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
     echo "=== Build All Complete! ==="
     ;;
   *)
