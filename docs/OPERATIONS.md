@@ -1,143 +1,73 @@
-# Operations & Rules Reference Guide
+# Operations & Architecture Guide
 
-This document combines the instructions for managing agent skills, static reference rulesets, Codex exclusives, and trigger shortcuts.
-
----
-
-## 1. Skill Triggers & Prompting Cheat Sheet
-
-To trigger installed agent skills reliably, mention their name explicitly using this pattern:
-```text
-Use the <skill-name> skill for this task.
-Task: <description of task>
-```
-
-### Prompt Triggers Reference
-* **Code Reviews & Quality**: `code-reviewer`, `code-review-and-quality`, `pr-review-expert`
-* **Refactoring**: `code-refactor`
-* **Planning & Scaffolding**: `planning-and-task-breakdown`, `feature-planning`, `fullstack-feature-scaffold`
-* **Testing & TDD**: `testing-loop-master`, `test-driven-development`
-* **Framework Experts**: `nextjs-15-expert`, `supabase-expert`, `tailwind-radix-expert`
-* **Sentry Errors**: `sentry-workflow`, `sentry-sdk-setup`
-* **Git Workflows**: `git-workflow-and-versioning`, `git-pushing`
-* **GSD Workflows**: `gsd-plan-phase`, `gsd-execute-phase`, `gsd-progress`, `gsd-verify-work`
+> Operational manual for managing skills, command namespaces, rule compilation, and multi-agent synchronization.
 
 ---
 
-## 2. Agent Rules Books Reference
+## 1. Single Source of Truth Architecture
 
-Rules Books are static **reference files** (policies and patterns) rather than executable skills. 
+All capabilities are maintained under two canonical directories:
+* **`skills/`**: Modular skill manuals (`SKILL.md`).
+* **`rules/`**: Baseline engineering standards, 14 book rulesets, and `/learn` directives.
 
-### Available Rulebooks
-1. `a-philosophy-of-software-design.md` — Deep modules, information hiding.
-2. `clean-architecture.md` — Dependency rule, layer separation.
-3. `clean-code.md` — Clean names, short functions, error patterns.
-4. `code-complete.md` — Quality construction, defensive checks.
-5. `designing-data-intensive-applications.md` — Consistency, partitions, scaling.
-6. `domain-driven-design-distilled.md` — Bound contexts, simple aggregates.
-7. `domain-driven-design.md` — Ubiquitous language, entities vs value objects.
-8. `implementing-domain-driven-design.md` — Aggregates, repositories, ACLs.
-9. `patterns-of-enterprise-application-architecture.md` — Persistence, transactions.
-10. `refactoring.md` — Behavior-preserving structural changes.
-11. `release-it.md` — Timeout, retries, circuit-breakers.
-12. `the-pragmatic-programmer.md` — DRY, orthogonality, automation.
-13. `working-effectively-with-legacy-code.md` — Seams, characterization tests.
+All command wrappers (`commands/`), index registries (`skills.json`), dependency graphs (`docs/DEPENDENCY_GRAPH.md`), catalog docs (`docs/SKILLS_CATALOG.md`), and multi-IDE rules (`.agentrules`, `.cursorrules`, `.windsurfrules`, `copilot-instructions.md`) are **auto-generated build artifacts**.
 
-### Management Commands
+---
+
+## 2. CLI Tooling Reference (`gskills`)
+
 ```bash
-# Sync local rules to all agent folders (Cursor, Copilot, Gemini, etc.)
-./install-rules-books.sh sync
+# Build the complete pipeline end-to-end
+gskills build-all
 
-# Check rule installation status
-./install-rules-books.sh status
-```
+# Synchronize skills across ~/.gemini, ~/.agents, ~/.cursor, ~/.copilot, ~/.codex
+gskills sync
 
-### How to Reference in Prompts
-Explicitly point your agent to the local file or mention it in the prompt:
-```text
-Review this new module using the "clean-architecture" and "clean-code" rules.
-```
+# Rebuild skills.json index
+gskills index
 
----
+# Auto-generate namespaced (/debug/, /web/, /rule/) and flat command wrappers
+gskills generate-commands
 
-## 3. Codex-Exclusive Skills
+# Resolve prerequisite dependency tree & render Mermaid graph
+gskills graph
 
-The directory `~/.codex/skills/` contains 14 skills that are isolated from canonical roots to serve as experimental channels or platform-specific tools.
+# Audit skills repository for potential duplicates and alias collisions
+gskills lint
 
-### Exclusive Skills Matrix
+# Record and view skill usage analytics
+gskills telemetry report
 
-| Category | Skill Name | Purpose |
-|----------|------------|---------|
-| **Deployment** | `cloudflare-deploy`, `vercel-deploy`, `render-deploy` | Platform deployments. |
-| **GitHub** | `gh-address-comments`, `gh-fix-ci`, `yeet` | PR handling and CI debugging via GitHub CLI. |
-| **Browser** | `playwright`, `playwright-interactive`, `screenshot` | Playwright browser automation and captures. |
-| **Data / Sec** | `jupyter-notebook`, `security-best-practices`, `security-threat-model`, `security-ownership-map` | Notebook scaffolding and deep code/security analysis. |
-| **Monitoring** | `sentry` | Querying Sentry endpoints. |
+# Export multi-client IDE rules to a project folder
+gskills export --format all --output-dir ~/my-project
 
-### Propagation CLI (`codex-exclusive-skills.sh`)
-```bash
-# Compare local Codex setup vs canonical roots
-./codex-exclusive-skills.sh compare
-
-# Propagate all exclusive skills globally
-./codex-exclusive-skills.sh propagate
-
-# Selectively propagate specific skills
-./codex-exclusive-skills.sh propagate --skill vercel-deploy --skill sentry
+# Create timestamped tar.gz backups of all agent environment roots
+gskills backup
 ```
 
 ---
 
-## 4. Upstream Skills Selection (Matt Pocock Audit)
+## 3. Command Namespaces & Slash Commands
 
-On **1 May 2026**, an audit of the `mattpocock/skills` repository was completed. Out of 22 skills, **6 unique skills** were added, while the other 16 duplicate skills were skipped:
+Skills and rules are assigned namespaced commands for instant invocation:
 
-### Added Skills
-1. `caveman` (75% token reduction instructions)
-2. `diagnose` (Disciplined debugging loop)
-3. `grill-with-docs` (Challenging plans against domain models)
-4. `qa` (File bugs conversationally)
-5. `setup-matt-pocock-skills` (Config scaffolding)
-6. `zoom-out` (High-level codebase views)
-
-### Skipped Duplicates
-* `tdd`, `improve-codebase-architecture`, `design-an-interface`, `write-a-skill`, `ubiquitous-language`, `migrate-to-shoehorn`, `scaffold-exercises`, `setup-pre-commit`, `git-guardrails-claude-code`, `obsidian-vault`, `edit-article`, `request-refactor-plan`, `triage`, `to-issues`, `to-prd`, `grill-me`.
+* **`/debug/`**: Systematic debugging, root-cause isolation (`/debug/systematic`, `/debug/root-cause`).
+* **`/web/`**: Modern web stack guidance (`/web/nextjs-15-expert`, `/web/supabase-expert`, `/web/tailwind-radix-expert`).
+* **`/lang/`**: Language systems & interop (`/lang/python-ts-interop-mcp-builder`).
+* **`/style/`**: Coding conventions (`/style/google-style-python`, `/style/google-ts`, `/style/nasa-jpl`).
+* **`/gsd/`**: Milestone & phase management (`/gsd/plan-phase`, `/gsd/execute-phase`, `/gsd/progress`).
+* **`/devops/`**: Deployment & containerization (`/devops/docker-patterns`, `/devops/vercel-deploy`).
+* **`/rule/`**: Explicit rule invocation (`/rule/clean-code`, `/rule/user-global-rules`, `/rule/refactoring`).
 
 ---
 
-## 5. Workspace Integration & Utilities
+## 4. Multi-Client Rule Exports
 
-This repository integrates local configurations and custom tools to compile and protect multi-environment developer workflows.
+When opening any project in Cursor, Windsurf, Copilot, or generic LLM harnesses, compile your rules into the target repository:
 
-### 5.1 Borrowed Workspace Skills
-We borrow key high-value skills from companion repositories directly into the local `./skills` directory:
-1. `create-cli` — Language-agnostic CLI specification and usability design rules (from `agent-scripts`).
-2. `brain-to-docs` — Q&A-driven loop to extract vision and decisions into READMEs and ADRs (from `davidondrej-skills`).
-3. `interview-style-doc-building` — Strategic document builder that updates files incrementally without generative filler (from `davidondrej-skills`).
-
-### 5.2 Skill Compiler (`scripts/export_skills.py`)
-The compilation script detects and aggregates skills under the local `./skills` directory (with optional path flags for external folders if needed).
-By default, the command `./global-skills.sh export` compiles these skills into a unified target (`.agentrules`, etc.).
-
-### 5.3 Skill Frontmatter Validator (`scripts/validate_skills.py`)
-This tool checks that all markdown-based skills under the local `./skills` folder conform to quality standards before synchronization:
-* Validates YAML frontmatter parsing syntax.
-* Enforces that `name` and `description` are defined and are non-empty strings.
-* Scans for name conflicts/collisions.
-
-Run the validation suite via:
 ```bash
-python3 scripts/validate_skills.py
+# Export all rule formats (.agentrules, .cursorrules, .windsurfrules, copilot-instructions.md)
+gskills export --format all --output-dir ~/my-project
 ```
 
-### 5.4 Stale Lock & Safe Git Committer (`scripts/committer.sh`)
-This helper script secures git operations against accidental broad staging and environment index locks:
-* Restores broad staged changes before operation.
-* Stages only the explicit file paths passed.
-* Detects and removes stale `.git/index.lock` locks using the `--force` flag.
-
-Run the committer utility via:
-```bash
-bash scripts/committer.sh [--force] "feat: your commit message" path/to/file1 path/to/file2
-```
-
+This ensures any AI assistant touching your project automatically inherits all 388 skill guidelines and 16 core engineering book rules.

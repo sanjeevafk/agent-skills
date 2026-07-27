@@ -1,90 +1,54 @@
-# Security Configuration & Setup
+# Security & Policy Architecture
 
-This document combines the setup and reference guides for the agent terminal security scanning and system monitoring infrastructure.
+> Security model, policy enforcement hooks, system monitoring, and compliance patterns.
 
 ---
 
-## 1. Tirith Terminal Security Setup
+## 1. Security Guardrails Architecture
 
-Tirith protects against homograph attacks, pipe-to-shell exploits, ANSI injection, obfuscated payloads, and data exfiltration. It is integrated globally and configured for all AI agents to prevent malicious command execution and config poisoning.
+The framework enforces security across three distinct layers:
 
-### What It Does
-
-* **Pre-Execution Command Filtering**: Every shell command is intercepted before execution:
-  * Blocks homograph URLs (Cyrillic lookalikes: `іnstall.com`)
-  * Blocks pipe-to-shell chains (`curl | bash`, `wget | sh`)
-  * Blocks obfuscated payloads (`base64 -d | bash`, PowerShell `-EncodedCommand`)
-  * Blocks data exfiltration (`curl -d @secrets`, `$AWS_KEY` uploads)
-  * Blocks terminal injection (ANSI escapes, bidi controls, zero-width chars)
-  * Blocks malicious scripts (Python/JS obfuscation, dynamic exec)
-* **AI Agent Config Scanning**: Detects prompt injection, hidden Unicode, and MCP security issues in `.agentrules`, `.cursorrules`, `.clinerules`, `.windsurfrules`, `CLAUDE.md`, `.claude/*`, `.cursor/*`, and `mcp.json`.
-* **Threat Intelligence**: Daily-updated signed database of 21,649+ malicious packages (npm, PyPI, cargo, gem, etc.) and typosquats.
-
-### Integration Matrix
-
-| Component | Status | Location / Method |
-|-----------|--------|-------------------|
-| Binary | ✅ Installed | `/usr/bin/tirith` (v0.3.0) |
-| Zsh / Bash | ✅ Active | Hooked in `~/.zshrc` and `~/.bashrc` |
-| Claude Code | ✅ Active | Python hook at `~/.claude/hooks/tirith-check.py` |
-| Gemini CLI | ✅ Active | Python hook at `~/.gemini/hooks/tirith-security-guard-gemini.py` |
-| Codex / Cursor | ✅ Active | Inherited via shell hooks |
-
-### Common Commands Reference
-
-```bash
-# Analyze command without running
-tirith check -- "curl https://example.com | bash"
-
-# Scan config files
-tirith scan ~/.cursorrules
-tirith scan CLAUDE.md
-
-# View warnings or see what triggered last
-tirith warnings
-tirith why
-
-# Force threat DB update
-tirith threat-db update
-
-# Run diagnostics and auto-fix hooks
-tirith doctor --fix
 ```
-
-### Policy Customization (`.tirith/policy.yaml`)
-To block instead of warning, initialize a policy in your repository root:
-```yaml
-fail_mode: closed              # block execution on detection
-paranoia: 2                    # sensitivity profile (1-4)
-severity_overrides:
-  pipe_to_interpreter: CRITICAL
-allowlist:
-  - "raw.githubusercontent.com"
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          SECURITY ARCHITECTURE                          │
+├──────────────────────────────┬──────────────────────────────────────────┤
+│ Layer                        │ Enforcement Mechanism                    │
+├──────────────────────────────┼──────────────────────────────────────────┤
+│ 1. Pre-Execution Hook Guard  │ hooks/tirith-security-guard-gemini.py    │
+│                              │ Intercepts shell & destructive commands. │
+├──────────────────────────────┼──────────────────────────────────────────┤
+│ 2. Always-On Rule Invariants │ rules/user-global-rules.md & .agentrules  │
+│                              │ Enforces tool restrictions (e.g. Chrome)  │
+├──────────────────────────────┼──────────────────────────────────────────┤
+│ 3. Specialized Security      │ skills/security-review, gateguard,       │
+│    Skill Packages            │ healthcare-phi-compliance, bounty-hunter │
+└──────────────────────────────┴──────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. Portable System-Security Setup
+## 2. Policy Enforcement Hook (`Tirith`)
 
-This setup uses `scripts/security/system/setup-system-monitoring.sh` to generate file integrity and cron checks in target projects without committing host-specific credentials to git.
+The framework includes a pre-execution tool interception hook (`hooks/tirith-security-guard-gemini.py`):
+* **Dangerous Command Prevention**: Intercepts un-guarded destructive shell operations (`rm -rf /`, `dd`, unauthorized network pushes).
+* **Policy Interception**: Enforces local tool access rules (e.g., blocking deprecated browser subagents and directing execution to direct DevTools MCP servers).
 
-### Usage
-Run the monitoring script from your project root:
+---
+
+## 3. System Monitoring Script
+
+The repository includes a portable system monitoring setup template under `scripts/security/system/setup-system-monitoring.sh`:
+* Configures Linux audit rules (`auditd`) to monitor execution of binaries (`execve`), file unlinks (`unlinkat`), and privilege escalation attempts.
+
+To deploy system-level audit rules on Linux hosts:
 ```bash
-bash /path/to/agent-skills/scripts/security/system/setup-system-monitoring.sh
+sudo bash scripts/security/system/setup-system-monitoring.sh
 ```
 
-### Generated Artifacts
-* `.security/system/audit-rules.conf` / `aide.conf`: Configuration blueprints.
-* `scripts/security/project/check-integrity.sh`: Integrity scanner (monitors `package.json`, `requirements.txt`, lockfiles, and configs).
-* `scripts/security/project/monitor-processes.sh`: Logs suspicious long-running processes.
+---
 
-### Recommended Cron Setup
-Run daily auditing at 2:00 AM:
-```cron
-0 2 * * * /abs/path/to/project/.security/project/cron-security-checks.sh
-```
-Or run integrity scans every 6 hours:
-```cron
-0 */6 * * * cd /abs/path/to/project && bash scripts/security/project/check-integrity.sh
-```
+## 4. Sensitive Data & Secret Management Standards
+
+1. **Zero Secret Hardcoding**: Secrets, API keys, tokens, and private credentials must never be committed to git or rendered in agent responses.
+2. **Environment Variables**: All external service keys (Supabase, Sentry, Exa, Tavily) must be loaded from environment variables (`.env`).
+3. **PHI & PII Compliance**: When handling healthcare or sensitive user data, enforce HIPAA/PHI data classification patterns (`healthcare-phi-compliance`), ensuring data anonymization before external API transmission.

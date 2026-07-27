@@ -1,103 +1,58 @@
+# Engineering Principles & Architecture Standards
+
+> Canonical reference for architectural standards, coding invariants, and software engineering book rules.
+
 ---
-description: Lightweight engineering principles reference (optimized for token efficiency)
-applyTo: "**/*.{ts,tsx,js,jsx,py,md}"
+
+## 1. Core Philosophy
+
+1. **Single Source of Truth**: `skills/` and `rules/` are canonical. All commands, indexes, dependency graphs, and IDE exports are derived build artifacts.
+2. **Explicit > Clever**: Code readability, maintainability, and clear type boundaries take priority over clever shortcuts.
+3. **Information Hiding & Deep Modules**: Simple, clean interfaces hiding internal complexity (*A Philosophy of Software Design*).
+4. **Separation of Concerns**: Strict boundary enforcement between UI, Business Domain, and Infrastructure layers (*Clean Architecture*).
+5. **Defend Boundaries**: Validate all external inputs at system entry points; enforce strict typing inside domain boundaries (*Code Complete*).
+6. **Zero-Defect Verification**: Never declare work complete without empirical CLI test passing evidence (*TDD* & *Verification Loop*).
+
 ---
 
-# Engineering Principles Quick Reference
+## 2. Incorporated Software Engineering Standards (14 Books)
 
-**For full detailed rules, see:** `~/.copilot/archived-rules/agent-rules-books/`  
-**Ask me directly:** "Show me clean code patterns" or "DDD rules for this schema"
+The framework enforces guidelines derived from 14 software engineering classics:
 
-## Core Philosophy
+| Book Standard | Primary Architectural Mandate |
+| :--- | :--- |
+| **Clean Code** (Martin) | Short, single-responsibility functions; meaningful names; explicit error handling. |
+| **Clean Architecture** (Martin) | The Dependency Rule: Outer layers depend on inner domain; domain never imports infrastructure. |
+| **Refactoring** (Fowler) | Small, behavior-preserving structural changes backed by deterministic tests. |
+| **The Pragmatic Programmer** (Hunt & Thomas) | DRY principle, orthogonality, automation, and explicit contract design. |
+| **Designing Data-Intensive Applications** (Kleppmann) | Concurrency control, idempotency, data isolation levels, and partition safety. |
+| **A Philosophy of Software Design** (Ousterhout) | Deep modules, hiding implementation details, reducing cognitive complexity. |
+| **Domain-Driven Design** (Evans, Vernon) | Ubiquitous language, bounded contexts, entities vs value objects, aggregate boundaries. |
+| **Code Complete** (McConnell) | Defensive programming, input sanitization, assertions, and boundary checks. |
+| **Working Effectively with Legacy Code** (Feathers) | Establishing characterization tests and dependency seams before modifying legacy logic. |
+| **Release It!** (Nygard) | Production stability patterns: Timeouts, Circuit Breakers, Bulkheads, and Graceful Degradation. |
+| **PofEAA** (Fowler) | Domain Model, Data Mapper, Repository, and Unit of Work patterns for enterprise applications. |
 
-1. **Explicit > Clever** - Readability and maintainability first
-2. **Hide Complexity** - Simple interfaces, deep implementations
-3. **Separation of Concerns** - One responsibility per unit
-4. **Test-Driven** - Tests before implementation
-5. **Defend Boundaries** - Validate at edges, trust inside
+---
 
-## Quick Decision Tree
-
-### Am I writing...
-
-**Business Logic?**
-- Use pure functions
-- Make invalid states impossible
-- Test edge cases first
-- Validate inputs at boundary
-
-**API/Database Code?**
-- Parameterized queries always
-- Whitelist inputs, not blacklist
-- Log security events
-- Enforce auth at layer boundary
-
-**User-Facing Code?**
-- Accessibility first
-- Responsive design
-- Semantic HTML
-- Keyboard navigation
-
-**Infrastructure/Tooling?**
-- Fail fast and loud
-- Comprehensive logging
-- Graceful degradation
-- Document assumptions
-
-## By Technology
+## 3. Technology Guidelines
 
 ### TypeScript
-- Strict mode always: `strict: true`
-- No `any` except interop boundaries
-- Discriminated unions for complex state
-- Readonly where possible
+* Strict mode enabled (`strict: true`).
+* Disallow `any` except at explicitly documented external boundary adaptors.
+* Discriminated unions for domain state modeling.
+* Immutability preferred (`readonly`).
 
 ### Python
-- Type hints on all functions
-- Dataclasses > dicts for structured data
-- Context managers for resources
-- Single-responsibility functions
+* Complete type annotations on all function signatures (`mypy` clean).
+* Dataclasses or Pydantic models over raw untyped dictionaries.
+* Explicit context managers (`with`) for resource management.
 
-### Database (Postgres/Supabase)
-- RLS on every user-facing table
-- Migrations testable and reversible
-- Foreign keys enforced
-- Audit logs for sensitive data
+### Database (Postgres & Supabase)
+* Row Level Security (RLS) policies mandatory on every user-facing table.
+* Parameterized queries mandatory (zero string concatenation for SQL).
+* Reversible, migration-safe DDL schemas.
 
-### APIs (REST/GraphQL)
-- Consistent error responses
-- Pagination for lists
-- CORS/auth on all endpoints
-- API versioning strategy
-
-## Security Patterns
-
-**Authentication:** Use established libraries (Supabase Auth, NextAuth)  
-**Secrets:** Environment variables only, never in code  
-**SQL:** Parameterized queries, never string concatenation  
-**Validation:** Validate at all trust boundaries  
-**Errors:** Don't leak internal implementation details
-
-## Testing
-
-- Unit tests for business logic
-- Integration tests for flows
-- E2E tests for user-critical paths
-- Aim for 80%+ coverage on core code
-
-## Common Anti-Patterns to Avoid
-
-- Mixing business logic with UI
-- Global state without isolation
-- Hardcoded configuration values
-- Catching all exceptions silently
-- Temporary code that becomes permanent
-- Over-engineering simple problems
-
-## Response Style
-
-**Canonical Rule:** No emojis in any responses. Use clear text and formatting instead. Applies to all agents and all response contexts.
-
----
-
-**For deeper guidance on any topic, ask me directly.**
+### Production Reliability & Resilience
+* Wrap all external API and network boundaries with explicit timeout and retry limits.
+* Implement fallback degradation paths for external dependency outages.
