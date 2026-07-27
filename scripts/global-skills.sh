@@ -2,6 +2,8 @@
 set -euo pipefail
 
 CONFIG_FILE="${GLOBAL_SKILLS_CONFIG:-$HOME/.global-skills.conf}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Defaults (used if config file is missing)
 DEFAULT_ROOT_AGENTS="${HOME}/.agents/skills"
@@ -65,6 +67,13 @@ Usage:
   global-skills init-config
   global-skills export [--format agentrules|cursor|copilot|windsurf|all] [--include skill1,skill2] [--output-dir DIR]
   global-skills import [skills_dir]
+  global-skills index
+  global-skills generate-commands
+  global-skills graph
+  global-skills lint
+  global-skills telemetry [record|report]
+  global-skills generate-docs
+  global-skills build-all
 
 Config:
   Uses: $CONFIG_FILE
@@ -151,6 +160,12 @@ sync_all() {
       cp -a "$src/." "$dest_path/"
     done
   done < <(list_canonical_skills)
+
+  echo "Auto-generating commands, index, graph, and docs..."
+  python3 "$SCRIPT_DIR/build_index.py"
+  python3 "$SCRIPT_DIR/generate_commands.py"
+  python3 "$SCRIPT_DIR/dependency_graph.py"
+  python3 "$SCRIPT_DIR/generate_docs.py"
 
   printf 'Sync complete.\n'
 }
@@ -296,39 +311,48 @@ case "$cmd" in
     ;;
   export)
     shift || true
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    EXPORT_SCRIPT="$SCRIPT_DIR/export_skills.py"
-    if [ ! -f "$EXPORT_SCRIPT" ]; then
-      echo "Error: export_skills.py not found at $EXPORT_SCRIPT"
+    EXPORT_SCRIPT="/export_skills.py"
+    if [ ! -f "" ]; then
+      echo "Error: export_skills.py not found at "
       exit 1
     fi
-
-    # Check if --skills-dir is explicitly passed
-    local has_skills_dir=0
-    for arg in "$@"; do
-      if [[ "$arg" == "--skills-dir"* ]]; then
-        has_skills_dir=1
-      fi
-    done
-
-    if [ "$has_skills_dir" -eq 1 ]; then
-      python3 "$EXPORT_SCRIPT" "$@"
-    else
-      # Default: find the first active canonical root with actual skills
-      SKILLS_SOURCE=""
-      for root in "${CANONICAL_ROOTS[@]}"; do
-        if [ -d "$root" ] && [ -n "$(find "$root" -name SKILL.md 2>/dev/null)" ]; then
-          SKILLS_SOURCE="$root"
-          break
-        fi
-      done
-
-      if [ -n "$SKILLS_SOURCE" ]; then
-        python3 "$EXPORT_SCRIPT" --skills-dir "${SKILLS_SOURCE}" "$@"
-      else
-        python3 "$EXPORT_SCRIPT" "$@"
-      fi
-    fi
+    python3 "" --format all --skills-dir "/skills" --output-dir "/exports"
+    python3 "" --format all --skills-dir "/skills" --output-dir ""
+    ;;
+  index)
+    python3 "$SCRIPT_DIR/build_index.py"
+    ;;
+  generate-commands)
+    python3 "$SCRIPT_DIR/generate_commands.py"
+    ;;
+  graph)
+    python3 "$SCRIPT_DIR/dependency_graph.py"
+    ;;
+  lint)
+    python3 "$SCRIPT_DIR/lint_skills.py"
+    ;;
+  telemetry)
+    shift || true
+    python3 "$SCRIPT_DIR/telemetry.py" ""
+    ;;
+  generate-docs)
+    python3 "$SCRIPT_DIR/generate_docs.py"
+    ;;
+  build-all)
+    echo "=== [1/6] Building skills.json index... ==="
+    python3 "$SCRIPT_DIR/build_index.py"
+    echo "=== [2/6] Auto-generating command wrappers... ==="
+    python3 "$SCRIPT_DIR/generate_commands.py"
+    echo "=== [3/6] Building dependency graph... ==="
+    python3 "$SCRIPT_DIR/dependency_graph.py"
+    echo "=== [4/6] Running quality & duplicate linter... ==="
+    python3 "$SCRIPT_DIR/lint_skills.py"
+    echo "=== [5/6] Auto-generating documentation artifacts... ==="
+    python3 "$SCRIPT_DIR/generate_docs.py"
+    echo "=== [6/6] Exporting multi-client rule files... ==="
+    python3 "$SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR/exports"
+    python3 "$SCRIPT_DIR/export_skills.py" --format all --skills-dir "$REPO_DIR/skills" --output-dir "$REPO_DIR"
+    echo "=== Build All Complete! ==="
     ;;
   *)
     usage

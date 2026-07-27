@@ -105,6 +105,32 @@ def discover_skills(skills_dirs: list[Path], include: list[str] | None = None) -
     return skills
 
 
+
+# ── Rules discovery ────────────────────────────────────────────────────────────
+
+def discover_rules(rules_dir: Path) -> list[dict]:
+    """Return list of rule dicts sorted by filename from rules_dir."""
+    rules = []
+    if not rules_dir.exists():
+        return rules
+    rule_mds = sorted(list(rules_dir.rglob("*.md")))
+    for rule_md in rule_mds:
+        try:
+            content = rule_md.read_text(encoding='utf-8')
+        except Exception as e:
+            print(f"Error reading {rule_md}: {e}", file=sys.stderr)
+            continue
+        meta, body = strip_frontmatter(content)
+        name = meta.get('title') or rule_md.stem.replace('_', ' ').replace('-', ' ').title()
+        rules.append({
+            'name': name,
+            'filename': rule_md.name,
+            'path': rule_md,
+            'body': body.strip(),
+        })
+    return rules
+
+
 # ── Format renderers ──────────────────────────────────────────────────────────
 
 HEADER_BANNER = """\
@@ -119,9 +145,23 @@ HEADER_BANNER = """\
 # ─────────────────────────────────────────────────────────────────────────────
 """
 
-def render_generic(skills: list[dict], fmt: str) -> str:
+def render_generic(skills: list[dict], fmt: str, rules: list[dict] | None = None) -> str:
     """Render generic instruction format — plain-text rules."""
     parts = [HEADER_BANNER.format(fmt=fmt, count=len(skills))]
+
+    if rules:
+        parts.append("# ─────────────────────────────────────────────────────────────────────────────")
+        parts.append("# CORE ENGINEERING STANDARDS & BOOK RULES")
+        parts.append("# ─────────────────────────────────────────────────────────────────────────────\n")
+        for r in rules:
+            parts.append(f"### Rule: {r['name']}")
+            parts.append(r['body'])
+            parts.append("\n---\n")
+
+    parts.append("# ─────────────────────────────────────────────────────────────────────────────")
+    parts.append("# SKILL RULES")
+    parts.append("# ─────────────────────────────────────────────────────────────────────────────\n")
+
     for s in skills:
         parts.append(f"## Skill: {s['name']}")
         if s['description']:
@@ -143,22 +183,22 @@ def render_generic(skills: list[dict], fmt: str) -> str:
     return '\n'.join(parts)
 
 
-def render_agentrules(skills: list[dict]) -> str:
+def render_agentrules(skills: list[dict], rules: list[dict] | None = None) -> str:
     """Render generic .agentrules format."""
-    return render_generic(skills, 'agentrules')
+    return render_generic(skills, 'agentrules', rules)
 
 
-def render_cursor(skills: list[dict]) -> str:
+def render_cursor(skills: list[dict], rules: list[dict] | None = None) -> str:
     """Render .cursorrules format."""
-    return render_generic(skills, 'cursor')
+    return render_generic(skills, 'cursor', rules)
 
 
-def render_windsurf(skills: list[dict]) -> str:
+def render_windsurf(skills: list[dict], rules: list[dict] | None = None) -> str:
     """Render .windsurfrules format."""
-    return render_generic(skills, 'windsurf')
+    return render_generic(skills, 'windsurf', rules)
 
 
-def render_copilot(skills: list[dict]) -> str:
+def render_copilot(skills: list[dict], rules: list[dict] | None = None) -> str:
     """Render GitHub Copilot instructions markdown format."""
     parts = [
         "# GitHub Copilot Instructions\n",
@@ -270,6 +310,9 @@ def main():
     include = [s.strip() for s in args.include.split(',')] if args.include else None
     skills = discover_skills(skills_dirs, include)
 
+    rules_dir = repo_root / 'rules'
+    rules = discover_rules(rules_dir)
+
     if not skills:
         dirs_str = ", ".join(str(p) for p in skills_dirs)
         print(f"No skills found in: {dirs_str}", file=sys.stderr)
@@ -286,7 +329,7 @@ def main():
 
     for fmt in formats_to_run:
         spec = FORMATS[fmt]
-        content = spec['render'](skills)
+        content = spec['render'](skills, rules)
         out_path = args.output_dir / spec['filename']
 
         if args.dry_run:
@@ -299,7 +342,7 @@ def main():
         else:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(content, encoding='utf-8')
-            print(f"[{fmt}] Written: {out_path} ({len(content):,} chars, {len(skills)} skills)")
+            print(f"[{fmt}] Written: {out_path} ({len(content):,} chars, {len(skills)} skills, {len(rules)} book/global rules)")
 
 
 if __name__ == '__main__':
