@@ -116,6 +116,8 @@ Usage:
   global-skills telemetry [record|report]
   global-skills generate-docs
   global-skills build-all
+  global-skills verify
+  global-skills benchmark [--repeats N] [--output FILE]
 
 Config:
   Uses: $CONFIG_FILE
@@ -437,6 +439,13 @@ case "$cmd" in
     echo "=== [9/9] Running System Doctor Verification... ==="
     python3 "$PY_SCRIPT_DIR/doctor.py"
     echo "=== Platform Build Complete! ==="
+    ;;
+  verify)
+    python3 "$PY_SCRIPT_DIR/verify_all.py"
+    ;;
+  benchmark)
+    shift || true
+    python3 "$PY_SCRIPT_DIR/benchmark.py" "$@"
     ;;
   *)
     usage

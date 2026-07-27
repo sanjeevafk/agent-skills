@@ -102,6 +102,8 @@ gskills export --format cursor --output-dir ~/my-project
 
 ```bash
 gskills build-all         # Run full index, command generation, graph, lint, docs, and exports
+gskills verify            # Run validation, integration tests, syntax, and compilation checks
+gskills benchmark         # Measure validation, generation, and test-suite performance
 gskills sync              # Copy skills across ~/.gemini, ~/.agents, ~/.cursor, ~/.copilot, ~/.codex
 gskills index             # Rebuild skills.json index
 gskills generate-commands # Auto-generate namespaced & flat command wrappers
