@@ -23,10 +23,11 @@ def run_cmd(prompt: str, model: str = None) -> tuple[int, str, str]:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode, proc.stdout, proc.stderr
 
-def run_judge(prompt: str, out_a: str, out_b: str, schema_path: Path, model: str = None) -> dict:
-    judging_prompt = f"""You are an expert AI evaluator judging two coding agent outputs head-to-head.
+def run_judge(prompt: str, out_a: str, out_b: str, model: str = None) -> dict:
+    judging_prompt = f"""You are an expert AI evaluator judging two coding agent responses head-to-head.
 
-[Task Prompt]: {prompt}
+[Original Task Prompt]:
+{prompt}
 
 ---
 [Agent Response A]:
@@ -36,36 +37,56 @@ def run_judge(prompt: str, out_a: str, out_b: str, schema_path: Path, model: str
 {out_b}
 ---
 
-Evaluate both responses strictly on a scale of 1 to 5 for each of these criteria:
-1. correctness (technical accuracy, lack of errors)
-2. completeness (covers all requirements in the prompt)
-3. maintainability (clean, documented, easy to extend)
-4. architecture (structure, patterns used)
-5. security (covers security boundaries, prevents leaks/vulnerabilities)
-6. reasoning_quality (logical breakdown, explanations)
-7. instruction_adherence (follows original prompts)
+Evaluate both responses strictly. You MUST award a score from 1 to 5 for each of these criteria:
+- correctness (technical accuracy, lack of errors)
+- completeness (covers all requirements in the prompt)
+- maintainability (clean, documented, easy to extend)
+- architecture (structure, patterns used)
+- security (covers security boundaries, prevents leaks/vulnerabilities)
+- reasoning_quality (logical breakdown, explanations)
+- instruction_adherence (follows original prompts)
 
-You must output a single JSON object conforming to the schema. Blind yourself to Control/Treatment labels. Compare them objectively."""
+You must output a single JSON object inside a ```json ... ``` code block. Follow this structure:
+{{
+  "A": {{
+    "correctness": [1-5],
+    "completeness": [1-5],
+    "maintainability": [1-5],
+    "architecture": [1-5],
+    "security": [1-5],
+    "reasoning_quality": [1-5],
+    "instruction_adherence": [1-5],
+    "justification": "Why this score was given"
+  }},
+  "B": {{
+    "correctness": [1-5],
+    "completeness": [1-5],
+    "maintainability": [1-5],
+    "architecture": [1-5],
+    "security": [1-5],
+    "reasoning_quality": [1-5],
+    "instruction_adherence": [1-5],
+    "justification": "Why this score was given"
+  }},
+  "winner": "A" or "B" or "Draw",
+  "comparison_summary": "Overall comparison summary"
+}}
 
-    cmd = [
-        "agy",
-        "--dangerously-skip-permissions",
-        "--json-schema", str(schema_path),
-        "--output-format", "json",
-        "-p", judging_prompt
-    ]
-    if model:
-        cmd.extend(["--model", model])
-        
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode == 0:
+Respond ONLY with the JSON code block. Blind yourself to which output is Control or Treatment."""
+
+    rc, stdout, stderr = run_cmd(judging_prompt, model)
+    if rc == 0:
+        json_match = re.search(r"```json\s*(.*?)\s*```", stdout, re.DOTALL | re.IGNORECASE)
+        json_str = json_match.group(1) if json_match else stdout
+        json_str = json_str.strip()
         try:
-            return json.loads(proc.stdout)
+            return json.loads(json_str)
         except Exception as e:
-            print(f"⚠️ Failed to parse judge output: {e}. Output was: {proc.stdout}")
+            print(f"⚠️ Failed to parse judge JSON: {e}. Raw stdout was:\n{stdout}")
             
-    print(f"⚠️ Judge call failed with code {proc.returncode}. Stderr: {proc.stderr}")
+    print(f"⚠️ Judge call failed with code {rc}. Stderr: {stderr}")
     return None
+
 
 def check_code_syntax(output: str) -> tuple[int, list[str]]:
     # Extract code blocks
@@ -260,7 +281,7 @@ Use these guidelines to complete the task:
                 out_a, out_b = (out_t, out_c) if is_swapped else (out_c, out_t)
                 
                 print("⚖️ Submitting responses to blinded LLM-as-a-Judge...")
-                judge_res = run_judge(prompt, out_a, out_b, schema_path, model)
+                judge_res = run_judge(prompt, out_a, out_b, model)
                 
                 if not judge_res:
                     print("⚠️ Judging failed! Skipping this run.")
