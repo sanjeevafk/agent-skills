@@ -20,13 +20,9 @@ process.stdin.on('end', () => {
     const remaining = data.context_window?.remaining_percentage;
     const usedPercentage = data.context_window?.used_percentage;
     
-    // Extract tokens - cross-compatible with both Antigravity and Claude Code
+    // Extract tokens - total_input_tokens represents the active loaded context window
     const tokensTotal = data.context_window?.context_window_size || data.context_window?.tokens_total;
-    const tokensUsed = data.context_window?.tokens_used || (
-      data.context_window?.current_usage 
-        ? ((data.context_window.current_usage.input_tokens || 0) + (data.context_window.current_usage.output_tokens || 0))
-        : 0
-    );
+    const tokensUsed = data.context_window?.total_input_tokens || data.context_window?.tokens_used || 0;
 
     let ctxStr = '';
     if (remaining != null || usedPercentage != null) {
