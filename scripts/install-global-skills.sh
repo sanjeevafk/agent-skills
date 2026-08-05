@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="$SCRIPT_DIR/global-skills.sh"
 TARGET_DIR="${HOME}/.local/bin"
 TARGET_BIN="$TARGET_DIR/global-skills"
+TARGET_LINK="$TARGET_DIR/skills"
 CONFIG_FILE="${HOME}/.global-skills.conf"
-ALIAS_LINE="alias gskills='global-skills'"
+ALIAS_LINE="alias skills='global-skills'"
 
 if [ ! -f "$SOURCE_SCRIPT" ]; then
   echo "Error: source script not found: $SOURCE_SCRIPT"
@@ -16,8 +17,9 @@ fi
 mkdir -p "$TARGET_DIR"
 cp "$SOURCE_SCRIPT" "$TARGET_BIN"
 chmod +x "$TARGET_BIN"
+ln -sf "$TARGET_BIN" "$TARGET_LINK"
 
-echo "Installed binary: $TARGET_BIN"
+echo "Installed binary: $TARGET_BIN (symlinked as $TARGET_LINK)"
 
 if [ ! -f "$CONFIG_FILE" ]; then
   "$TARGET_BIN" init-config

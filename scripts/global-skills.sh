@@ -94,6 +94,9 @@ ROOT_CODEX="${DEFAULT_ROOT_CODEX}"
 
 # Backup base directory used by: global-skills backup
 BACKUP_BASE_DIR="${DEFAULT_BACKUP_BASE_DIR}"
+
+# Repository root directory
+REPO_DIR="${REPO_DIR}"
 CFG_EOF
 
   echo "Created default config: $CONFIG_FILE"
@@ -202,15 +205,19 @@ sync_all() {
         continue
       fi
 
-      cp -a "$src/." "$dest_path/"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --exclude='.git' "$src/" "$dest_path/"
+      else
+        cp -a "$src/." "$dest_path/"
+      fi
     done
   done < <(list_canonical_skills)
 
   echo "Auto-generating commands, index, graph, and docs..."
-  python3 "$SCRIPT_DIR/build_index.py"
-  python3 "$SCRIPT_DIR/generate_commands.py"
-  python3 "$SCRIPT_DIR/dependency_graph.py"
-  python3 "$SCRIPT_DIR/generate_docs.py"
+  python3 "$PY_SCRIPT_DIR/build_index.py"
+  python3 "$PY_SCRIPT_DIR/generate_commands.py"
+  python3 "$PY_SCRIPT_DIR/dependency_graph.py"
+  python3 "$PY_SCRIPT_DIR/generate_docs.py"
 
   printf 'Sync complete.\n'
 }
