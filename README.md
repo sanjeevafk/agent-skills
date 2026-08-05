@@ -21,10 +21,10 @@ After opening a new shell:
 
 ```bash
 # Verify installation
-gskills status
+skills status
 
 # Run full framework build
-gskills build-all
+skills build-all
 ```
 
 ---
@@ -90,28 +90,28 @@ Export your entire skills collection and 14 book standards into single-file rule
 
 ```bash
 # Export all client rule formats at once (.agentrules, .cursorrules, .windsurfrules, copilot-instructions.md)
-gskills export --format all --output-dir ~/my-project
+skills export --format all --output-dir ~/my-project
 
 # Export specific format
-gskills export --format cursor --output-dir ~/my-project
+skills export --format cursor --output-dir ~/my-project
 ```
 
 ---
 
-## `gskills` CLI Reference
+## `skills` CLI Reference
 
 ```bash
-gskills build-all         # Run full index, command generation, graph, lint, docs, and exports
-gskills verify            # Run validation, integration tests, syntax, and compilation checks
-gskills benchmark         # Measure validation, generation, and test-suite performance
-gskills sync              # Copy skills across ~/.gemini, ~/.agents, ~/.cursor, ~/.copilot, ~/.codex
-gskills index             # Rebuild skills.json index
-gskills generate-commands # Auto-generate namespaced & flat command wrappers
-gskills graph            # Build skill dependency tree & Mermaid graph
-gskills lint             # Audit repository for duplicates and description similarities
-gskills telemetry        # Record and generate skill usage analytics
-gskills generate-docs    # Regenerate catalog & metrics dashboards
-gskills backup           # Create timestamped tar.gz backups of all agent roots
+skills build-all         # Run full index, command generation, graph, lint, docs, and exports
+skills verify            # Run validation, integration tests, syntax, and compilation checks
+skills benchmark         # Measure validation, generation, and test-suite performance
+skills sync              # Copy skills across ~/.gemini, ~/.agents, ~/.cursor, ~/.copilot, ~/.codex
+skills index             # Rebuild skills.json index
+skills generate-commands # Auto-generate namespaced & flat command wrappers
+skills graph            # Build skill dependency tree & Mermaid graph
+skills lint             # Audit repository for duplicates and description similarities
+skills telemetry        # Record and generate skill usage analytics
+skills generate-docs    # Regenerate catalog & metrics dashboards
+skills backup           # Create timestamped tar.gz backups of all agent roots
 ```
 
 > **Test coverage note:** `gskills verify` currently validates all 390 skills, generated command coverage, repository integrity, filesystem safety, shell syntax, and Python compilation. Rules and custom commands are included in generation checks but are not yet behaviorally evaluated in depth. The benchmark currently measures framework build speed; AI response quality and rule/command behavior benchmarks are planned next.
