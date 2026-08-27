@@ -97,7 +97,10 @@ function installShippingStub(overrides: Partial<APIStubOptions['shipping']> = {}
     overnight: { id: 'ship_ont', cost: overrides.overnightCost ?? 24.00, label: 'Overnight', estimatedDaysMin: 1, estimatedDaysMax: 1 },
   };
 
-  ctx.route('POST**/api/shipping/rates', async (route) => {
+  ctx.route('**/api/shipping/rates', async (route) => {
+    if (route.request().method() !== 'POST') {
+      return route.fallback();
+    }
     const tier = (overrides.selectedTier as ShippingTierKey) ?? 'standard';
     await route.fulfill({
       status: 200,
@@ -109,7 +112,10 @@ function installShippingStub(overrides: Partial<APIStubOptions['shipping']> = {}
 
 function installPaymentStub(fail: boolean) {
   const ctx = getMustHaveContext();
-  ctx.route('POST**/api/payments/process', async (route) => {
+  ctx.route('**/api/payments/process', async (route) => {
+    if (route.request().method() !== 'POST') {
+      return route.fallback();
+    }
     const body = await route.request().json() as Record<string, unknown>;
     const cardNumber = (body.cardNumber as string)?.replace(/\s/g, '') ?? '';
 
@@ -136,7 +142,10 @@ function installPaymentStub(fail: boolean) {
 
 function installCartStub() {
   const ctx = getMustHaveContext();
-  ctx.route('GET**/api/cart', async (route) => {
+  ctx.route('**/api/cart', async (route) => {
+    if (route.request().method() !== 'GET') {
+      return route.fallback();
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -153,7 +162,10 @@ function installCartStub() {
 
 function installCouponStub() {
   const ctx = getMustHaveContext();
-  ctx.route('POST**/api/coupons/apply', async (route) => {
+  ctx.route('**/api/coupons/apply', async (route) => {
+    if (route.request().method() !== 'POST') {
+      return route.fallback();
+    }
     const body = await route.request().json() as Record<string, unknown>;
     const code = (body.code as string)?.toUpperCase() ?? '';
 

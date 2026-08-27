@@ -1,5 +1,9 @@
 import { test as baseAuth } from '@playwright/test';
-import { resolve } from 'path';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 /**
  * Path to the serialized auth state file.
