@@ -255,7 +255,22 @@ QUOTA_RE = re.compile(r"Resets in\s*(?:(\d+)m)?\s*(\d+)s")
 
 def run_cmd(prompt: str, model: str = None, backend: str = "cmd", timeout: int = 300,
             quota_retries: int = 4) -> tuple[int, str, str, float]:
-    """Execute via cmd CLI (e.g. Qwen) or agy CLI (Gemini)."""
+    """Execute via opencode CLI, cmd CLI, or agy CLI."""
+    if backend == "opencode":
+        actual_model = model or "opencode/nemotron-3.5-lightning-free"
+        cmd_prompt = prompt + "\n\n[OUTPUT INSTRUCTION]: Provide your complete analysis and full code implementation directly in your markdown response text. Do NOT create, write, or modify any files on disk."
+        cmd = ["opencode", "run", "-m", actual_model, cmd_prompt]
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            rc, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired:
+            rc, out, err = 124, "", f"TIMEOUT after {timeout}s"
+        except Exception as e:
+            rc, out, err = 1, "", f"Exception: {e}"
+        elapsed = time.perf_counter() - start
+        return rc, out, err, elapsed
+
     if backend == "cmd":
         actual_model = model or "qwen/qwen3.7-flash"
         cmd_prompt = prompt + "\n\n[OUTPUT INSTRUCTION]: Provide your complete analysis and full code implementation directly in your markdown response. Do NOT create, write, or modify any files on disk."
@@ -272,7 +287,7 @@ def run_cmd(prompt: str, model: str = None, backend: str = "cmd", timeout: int =
         return rc, out, err, elapsed
 
     cmd = ["agy", "--dangerously-skip-permissions"]
-    if model:
+    if model and ("gemini" in model.lower() or "claude" in model.lower()):
         cmd.extend(["--model", model])
     cmd.extend(["-p", prompt])
 
@@ -354,7 +369,7 @@ def parse_judge_json(text: str) -> dict | None:
 
 
 def _judge_via_agy_once(judging_prompt: str, model: str = None, timeout: int = 900) -> tuple[dict | None, dict, str]:
-    rc, stdout, stderr, elapsed = run_cmd(judging_prompt, model, timeout)
+    rc, stdout, stderr, elapsed = run_cmd(judging_prompt, model=model, backend="agy", timeout=timeout)
     usage = {"latency_s": round(elapsed, 2), "prompt_tokens": None, "completion_tokens": None}
     if rc != 0:
         return None, usage, f"agy exit {rc}: {stderr[:200]}"
@@ -1234,16 +1249,16 @@ def main():
     parser = argparse.ArgumentParser(description="Skill Delivery Strategy Experiment (IEEE hardened)")
     parser.add_argument("--tasks", type=Path, default=ROOT / "benchmarks" / "tasks_ieee.json")
     parser.add_argument("--runs", type=int, default=5, help="Runs per task per strategy")
-    parser.add_argument("--executor-backend", choices=["cmd", "agy"], default="cmd",
-                        help="cmd = Command Code CLI (Qwen); agy = agy CLI (Gemini)")
+    parser.add_argument("--executor-backend", choices=["cmd", "agy", "opencode"], default="cmd",
+                        help="cmd = Command Code CLI (Qwen); agy = agy CLI (Gemini); opencode = opencode CLI (Nemotron)")
     parser.add_argument("--executor-model", type=str, default="qwen/qwen3.7-flash",
-                        help="Executor model id (e.g. qwen/qwen3.7-flash for cmd)")
+                        help="Executor model id (e.g. qwen/qwen3.7-flash for cmd; opencode/nemotron-3.5-lightning-free for opencode)")
     parser.add_argument("--models", type=str, default=None, help="Executor model override (comma-separated)")
     parser.add_argument("--judge-backend", choices=["cmd", "agy", "openai"], default="cmd",
                         help="cmd = Command Code CLI (DeepSeek Pro); agy = agy CLI; openai = OpenAI-compatible API")
     parser.add_argument("--judge-model", type=str, default="deepseek/deepseek-v4-pro",
                         help="Judge model id (e.g. deepseek/deepseek-v4-pro for cmd, or claude-sonnet-4-6 for agy)")
-    parser.add_argument("--judge-chars", type=int, default=10000,
+    parser.add_argument("--judge-chars", type=int, default=16000,
                         help="Max chars of each response shown to the judge")
     parser.add_argument("--exec-timeout", type=int, default=900, help="Per-execution timeout (s)")
     parser.add_argument("--seed", type=int, default=20260824)
@@ -1271,7 +1286,7 @@ def main():
         if not preflight_openai_judge(args):
             raise SystemExit(1)
 
-    default_model = args.executor_model if args.executor_backend == "cmd" else None
+    default_model = args.executor_model if args.executor_backend in ("cmd", "opencode") else None
     models = [m.strip() for m in args.models.split(",")] if args.models else [default_model]
 
     # Resume support
@@ -1295,15 +1310,10 @@ def main():
     all_data["provenance"] = build_provenance(args, json.loads(args.tasks.read_text()))
     prov = all_data["provenance"]
 
-    if args.judge_only:
-        if not all_data.get("tasks"):
-            print("❌ No checkpoint data to recover.")
-            raise SystemExit(1)
-        process_pending_judges(args, all_data, limit=args.judge_limit)
-    else:
+    if tasks:
         print(f"🧪 Skill Delivery Experiment | {len(tasks)} tasks × {args.runs} runs × {len(STRATEGY_NAMES)} strategies")
         print(f"   Strategies: {STRATEGY_NAMES}")
-        exec_str = f"{args.executor_backend}:{args.executor_model}" if args.executor_backend == "cmd" else f"agy ({prov.get('agy_version', '?')})"
+        exec_str = f"{args.executor_backend}:{args.executor_model}" if args.executor_backend in ("cmd", "opencode") else f"agy ({prov.get('agy_version', '?')})"
         print(f"   Executor: {exec_str} | Judge: {args.judge_backend}:{args.judge_model}\n")
 
         RAW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
