@@ -1,5 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
-import { resolve } from 'path';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 /**
  * Read environment variables with defaults.
@@ -56,13 +60,11 @@ export default defineConfig({
     // promoted to persistent storage *only* on retry (see the custom
     // `checkoutTest` fixture which checks `info.retry`).
     video: 'retain-on-failure',
-    videosPath: resolve(__dirname, 'artifacts/videos'),
-
     // ── traces ───────────────────────────────────────────────────
     // Traces are also discarded by default. The extended fixture
     // promotes them on retry.
     trace: 'retain-on-failure',
-    screenshots: false,
+    screenshot: 'off',
   },
 
   // ── projects ────────────────────────────────────────────────────
