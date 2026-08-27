@@ -121,7 +121,7 @@ def create_manuscript_docx():
 
     # Title & Abstract
     add_title("Instruction Density and Context Collapse in Coding Agent Skills:\nAn Empirical Study of Prompt Compression and Multi-Skill Scaling")
-    add_author("Sanjeev M. R. | Graduate Research Manuscript (Target: IEEE Transactions on Software Engineering / IEEE Software)")
+    add_author("Sanjeev M. R. | Graduate Research Manuscript (Target: IEEE Transactions on Software Engineering / IEEE Software)\nArtifact Repository: https://github.com/sanjeevafk/agent-skills")
 
     add_p("Autonomous software engineering agents increasingly rely on injected skill documents (SKILL.md, .cursorrules, and .agentrules) to enforce repository constraints, architectural patterns, and domain standards. However, in enterprise codebases loading 15 to 25 active skills, verbatim prompt injection incurs severe context bloat (exceeding 50,000 prompt tokens per turn), whereas aggressive rule extraction risks Context Collapse—the omission of critical syntax, type signatures, and concurrency invariants. This paper presents an empirical investigation of skill delivery strategies across an 18-task software engineering benchmark spanning 6 core domains: Architecture, Databases, DevOps, SRE, Security, and Testing (N=396 blind evaluations across frontier reasoning architectures). We establish an empirical instruction density curve across five delivery strategies: un-injected baseline (control), uncompressed manuals (full), TF-IDF section retrieval (retrieved), aggressive rule compilation (checklist_v1), and structure-preserving static compilation (checklist_v2). Our results show that structure-preserving compilation retains 99.2% of full manual quality (24.96 vs. 25.17 out of 35, Welch t=0.22, p=0.8286, Cohen’s d=+0.03) while reducing prompt overhead by 30.0% (680 tokens saved per turn) and producing the highest implementation depth (5,431 output tokens). Conversely, aggressive rule compilation exhibits high variance (std=6.94) and catastrophic failure in syntax-dense tasks (crashing to 17.2/35 in Testing & QA). We formalize the multi-skill Pareto scaling frontier, demonstrating that structure-preserving compilation eliminates 26,000 prompt tokens per turn in 20-skill environments without statistically significant quality degradation.", italic=True, bold_lead="Abstract—")
 
@@ -131,13 +131,13 @@ def create_manuscript_docx():
     add_h1("1. Introduction")
     add_p("Autonomous coding agents and AI-assisted integrated development environments (IDEs)—including Claude Code, Cursor, Windsurf, GitHub Copilot Workspace, and Google Antigravity—have transitioned from single-line auto-completion to repository-scale software development. In modern agentic workflows, domain-specific behavior is guided by developer-authored instruction files, known as Agent Skills (typically formatted as SKILL.md, .cursorrules, or .agentrules). These files encode engineering implementation standards, database isolation patterns, security review checklists, and deployment conventions.")
 
-    add_p("Recent large-scale repository mining studies confirm that agent skill files have proliferated across open-source software. Destefanis et al. (GitSkills, MSR 2027) mined 3.8 million skill files across 282,000 GitHub repositories, demonstrating that software teams increasingly treat prompt instructions as software configuration artifacts. However, their investigation revealed that over 50.5% of skill files in the wild are unmanaged, redundant, or verbatim duplicates, resulting in severe prompt bloat.")
+    add_p("Recent large-scale repository mining studies confirm that agent skill files have proliferated across open-source software. Destefanis et al. (GitSkills, MSR 2027) [1] mined 3.8 million skill files across 282,000 GitHub repositories, demonstrating that software teams increasingly treat prompt instructions as software configuration artifacts. However, their investigation revealed that over 50.5% of skill files in the wild are unmanaged, redundant, or verbatim duplicates, resulting in severe prompt bloat.")
 
-    add_p("In practical developer environments, an agent rarely operates with a single isolated skill. Enterprise repositories routinely load 15 to 25 specialized skills covering API design, database migrations, authentication, concurrency locking, and container orchestration. Verbatim injection of uncompressed skill documents consumes 40,000 to 65,000 prompt tokens on every developer interaction. This prompt bloat degrades inference latency, inflates operational API costs, and induces attention decay—the well-documented 'Lost in the Middle' phenomenon where language models fail to attend to relevant instructions placed in long prompt contexts (Liu et al., TACL 2023).")
+    add_p("In practical developer environments, an agent rarely operates with a single isolated skill. Enterprise repositories routinely load 15 to 25 specialized skills covering API design, database migrations, authentication, concurrency locking, and container orchestration. Verbatim injection of uncompressed skill documents consumes 40,000 to 65,000 prompt tokens on every developer interaction. This prompt bloat degrades inference latency, inflates operational API costs, and induces attention decay—the well-documented 'Lost in the Middle' phenomenon where language models fail to attend to relevant instructions placed in long prompt contexts (Liu et al., TACL 2023) [6].")
 
-    add_p("To mitigate prompt bloat, developers frequently resort to aggressive text summarization, converting multi-page engineering guidelines into brief, single-line bulleted rules. However, recent theoretical work in agent context engineering (Zhang et al., ACE 2025) warns that aggressive compression triggers Context Collapse and Brevity Bias, wherein models stripped of formal syntax examples and interface definitions take architectural shortcuts and produce non-functional pseudocode.")
+    add_p("To mitigate prompt bloat, developers frequently resort to aggressive text summarization, converting multi-page engineering guidelines into brief, single-line bulleted rules. However, recent theoretical work in agent context engineering (Zhang et al., ACE 2025) [7] warns that aggressive compression triggers Context Collapse and Brevity Bias, wherein models stripped of formal syntax examples and interface definitions take architectural shortcuts and produce non-functional pseudocode.")
 
-    add_p("While recent empirical software engineering literature has investigated prompt programming techniques for function-level generation (Khojah et al., IEEE TSE 2025), automated unit test generation (Schäfer et al., TestPilot, IEEE TSE 2024), and repository-level code reuse (Liao et al., A3-CodGen, IEEE TSE 2024), the empirical trade-off between instruction compression density and code generation correctness in agent skills remains uncharacterized.")
+    add_p("While recent empirical software engineering literature has investigated prompt programming techniques for function-level generation (Khojah et al., IEEE TSE 2025) [2], automated unit test generation (Schäfer et al., TestPilot, IEEE TSE 2024) [3], and repository-level code reuse (Liao et al., A3-CodGen, IEEE TSE 2024) [4], the empirical trade-off between instruction compression density and code generation correctness in agent skills remains uncharacterized.")
 
     add_p("This paper addresses this gap through an empirical study of instruction density in software engineering agent skills. We formulate four research questions:")
     add_bullet("RQ1 (Quality Preservation):", "Does static skill compression preserve code implementation quality and architectural correctness compared to uncompressed manuals?")
@@ -148,18 +148,31 @@ def create_manuscript_docx():
     # Section 2
     add_h1("2. Background & Related Work")
     add_h2("2.1 Prompt Engineering in Software Engineering")
-    add_p("Empirical investigation into prompt construction has become a central focus of software engineering research. Khojah et al. (IEEE TSE 2025) conducted a large-scale empirical evaluation of 7,072 prompts across five prompt programming techniques on function-level code generation, demonstrating that structured prompt modifications exert complex, non-linear effects on syntactic and semantic code correctness. Similarly, Schäfer et al. (IEEE TSE 2024) developed TestPilot to evaluate LLM capabilities for automated unit test generation, highlighting that prompt context structuring directly governs test execution rates and branch coverage. Liao et al. (IEEE TSE 2024) introduced A3-CodGen, establishing that local, global, and third-party context retrieval must be balanced to achieve repository-level code reuse without context pollution. Fakhoury et al. (IEEE TSE 2024) investigated test-driven interactive code generation, identifying that developer instruction adherence deteriorates when prompt context exceeds working memory boundaries.")
+    add_p("Empirical investigation into prompt construction has become a central focus of software engineering research. Khojah et al. (IEEE TSE 2025) [2] conducted a large-scale empirical evaluation of 7,072 prompts across five prompt programming techniques on function-level code generation, demonstrating that structured prompt modifications exert complex, non-linear effects on syntactic and semantic code correctness. Similarly, Schäfer et al. (IEEE TSE 2024) [3] developed TestPilot to evaluate LLM capabilities for automated unit test generation, highlighting that prompt context structuring directly governs test execution rates and branch coverage. Liao et al. (IEEE TSE 2024) [4] introduced A3-CodGen, establishing that local, global, and third-party context retrieval must be balanced to achieve repository-level code reuse without context pollution. Fakhoury et al. (IEEE TSE 2024) [5] investigated test-driven interactive code generation, identifying that developer instruction adherence deteriorates when prompt context exceeds working memory boundaries.")
 
     add_h2("2.2 Context Engineering, Attention Decay, and Context Collapse")
-    add_p("Language model attention mechanisms exhibit non-uniform positional decay. Liu et al. (TACL 2023) established the foundational 'Lost in the Middle' phenomenon, demonstrating that LLM retrieval and reasoning performance degrades significantly when target instructions are placed in the interior of long multi-thousand-token prompts. In response to context degradation, Zhang et al. (Agentic Context Engineering, 2025) proposed ACE, identifying two primary failure modes in agent prompts: Brevity Bias (models generating shallow, incomplete code when prompted with short summaries) and Context Collapse (models losing the ability to satisfy complex multi-clause constraints when intermediate structural tokens are removed).")
+    add_p("Language model attention mechanisms exhibit non-uniform positional decay. Liu et al. (TACL 2023) [6] established the foundational 'Lost in the Middle' phenomenon, demonstrating that LLM retrieval and reasoning performance degrades significantly when target instructions are placed in the interior of long multi-thousand-token prompts. In response to context degradation, Zhang et al. (Agentic Context Engineering, 2025) [7] proposed ACE, identifying two primary failure modes in agent prompts: Brevity Bias (models generating shallow, incomplete code when prompted with short summaries) and Context Collapse (models losing the ability to satisfy complex multi-clause constraints when intermediate structural tokens are removed).")
 
     add_h2("2.3 Skill Repositories and Agent Evaluation")
-    add_p("The operationalization of agent instructions as standalone files has emerged as a distinct software engineering paradigm. Destefanis et al. (MSR 2027) introduced the GitSkills dataset, mining 3.8 million skill files from GitHub and documenting the widespread absence of package managers, versioning, or static compilation tools for agent instructions. NVIDIA Research (ACES, 2026) introduced Agentic Continuous Evaluation of Skills, demonstrating across 145 enterprise skills and 947 paired trials that static token counts correlate weakly with live agent execution quality (rho = 0.14), emphasizing the necessity of paired live execution trials. In evaluation methodology, Kong et al. (2026) established multi-stage judge lifecycles for LLM evaluators, proving that blind, randomized pairwise and rubric evaluations provide robust alignment with human expert assessments while avoiding position bias.")
+    add_p("The operationalization of agent instructions as standalone files has emerged as a distinct software engineering paradigm. Destefanis et al. (MSR 2027) [1] introduced the GitSkills dataset, mining 3.8 million skill files from GitHub and documenting the widespread absence of package managers, versioning, or static compilation tools for agent instructions. NVIDIA Research (ACES, 2026) [8] introduced Agentic Continuous Evaluation of Skills, demonstrating across 145 enterprise skills and 947 paired trials that static token counts correlate weakly with live agent execution quality (rho = 0.14), emphasizing the necessity of paired live execution trials. In evaluation methodology, Kong et al. (2026) [9] established multi-stage judge lifecycles for LLM evaluators, proving that blind, randomized pairwise and rubric evaluations provide robust alignment with human expert assessments while avoiding position bias.")
 
     # Section 3
-    add_h1("3. Experimental Design & Methodology")
+    add_h1("3. System Architecture & Experimental Methodology")
+    add_p("To investigate instruction density and context dynamics empirically, we developed an end-to-end research and evaluation framework shown in Figure 1. The architecture comprises five pipeline stages: (1) Skill Corpus Management, (2) Delivery Strategy Transformation, (3) Autonomous Code Generation with Output Isolation, (4) Blind Cross-Vendor LLM Evaluation, and (5) Statistical Hypothesis & Pareto Analysis.")
+
+    # Insert Architecture Diagram
+    arch_path = "benchmarks/tables_ieee/architecture_pipeline_diagram.png"
+    if os.path.exists(arch_path):
+        p_img = doc.add_paragraph()
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_picture(arch_path, width=Inches(6.2))
+        p_fig = doc.add_paragraph()
+        p_fig.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r_fig = p_fig.add_run("Figure 1: End-to-end system architecture and empirical evaluation pipeline. The workflow transforms raw skill manuals across 5 delivery arms, executes isolated code generation across 18 hard SE tasks, and performs randomized, blind 35-point rubric scoring via an independent cross-vendor frontier judge.")
+        set_font(r_fig, font_name="Calibri", size_pt=9.5, italic=True)
+
     add_h2("3.1 Benchmark Construction")
-    add_p("To evaluate skill delivery across realistic software engineering workflows, we constructed the IEEE 18-Task Hard Benchmark Suite. The benchmark tasks were developed to represent complex, non-trivial engineering problems requiring multi-step reasoning, architectural trade-offs, concurrency handling, security auditing, and test harness construction.")
+    add_p("We constructed the IEEE 18-Task Hard Benchmark Suite to evaluate skill delivery across non-trivial engineering problems requiring multi-step reasoning, architectural trade-offs, concurrency handling, security auditing, and test harness construction.")
     add_p("The 18 tasks are stratified evenly across 6 core software engineering domains (3 tasks per domain):")
     add_bullet("1. Architecture & Refactoring:", "High-throughput event-driven microservices, clean architecture boundary decoupling, and domain-driven design aggregates (architecture-decision-records, code-refactor, type-architecture-analyzer).")
     add_bullet("2. Databases & Persistence:", "Zero-downtime PostgreSQL schema migrations with lock timeout management, multi-tenant connection pooling with row-level security, and Redis distributed rate-limiting token buckets (database-migrations, postgres-patterns, redis-patterns).")
@@ -236,7 +249,7 @@ def create_manuscript_docx():
 
     add_callout("Finding 3:", "Aggressive bulletization (checklist_v1) triggers catastrophic Context Collapse in syntax-heavy domains (falling to 17.2/35 in Testing & QA) and exhibits high overall variance (std=6.94). Preserving code blocks and tables in checklist_v2 stabilizes execution across all domains.")
 
-    # Insert Figure if exists
+    # Insert Figure 2 (Pareto Plot)
     plot_path = "benchmarks/tables_ieee/density_curve_plot.png"
     if os.path.exists(plot_path):
         p_img = doc.add_paragraph()
@@ -244,7 +257,7 @@ def create_manuscript_docx():
         doc.add_picture(plot_path, width=Inches(6.0))
         p_fig = doc.add_paragraph()
         p_fig.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r_fig = p_fig.add_run("Figure 1: Empirical instruction density trade-off curve across 396 evaluations. checklist_v2 defines the Pareto-optimal operating point, retaining 99.2% of full manual quality while cutting prompt bloat by 30.0%.")
+        r_fig = p_fig.add_run("Figure 2: Empirical instruction density trade-off curve across 396 evaluations. checklist_v2 defines the Pareto-optimal operating point, retaining 99.2% of full manual quality while cutting prompt bloat by 30.0%.")
         set_font(r_fig, font_name="Calibri", size_pt=9.5, italic=True)
 
     add_h2("4.4 RQ4: Multi-Skill Pareto Economics")
@@ -278,8 +291,16 @@ def create_manuscript_docx():
     add_bullet("Internal Validity:", "Internal validity relates to confounding factors in execution. We enforced a fixed random seed (20260824) across all runs, archived every raw model generation for independent auditability, and applied explicit prompt output safeguards to prevent tool-calling diversion to local disk. Temperature and sampling parameters were kept uniform across all experimental arms.")
     add_bullet("External Validity:", "External validity concerns the generalizability of our findings across model families and programming languages. Our primary benchmark was conducted across two distinct frontier model families: Alibaba Qwen (qwen/qwen3.7-flash) as code executor and DeepSeek AI (deepseek/deepseek-v4-pro) as independent blind judge. The benchmark tasks encompass diverse languages and technologies, including Python, TypeScript, Solidity, Docker, Kubernetes, SQL, and Redis. Replicating the full matrix across additional commercial models (such as Google Gemini 3.7 Flash) represents an immediate avenue for future work.")
 
-    # Section 7
-    add_h1("7. Conclusion")
+    # Section 7: Data Availability & Open Science
+    add_h1("7. Data Availability & Reproducibility")
+    add_p("To uphold open-science empirical software engineering principles, all benchmark code, task specifications, compiled checklists, raw execution traces, and statistical analysis scripts are publicly accessible in our repository:")
+    add_bullet("Source Code & Compilers:", "https://github.com/sanjeevafk/agent-skills (includes scripts/skill_delivery_experiment.py and scripts/compile_checklists_v2.py)")
+    add_bullet("Benchmark Dataset (IEEE 18-Tasks):", "https://github.com/sanjeevafk/agent-skills/tree/main/benchmarks (contains tasks_ieee.json and checklists_v2/ with SHA256 integrity manifests)")
+    add_bullet("Raw Coding Traces & Judge Justifications:", "https://github.com/sanjeevafk/agent-skills/blob/main/benchmarks/delivery_results_ieee.json (contains all 396 full model generations, token metrics, and blind judge reasoning logs)")
+    add_bullet("Replication Command:", "python3 scripts/skill_delivery_experiment.py --tasks benchmarks/tasks_ieee.json --runs 5 --judge-chars 16000")
+
+    # Section 8
+    add_h1("8. Conclusion")
     add_p("This paper presented an empirical study of instruction density and prompt compression in coding agent skills across an 18-task software engineering benchmark (N=396 blind evaluations). We demonstrated that uncompressed skill manuals impose significant token overhead without delivering statistically significant quality gains (p=0.8286), while aggressive rule extraction triggers Context Collapse in syntax-dense domains.")
     add_p("Structure-preserving static compilation (checklist_v2) resolves this trade-off, capturing 99.2% of full manual quality while cutting prompt overhead by 30.0% and producing the highest implementation depth (5,431 output tokens). In enterprise multi-skill repositories, this translates to saving up to 780,000 prompt tokens per developer session. All benchmark tasks, compiled checklists, raw execution traces, and reproduction scripts are released openly to support reproducible agent context engineering.")
 
@@ -313,7 +334,7 @@ def create_manuscript_docx():
         set_font(r_body, font_name="Calibri", size_pt=9.5)
 
     doc.save("paper/MANUSCRIPT.docx")
-    print("Saved paper/MANUSCRIPT.docx successfully!")
+    print("Saved updated paper/MANUSCRIPT.docx successfully with architecture diagram and data availability!")
 
 if __name__ == "__main__":
     create_manuscript_docx()
