@@ -76,6 +76,49 @@ validate_skill_name() {
   }
 }
 
+validate_repo_spec() {
+  # Strict owner/repo to prevent typosquat pulls and flag injection.
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+    echo "Error: invalid repo spec (expected <owner>/<repo>): $1" >&2
+    exit 1
+  }
+}
+
+validate_backup_dir() {
+  local dir="$1"
+  [[ "$dir" = /* ]] || { echo "Error: backup directory must be absolute: $dir" >&2; exit 1; }
+  [ "$dir" != "/" ] || { echo "Error: refusing to use / as backup directory" >&2; exit 1; }
+  [ "$dir" != "$HOME" ] || { echo "Error: refusing to use HOME as backup directory" >&2; exit 1; }
+  local base_real
+  base_real="$(readlink -f "$BACKUP_BASE_DIR" 2>/dev/null || printf '%s' "$BACKUP_BASE_DIR")"
+  local dir_real
+  # Resolve parent when dir does not exist yet.
+  if [ -e "$dir" ]; then
+    dir_real="$(readlink -f "$dir" 2>/dev/null || printf '%s' "$dir")"
+  else
+    dir_real="$(readlink -f "$(dirname "$dir")" 2>/dev/null || printf '%s' "$(dirname "$dir")")/$(basename "$dir")"
+  fi
+  case "$dir_real" in
+    "$base_real"/*|"$base_real") ;;
+    *) echo "Error: backup directory must be inside $BACKUP_BASE_DIR: $dir" >&2; exit 1 ;;
+  esac
+}
+
+safe_copy_dir() {
+  # Copy without propagating setuid/setgid bits or ownership.
+  local src="$1" dest="$2"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -r --exclude='.git' --chmod=u-s,g-s "$src/" "$dest/"
+  else
+    if cp --help 2>&1 | grep -q -- '--no-preserve'; then
+      cp -a --no-preserve=mode,ownership "$src/." "$dest/"
+    else
+      cp -a "$src/." "$dest/"
+    fi
+    chmod -R u-s,g-s "$dest" 2>/dev/null || true
+  fi
+}
+
 write_default_config() {
   if [ -f "$CONFIG_FILE" ]; then
     echo "Config already exists: $CONFIG_FILE"
@@ -205,11 +248,7 @@ sync_all() {
         continue
       fi
 
-      if command -v rsync >/dev/null 2>&1; then
-        rsync -a --exclude='.git' "$src/" "$dest_path/"
-      else
-        cp -a "$src/." "$dest_path/"
-      fi
+      safe_copy_dir "$src" "$dest_path"
     done
   done < <(list_canonical_skills)
 
@@ -231,6 +270,7 @@ backup_all() {
   else
     backup_dir="${BACKUP_BASE_DIR}/skills-$(date +%Y%m%d-%H%M%S)"
   fi
+  validate_backup_dir "$backup_dir"
 
   mkdir -p "$backup_dir"
 
@@ -244,7 +284,12 @@ backup_all() {
 
   for root in "${ALL_ROOTS[@]}"; do
     label="$(echo "$root" | sed 's#^/##; s#[^a-zA-Z0-9._-]#_#g')"
-    tar -czf "$backup_dir/${label}.tar.gz" -C "$(dirname "$root")" "$(basename "$root")"
+    if [ -L "$root" ]; then
+      echo "Warning: skipping symlinked root $root" >&2
+      echo "$root -> SKIPPED (symlink)" >> "$backup_dir/manifest.txt"
+      continue
+    fi
+    tar -czf "$backup_dir/${label}.tar.gz" --exclude='.git' -C "$(dirname "$root")" "$(basename "$root")"
     count="$(find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
     echo "$root -> $count entries" >> "$backup_dir/manifest.txt"
   done
@@ -296,9 +341,39 @@ case "$cmd" in
 
     repo="$1"
     shift || true
+    validate_repo_spec "$repo"
+
+    # Only allow --skill <name> passthrough; reject all other flags to
+    # prevent flag injection into npx.
+    skill_args=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --skill)
+          [ $# -ge 2 ] || { echo "Error: --skill requires a value" >&2; exit 1; }
+          validate_skill_name "$2"
+          skill_args+=(--skill "$2")
+          shift 2
+          ;;
+        --skill=*)
+          validate_skill_name "${1#--skill=}"
+          skill_args+=("$1")
+          shift
+          ;;
+        -*)
+          echo "Error: unsupported flag for add: $1 (only --skill <name> allowed)" >&2
+          exit 1
+          ;;
+        *)
+          echo "Error: unexpected argument for add: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
 
     # Install through Skills CLI, then propagate for full cross-agent parity.
-    CI=1 npx skills add "$repo" "$@" -g -y
+    # NOTE: $repo is validated owner/repo; skill names are validated; no
+    # unvalidated passthrough. Pin or review upstream before installing.
+    CI=1 npx skills add "$repo" "${skill_args[@]}" -g -y
     sync_all
     ;;
   sync)
@@ -332,6 +407,9 @@ case "$cmd" in
       echo "Error: Directory not found. Please specify local skills directory."
       exit 1
     fi
+    SRC_REAL="$(readlink -f "$SRC_DIR" 2>/dev/null || printf '%s' "$SRC_DIR")"
+    [ "$SRC_REAL" != "/" ] || { echo "Error: refusing to import from /" >&2; exit 1; }
+    [ "$SRC_REAL" != "$HOME" ] || { echo "Error: refusing to import from HOME" >&2; exit 1; }
 
     # Destination is the first canonical root
     DEST_ROOT=""
@@ -359,7 +437,7 @@ case "$cmd" in
       echo "  -> Importing $sname"
       rm -rf "$DEST_ROOT/$sname"
       mkdir -p "$DEST_ROOT/$sname"
-      cp -a "$d/." "$DEST_ROOT/$sname/"
+      safe_copy_dir "$d" "$DEST_ROOT/$sname"
       count=$((count + 1))
     done
 

@@ -9,11 +9,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import yaml
-    _HAS_YAML = True
-except ImportError:
-    _HAS_YAML = False
+from skills_common import strip_frontmatter_lenient as strip_frontmatter
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 SKILLS_DIR = REPO_ROOT / 'skills'
@@ -53,29 +49,8 @@ ALIAS_MAP = {
 }
 
 
-def strip_frontmatter(content: str) -> tuple[dict, str]:
-    meta: dict = {}
-    if not content.startswith('---'):
-        return meta, content
-    end = content.find('\n---', 3)
-    if end == -1:
-        return meta, content
-    frontmatter_raw = content[3:end]
-    body = content[end + 4:].lstrip('\n')
-
-    if _HAS_YAML:
-        try:
-            parsed = yaml.safe_load(frontmatter_raw)
-            meta = parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            pass
-    else:
-        for line in frontmatter_raw.splitlines():
-            if ':' in line and not line.startswith(' '):
-                key, _, val = line.partition(':')
-                meta[key.strip()] = val.strip()
-
-    return meta, body
+def _has_word(text: str, word: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", text) is not None
 
 
 def infer_category(sname: str, desc: str, body: str) -> str:
@@ -88,7 +63,7 @@ def infer_category(sname: str, desc: str, body: str) -> str:
         return 'observability'
     if any(k in s for k in ['debug', 'triage', 'fix-defect', 'syncause', 'diagnose']):
         return 'debug'
-    if any(k in s for k in ['security', 'phi', 'hipaa', 'auth', 'bounty', 'gateguard', 'taint', 'sec']):
+    if any(_has_word(s, k) for k in ['security', 'phi', 'hipaa', 'auth', 'bounty', 'gateguard', 'taint', 'sec']):
         return 'security'
     if any(k in s for k in ['nextjs', 'react', 'supabase', 'tailwind', 'frontend', 'ui', 'vue', 'svelte', 'html']):
         return 'web'
@@ -122,7 +97,18 @@ def infer_dependencies(sname: str, body: str) -> list[str]:
 
 
 def estimate_tokens(body: str) -> int:
-    return len(body) // 4
+    # Rough heuristic (~4 chars/token); documented as estimate only.
+    return max(1, len(body) // 4)
+
+
+def _fallback_last_updated(skill_md) -> str:
+    try:
+        import datetime as _dt
+
+        ts = skill_md.stat().st_mtime
+        return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).date().isoformat()
+    except Exception:
+        return "2026-07-27"
 
 
 def build_index():
@@ -153,7 +139,10 @@ def build_index():
         dependencies = meta.get('dependencies') if isinstance(meta.get('dependencies'), list) else infer_dependencies(name, body)
         supported_tools = meta.get('supported_tools') if isinstance(meta.get('supported_tools'), list) else ["*"]
         version = str(meta.get('version') or "1.0.0").strip()
-        last_updated = str(meta.get('last_updated') or "2026-07-27").strip()
+        if meta.get('last_updated'):
+            last_updated = str(meta.get('last_updated')).strip()
+        else:
+            last_updated = _fallback_last_updated(skill_md)
         aliases = meta.get('aliases') if isinstance(meta.get('aliases'), list) else []
 
         # Short name for namespace

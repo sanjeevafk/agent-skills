@@ -29,11 +29,22 @@ def lint_repository():
         print("skills.json not found. Run build_index.py first.")
         sys.exit(1)
 
-    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        index_data = json.load(f)
+    try:
+        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"skills.json is corrupt: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Failed to read skills.json: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    skills = index_data['skills']
-    aliases = index_data['aliases']
+    try:
+        skills = index_data['skills']
+        aliases = index_data.get('aliases', {})
+    except (KeyError, AttributeError) as e:
+        print(f"skills.json has unexpected schema: {e}", file=sys.stderr)
+        sys.exit(1)
 
     similar_pairs = []
     alias_conflicts = []
@@ -41,34 +52,53 @@ def lint_repository():
     short_desc = []
 
     skill_names = list(skills.keys())
+    # Threshold is configurable via env for large repos; O(n^2) by design.
+    try:
+        threshold = float(__import__('os').environ.get('LINT_SIMILARITY_THRESHOLD', '0.65'))
+    except ValueError:
+        threshold = 0.65
     for i in range(len(skill_names)):
         for j in range(i + 1, len(skill_names)):
             name1 = skill_names[i]
             name2 = skill_names[j]
-            d1 = skills[name1]['description']
-            d2 = skills[name2]['description']
+            d1 = skills[name1].get('description', '')
+            d2 = skills[name2].get('description', '')
+            if not isinstance(d1, str):
+                d1 = str(d1)
+            if not isinstance(d2, str):
+                d2 = str(d2)
 
             if not d1 or not d2:
                 continue
 
             sim = jaccard_similarity(d1, d2)
-            if sim > 0.65 and name1 != name2:
+            if sim > threshold and name1 != name2:
                 similar_pairs.append((name1, name2, sim, d1, d2))
 
     for name, meta in skills.items():
-        desc = meta['description']
+        desc = meta.get('description', '')
+        if not isinstance(desc, str):
+            desc = str(desc)
         if not desc:
             missing_desc.append(name)
         elif len(desc) < 15:
             short_desc.append(name)
 
-    # Check alias collisions
-    alias_targets = {}
+    # Check alias problems: alias collides with a skill name, target missing,
+    # or two aliases mapping inconsistently is caught via file-level scan below.
     for al, target in aliases.items():
-        if al in alias_targets:
-            alias_conflicts.append((al, alias_targets[al], target))
-        else:
-            alias_targets[al] = target
+        if al in skills:
+            alias_conflicts.append((al, target, f"collides with skill '{al}'"))
+        if target not in skills:
+            alias_conflicts.append((al, target, "target skill missing"))
+    # File-level alias collisions: same alias declared by multiple skills.
+    alias_declared_by: dict[str, str] = {}
+    for name, meta in skills.items():
+        for al in meta.get('aliases', []) if isinstance(meta.get('aliases'), list) else []:
+            if al in alias_declared_by and alias_declared_by[al] != name:
+                alias_conflicts.append((al, alias_declared_by[al], name))
+            else:
+                alias_declared_by[al] = name
 
     # Render report
     md_lines = [
@@ -84,7 +114,7 @@ def lint_repository():
     if alias_conflicts:
         md_lines.append("## ⚠️ Alias Collisions\n")
         for al, t1, t2 in alias_conflicts:
-            md_lines.append(f"- Alias `/{al}` points to both `{t1}` and `{t2}`")
+            md_lines.append(f"- Alias `/{al}`: `{t1}` → {t2}")
         md_lines.append("\n---\n")
 
     if similar_pairs:
