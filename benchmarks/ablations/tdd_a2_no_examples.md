@@ -11,18 +11,6 @@
 - Tests become insensitive to real changes - they pass when behavior breaks, fail when behavior is fine
 - You outrun your headlights, committing to test structure before understanding the implementation
 **Correct approach:** Vertical slices via tracer bullets. One test → one implementation → repeat. Each test responds to what you learned from the previous cycle. Because you just wrote the code, you know exactly what behavior matters and how to verify it.
-```
-WRONG (horizontal):
-  RED:   test1, test2, test3, test4, test5
-  GREEN: impl1, impl2, impl3, impl4, impl5
-
-RIGHT (vertical):
-  RED→GREEN: test1→impl1
-  RED→GREEN: test2→impl2
-  RED→GREEN: test3→impl3
-  ...
-```
-
 ### 1. Planning
 - [ ] Confirm with user what interface changes are needed
 - [ ] Confirm with user which behaviors to test (prioritize)
@@ -31,18 +19,7 @@ RIGHT (vertical):
 - [ ] List the behaviors to test (not implementation steps)
 - [ ] Get user approval on the plan
 **You can't test everything.:** Confirm with the user exactly which behaviors matter most. Focus testing effort on critical paths and complex logic, not every possible edge case.
-### 2. Tracer Bullet
-```
-RED:   Write test for first behavior → test fails
-GREEN: Write minimal code to pass → test passes
-```
-
 ### 3. Incremental Loop
-```
-RED:   Write next test → fails
-GREEN: Minimal code to pass → passes
-```
-
 - One test at a time
 - Only enough code to pass current test
 - Don't anticipate future tests
@@ -54,11 +31,3 @@ GREEN: Minimal code to pass → passes
 - [ ] Consider what new code reveals about existing code
 - [ ] Run tests after each refactor step
 **Never refactor while RED.:** Get to GREEN first.
-## Checklist Per Cycle
-```
-[ ] Test describes behavior, not implementation
-[ ] Test uses public interface only
-[ ] Test would survive internal refactor
-[ ] Code is minimal for this test
-[ ] No speculative features added
-```
