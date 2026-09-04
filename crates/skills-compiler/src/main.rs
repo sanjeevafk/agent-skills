@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
-use rayon::prelude::*;
 use compiler::{CompilationOptions, Compiler};
 use domain::Domain;
 use manifest::{compute_sha256, CompilationManifest, SkillArtifactEntry};
@@ -287,9 +286,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|e| e.path().to_path_buf())
                 .collect();
 
-            println!("Found {} SKILL.md files. Compiling in parallel with Rayon...", entries.len());
+            println!("Found {} SKILL.md files. Compiling...", entries.len());
 
-            entries.par_iter().for_each(|skill_path| {
+            entries.iter().for_each(|skill_path| {
                 let local_compiler = Compiler::new();
                 let skill_name = skill_path
                     .parent()

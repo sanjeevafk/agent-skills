@@ -14,18 +14,6 @@ pub enum Domain {
 }
 
 impl Domain {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Architecture => "architecture",
-            Self::Database => "database",
-            Self::Devops => "devops",
-            Self::Sre => "sre",
-            Self::Security => "security",
-            Self::Testing => "testing",
-            Self::General => "general",
-        }
-    }
-
     /// Default code compaction limit (lines) based on domain sensitivity
     pub fn default_code_lines(&self) -> usize {
         match self {
