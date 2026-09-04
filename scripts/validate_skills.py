@@ -7,41 +7,7 @@ Checks for required fields (name, description) and name uniqueness.
 import sys
 from pathlib import Path
 
-try:
-    import yaml
-    _HAS_YAML = True
-except ImportError:
-    _HAS_YAML = False
-
-def strip_frontmatter(content: str) -> tuple[dict, str, str | None]:
-    """Extract YAML frontmatter and return (meta dict, body content, error_msg)."""
-    meta: dict = {}
-    if not content.startswith('---'):
-        return meta, content, "Front matter must start on the first line with ---"
-    
-    end = content.find('\n---', 3)
-    if end == -1:
-        return meta, content, "Front matter is missing closing ---"
-        
-    frontmatter_raw = content[3:end]
-    body = content[end + 4:].lstrip('\n')
-
-    if _HAS_YAML:
-        try:
-            parsed = yaml.safe_load(frontmatter_raw)
-            if not isinstance(parsed, dict):
-                return meta, body, "Front matter must be a YAML mapping"
-            meta = parsed
-        except Exception as e:
-            return meta, body, f"YAML Syntax Error: {e}"
-    else:
-        # Fallback: simple line parser
-        for line in frontmatter_raw.splitlines():
-            if ':' in line and not line.startswith(' '):
-                key, _, val = line.partition(':')
-                meta[key.strip()] = val.strip()
-
-    return meta, body, None
+from skills_common import strip_frontmatter
 
 def main():
     repo_root = Path(__file__).parent.parent.resolve()

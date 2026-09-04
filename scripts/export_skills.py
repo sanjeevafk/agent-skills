@@ -21,43 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-try:
-    import yaml
-    _HAS_YAML = True
-except ImportError:
-    _HAS_YAML = False
-
-# ── YAML frontmatter parser ────────────────────────────────────────────────────
-
-def strip_frontmatter(content: str) -> tuple[dict, str]:
-    """Extract YAML frontmatter and return (meta dict, remaining content).
-
-    Uses PyYAML when available (handles multiline block scalars like
-    `description: >`). Falls back to a simple line parser otherwise.
-    """
-    meta: dict = {}
-    if not content.startswith('---'):
-        return meta, content
-    end = content.find('\n---', 3)
-    if end == -1:
-        return meta, content
-    frontmatter_raw = content[3:end]
-    body = content[end + 4:].lstrip('\n')
-
-    if _HAS_YAML:
-        try:
-            parsed = yaml.safe_load(frontmatter_raw)
-            meta = parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            pass
-    else:
-        # Fallback: only handles simple key: value (no block scalars)
-        for line in frontmatter_raw.splitlines():
-            if ':' in line and not line.startswith(' '):
-                key, _, val = line.partition(':')
-                meta[key.strip()] = val.strip()
-
-    return meta, body
+from skills_common import strip_frontmatter_lenient as strip_frontmatter
 
 
 # ── Skill discovery ────────────────────────────────────────────────────────────
@@ -93,11 +57,12 @@ def discover_skills(skills_dirs: list[Path], include: list[str] | None = None) -
                 continue
             
             seen_names.add(skill_name)
+            description = str(meta.get('description') or '').replace('\n', ' ').strip()
             skills.append({
                 'name': skill_name,
                 'path': skill_path,
                 'meta': meta,
-                'description': meta.get('description', '').replace('\n', ' ').strip(),
+                'description': description,
                 'body': body,
             })
     # Sort skills alphabetically by name for consistency
