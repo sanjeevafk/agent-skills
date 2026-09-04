@@ -22,6 +22,7 @@ pub enum InformationComponent {
 }
 
 impl InformationComponent {
+    #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Narrative => "Narrative",
