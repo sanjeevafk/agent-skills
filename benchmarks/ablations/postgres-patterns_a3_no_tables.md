@@ -1,22 +1,5 @@
 [ENGINEERING IMPLEMENTATION STANDARDS & ARCHITECTURAL CONSTRAINTS]
 
-### Index Cheat Sheet
-| Query Pattern | Index Type | Example |
-|--------------|------------|---------|
-| `WHERE col = value` | B-tree (default) | `CREATE INDEX idx ON t (col)` |
-| `WHERE col > value` | B-tree | `CREATE INDEX idx ON t (col)` |
-| `WHERE a = x AND b > y` | Composite | `CREATE INDEX idx ON t (a, b)` |
-| `WHERE jsonb @> '{}'` | GIN | `CREATE INDEX idx ON t USING gin (col)` |
-| `WHERE tsv @@ query` | GIN | `CREATE INDEX idx ON t USING gin (col)` |
-| Time-series ranges | BRIN | `CREATE INDEX idx ON t USING brin (col)` |
-### Data Type Quick Reference
-| Use Case | Correct Type | Avoid |
-|----------|-------------|-------|
-| IDs | `bigint` | `int`, random UUID |
-| Strings | `text` | `varchar(255)` |
-| Timestamps | `timestamptz` | `timestamp` |
-| Money | `numeric(10,2)` | `float` |
-| Flags | `boolean` | `varchar`, `int` |
 ### Common Patterns
 **Composite Index Order**
 ```sql
