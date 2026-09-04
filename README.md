@@ -2,8 +2,8 @@
 
 [![License](https://img.shields.io/github/license/sanjeevafk/agent-skills?style=flat-square)](https://github.com/sanjeevafk/agent-skills/blob/main/LICENSE)
 ![Agentic Engineering](https://img.shields.io/badge/Agentic-Engineering-1F8A70?style=flat-square)
-![Skills Count](https://img.shields.io/badge/Skills-418+-blue?style=flat-square)
-![Empirical Evaluations](https://img.shields.io/badge/IEEE_Benchmark-396_Evals-purple?style=flat-square)
+![Skills Count](https://img.shields.io/badge/Skills-424-blue?style=flat-square)
+![Empirical Evaluations](https://img.shields.io/badge/IEEE_Benchmark-396_of_450_Evals-purple?style=flat-square)
 
 A curated, telemetry-driven skill and prompt delivery framework for autonomous coding agents. Manage, compile, benchmark, and deploy domain engineering skills across **Claude Code, Google Antigravity, Cursor, Windsurf, GitHub Copilot, and Codex**.
 
@@ -16,9 +16,9 @@ Modern software engineering agents rely on injected skill documents (`SKILL.md`,
 However, in enterprise codebases loading 15 to 25 skills simultaneously, uncompressed prompt injection causes severe context bloat (exceeding 50,000 tokens per message), while aggressive one-line rule extraction triggers **Context Collapse** in syntax-dense tasks.
 
 `agent-skills` provides:
-1. **418+ Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
+1. **424 Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
 2. **Structure-Preserving Static Compiler:** An offline compiler (`scripts/compile_checklists_v2.py`) that extracts imperative constraints while strictly preserving code blocks, type signatures, and tables—capturing **99.2% of full manual quality** while reducing prompt token overhead by **30.0%**.
-3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 blind cross-vendor LLM-as-a-Judge evaluations.
+3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 scored blind cross-vendor LLM-as-a-Judge evaluations (450 designed runs: 18 tasks × 5 strategies × 5 runs; 54 runs unscored due to judge quota/incomplete cells).
 4. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
 
 ---
@@ -47,7 +47,7 @@ skills build-all
 
 ```
 agent-skills/
-|-- skills/                 [CANONICAL] 418+ Modular Domain Skill Manuals
+|-- skills/                 [CANONICAL] 424 Modular Domain Skill Manuals
 |-- playbooks/              [PRESETS] Curated Skill Bundles (Security, Fullstack, etc.)
 |-- rules/                  [STANDARDS] 16 System Standards & Software Design Principles
 |-- benchmarks/             [RESEARCH] IEEE 18-Task Benchmark & Empirical Evaluation Data
@@ -62,9 +62,9 @@ agent-skills/
 
 ---
 
-## Empirical Benchmark Findings (N=396 Blind Evaluations)
+## Empirical Benchmark Findings (N=396 Scored of 450 Designed Runs)
 
-We evaluated 5 instruction delivery strategies across 18 hard software engineering benchmark tasks spanning 6 domains: Architecture, Databases, DevOps, SRE, Security, and Testing ($N=396$ blind evaluations using Qwen 3.7 Flash as executor and DeepSeek V4 Pro as independent judge on a 35-point rubric).
+We evaluated 5 instruction delivery strategies across 18 hard software engineering benchmark tasks spanning 6 domains: Architecture, Databases, DevOps, SRE, Security, and Testing ($N=396$ scored blind evaluations out of 450 designed runs — 18 tasks × 5 strategies × 5 runs — using Qwen 3.7 Flash as executor and DeepSeek V4 Pro as independent judge on a 35-point rubric; 54 runs unscored due to judge quota/incomplete cells, including `db-ratelimit-redis-ieee` with 0 judged runs).
 
 | Strategy | Mean Score (/35) | 95% Confidence Interval | Median | Std Dev ($\sigma$) | Prompt Token Overhead | Output Code Depth |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -83,7 +83,7 @@ We evaluated 5 instruction delivery strategies across 18 hard software engineeri
 3. **Higher Output Code Volume:**  
    By removing narrative prose distraction, `checklist_v2` prompts the model to focus its reasoning budget directly on code synthesis, producing **5,431 output tokens** (+18.4% deeper implementations than uncompressed manuals).
 4. **Multi-Skill Scaling Economics:**  
-   In enterprise environments with 20 active repository skills, `checklist_v2` saves **26,000 prompt tokens per turn**, eliminating **~780,000 tokens per 30-turn developer session**.
+   In enterprise environments with 20 active repository skills, `checklist_v2` saves **~13,600 prompt tokens per turn** (680 tokens × 20), eliminating **~408,000 tokens per 30-turn developer session**.
 
 ---
 
@@ -135,10 +135,13 @@ To reproduce the empirical benchmark runs:
 
 ```bash
 # Run the 18-task IEEE benchmark suite
+# Note: the published 2026-08-26 run used --judge-chars 10000 (see
+# benchmarks/delivery_results_ieee.json provenance.judge_max_chars_per_response);
+# the script default is 16000.
 python3 scripts/skill_delivery_experiment.py \
   --tasks benchmarks/tasks_ieee.json \
   --runs 5 \
-  --judge-chars 16000
+  --judge-chars 10000
 
 # Recompile structure-preserving checklists
 python3 scripts/compile_checklists_v2.py
