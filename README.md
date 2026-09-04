@@ -17,9 +17,10 @@ However, in enterprise codebases loading 15 to 25 skills simultaneously, uncompr
 
 `agent-skills` provides:
 1. **424 Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
-2. **Structure-Preserving Static Compiler:** An offline compiler (`scripts/compile_checklists_v2.py`) that extracts imperative constraints while strictly preserving code blocks, type signatures, and tables—capturing **99.2% of full manual quality** while reducing prompt token overhead by **30.0%**.
+2. **Structure-Preserving Static Compiler:** A high-performance Rust compiler (`crates/skills-compiler/`) and Python script (`scripts/compile_checklists_v2.py`) that extract imperative constraints while strictly preserving code blocks, type signatures, and tables, capturing **99.2% of full manual quality** while reducing prompt token overhead by **30.0%**.
 3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 scored blind cross-vendor LLM-as-a-Judge evaluations (450 designed runs: 18 tasks × 5 strategies × 5 runs; 54 runs unscored due to judge quota/incomplete cells).
-4. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
+4. **Targeted Component Ablations & Execution Calibration:** Controlled experiments isolating the role of examples, tables, and types (42 runs), paired with dynamic subprocess execution calibration across 238 runs to validate LLM judge reliability.
+5. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
 
 ---
 
@@ -48,11 +49,16 @@ skills build-all
 ```
 agent-skills/
 |-- skills/                 [CANONICAL] 424 Modular Domain Skill Manuals
+|-- crates/
+|   `-- skills-compiler/    [COMPILER] High-Performance Rust Skill Static Compiler
 |-- playbooks/              [PRESETS] Curated Skill Bundles (Security, Fullstack, etc.)
 |-- rules/                  [STANDARDS] 16 System Standards & Software Design Principles
-|-- benchmarks/             [RESEARCH] IEEE 18-Task Benchmark & Empirical Evaluation Data
+|-- benchmarks/             [RESEARCH] IEEE Benchmark, Ablations & Calibration Data
 |   |-- tasks_ieee.json     18 Hard SE Benchmark Task Specifications
 |   |-- checklists_v2/      Structure-Preserving Compiled Checklists
+|   |-- ablations/          Component-Stripped Ablation Variants (Examples, Tables, Types)
+|   |-- ablation_results.json 42 Scored Ablation Run Traces
+|   |-- calibration_report.md Post-Hoc Execution Calibration Report (238 Code Runs)
 |   |-- tables_ieee/        Publication-Ready LaTeX Tables & Pareto Plots
 |   `-- csv_ieee/           Summary & Raw Evaluation Metrics (396 Evals)
 |-- scripts/                [TOOLING] Compilers, Runners, Linter, and Indexers
@@ -84,6 +90,8 @@ We evaluated 5 instruction delivery strategies across 18 hard software engineeri
    By removing narrative prose distraction, `checklist_v2` prompts the model to focus its reasoning budget directly on code synthesis, producing **5,431 output tokens** (+18.4% deeper implementations than uncompressed manuals).
 4. **Multi-Skill Scaling Economics:**  
    In enterprise environments with 20 active repository skills, `checklist_v2` saves **~13,600 prompt tokens per turn** (680 tokens × 20), eliminating **~408,000 tokens per 30-turn developer session**.
+5. **Component Ablation & Execution Calibration:**  
+   Component ablations (42 scored runs) demonstrate that removing reference tables causes the sharpest score crash (dropping to **17.5/35**, $\Delta = -9.40$) despite modest token savings (32.8%), while stripping code examples triggers context collapse in TDD tasks (falling to **10.0/35**). A post-hoc execution calibration across $N=238$ executable runs under a 15-second sandbox timeout confirms strong syntax-to-correctness alignment in self-contained tasks ($r = +0.616, p = 0.001$).
 
 ---
 
@@ -131,10 +139,16 @@ skills lint             # Audit repository for duplicates and metadata completen
 
 ## Reproducibility & Benchmark Execution
 
-To reproduce the empirical benchmark runs:
+To compile skills and reproduce empirical benchmarks:
 
 ```bash
-# Run the 18-task IEEE benchmark suite
+# 1. Compile structure-preserving checklists with the Rust compiler crate
+cargo run --manifest-path crates/skills-compiler/Cargo.toml -- \
+  --skills-dir skills \
+  --output-dir benchmarks/checklists_v2 \
+  --manifest-path benchmarks/checklists_v2/manifest.json
+
+# 2. Run the 18-task IEEE benchmark suite
 # Note: the published 2026-08-26 run used --judge-chars 10000 (see
 # benchmarks/delivery_results_ieee.json provenance.judge_max_chars_per_response);
 # the script default is 16000.
@@ -143,8 +157,14 @@ python3 scripts/skill_delivery_experiment.py \
   --runs 5 \
   --judge-chars 10000
 
-# Recompile structure-preserving checklists
-python3 scripts/compile_checklists_v2.py
+# 3. Run targeted structural ablations (examples, tables, types)
+python3 scripts/run_ablation_experiment.py \
+  --tasks benchmarks/tasks_ablation_subset.json \
+  --conditions a2_no_examples a3_no_tables a4_no_types \
+  --runs 3
+
+# 4. Run post-hoc execution calibration (syntax checks + PyTest execution)
+python3 scripts/run_execution_calibration.py
 ```
 
 All raw outputs, evaluation traces, and analysis scripts are available in [`benchmarks/`](benchmarks/).
