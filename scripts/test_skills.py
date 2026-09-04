@@ -4,8 +4,12 @@ test_skills.py — Skill testing framework for validating example prompts and be
 """
 
 import json
+import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from skills_common import strip_frontmatter
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 INDEX_FILE = REPO_ROOT / 'skills.json'
@@ -17,17 +21,22 @@ def test_skill(name: str, meta: dict) -> tuple[bool, str]:
     if not skill_file.exists():
         return False, "File missing"
 
-    content = skill_file.read_text(encoding='utf-8')
-    
+    try:
+        content = skill_file.read_text(encoding='utf-8')
+    except Exception as e:
+        return False, f"Failed to read file: {e}"
+
     if len(content) < 50:
         return False, "Content too short"
-    if not content.startswith('---') or '\n---' not in content[3:]:
-        return False, "Missing or unterminated frontmatter"
-    if f"name: {name}" not in content and f'name: "{name}"' not in content:
+    parsed, _body, err = strip_frontmatter(content)
+    if err:
+        return False, f"Missing or unterminated frontmatter: {err}"
+    front_name = str(parsed.get('name') or '').strip()
+    if front_name != name:
         return False, "Indexed name does not match frontmatter"
     if not meta.get('description', '').strip():
         return False, "Missing description"
-    
+
     return True, "Passed (Frontmatter valid, structure clean, prompts present)"
 
 
@@ -36,9 +45,13 @@ def run_all_tests(target_skill: str = None):
         print("skills.json not found. Run build_index.py first.")
         sys.exit(1)
 
-    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        index = json.load(f)
-        skills = index.get('skills', {})
+    try:
+        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+            index = json.load(f)
+            skills = index.get('skills', {})
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Failed to read skills.json: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Keep the smoke test from masking repository-integrity failures.
     import subprocess
