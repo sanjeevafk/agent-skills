@@ -73,6 +73,8 @@ def run_doctor():
     else:
         print("⚠️ System Doctor Status: ISSUES DETECTED — Run `gskills build-all` to repair build targets.")
     print("--------------------------------------------------------------------------------\n")
+    if not all_passed:
+        sys.exit(1)
 
 
 def explain_skill(skill_name: str):
@@ -80,12 +82,17 @@ def explain_skill(skill_name: str):
         print("skills.json not found. Run build_index.py first.")
         sys.exit(1)
 
-    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        skills = json.load(f).get('skills', {})
+    try:
+        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Failed to read skills.json: {e}", file=sys.stderr)
+        sys.exit(1)
+    skills = index_data.get('skills', {})
 
     if skill_name not in skills:
         # Check alias
-        aliases = json.load(open(INDEX_FILE)).get('aliases', {})
+        aliases = index_data.get('aliases', {})
         if skill_name in aliases:
             skill_name = aliases[skill_name]
         else:
