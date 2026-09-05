@@ -106,15 +106,8 @@ else
     info "Using provided message: $COMMIT_MSG"
 fi
 
-# Create commit with Claude Code footer
-git commit -m "$(cat <<EOF
-${COMMIT_MSG}
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-EOF
-)"
+# Create commit
+git commit -m "${COMMIT_MSG}"
 
 COMMIT_HASH=$(git rev-parse --short HEAD)
 info "Created commit: $COMMIT_HASH"
