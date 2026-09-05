@@ -11,6 +11,9 @@ DEFAULT_ROOT_COPILOT="${HOME}/.copilot/skills"
 DEFAULT_ROOT_CURSOR="${HOME}/.cursor/skills"
 DEFAULT_ROOT_ANTIGRAVITY="${HOME}/.gemini/antigravity/skills"
 DEFAULT_ROOT_CODEX="${HOME}/.codex/skills"
+DEFAULT_ROOT_HERMES="${HOME}/.hermes/skills"
+DEFAULT_ROOT_OPENCODE="${HOME}/.config/opencode/skills"
+DEFAULT_ROOT_CMD="${HOME}/.commandcode/skills"
 DEFAULT_BACKUP_BASE_DIR="${HOME}/.skills/backups"
 
 ROOT_AGENTS="$DEFAULT_ROOT_AGENTS"
@@ -18,6 +21,9 @@ ROOT_COPILOT="$DEFAULT_ROOT_COPILOT"
 ROOT_CURSOR="$DEFAULT_ROOT_CURSOR"
 ROOT_ANTIGRAVITY="$DEFAULT_ROOT_ANTIGRAVITY"
 ROOT_CODEX="$DEFAULT_ROOT_CODEX"
+ROOT_HERMES="$DEFAULT_ROOT_HERMES"
+ROOT_OPENCODE="$DEFAULT_ROOT_OPENCODE"
+ROOT_CMD="$DEFAULT_ROOT_CMD"
 BACKUP_BASE_DIR="$DEFAULT_BACKUP_BASE_DIR"
 
 # Arrays are rebuilt after optional config load.
@@ -29,7 +35,7 @@ load_config() {
     # Parse only the documented KEY=value format; never execute config contents.
     while IFS= read -r line || [ -n "$line" ]; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-      if [[ "$line" =~ ^[[:space:]]*(ROOT_AGENTS|ROOT_COPILOT|ROOT_CURSOR|ROOT_ANTIGRAVITY|ROOT_CODEX|BACKUP_BASE_DIR|REPO_DIR)[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
+      if [[ "$line" =~ ^[[:space:]]*(ROOT_AGENTS|ROOT_COPILOT|ROOT_CURSOR|ROOT_ANTIGRAVITY|ROOT_CODEX|ROOT_HERMES|ROOT_OPENCODE|ROOT_CMD|BACKUP_BASE_DIR|REPO_DIR)[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
         value="${value#\"}"; value="${value%\"}"
@@ -40,6 +46,9 @@ load_config() {
           ROOT_CURSOR) ROOT_CURSOR="$value" ;;
           ROOT_ANTIGRAVITY) ROOT_ANTIGRAVITY="$value" ;;
           ROOT_CODEX) ROOT_CODEX="$value" ;;
+          ROOT_HERMES) ROOT_HERMES="$value" ;;
+          ROOT_OPENCODE) ROOT_OPENCODE="$value" ;;
+          ROOT_CMD) ROOT_CMD="$value" ;;
           BACKUP_BASE_DIR) BACKUP_BASE_DIR="$value" ;;
           REPO_DIR) REPO_DIR="$value" ;;
         esac
@@ -55,8 +64,8 @@ load_config() {
   fi
   PY_SCRIPT_DIR="$REPO_DIR/scripts"
 
-  CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY")
-  ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX")
+  CANONICAL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_HERMES" "$ROOT_OPENCODE" "$ROOT_CMD")
+  ALL_ROOTS=("$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX" "$ROOT_HERMES" "$ROOT_OPENCODE" "$ROOT_CMD")
 }
 
 validate_safe_root() {
@@ -134,6 +143,9 @@ ROOT_COPILOT="${DEFAULT_ROOT_COPILOT}"
 ROOT_CURSOR="${DEFAULT_ROOT_CURSOR}"
 ROOT_ANTIGRAVITY="${DEFAULT_ROOT_ANTIGRAVITY}"
 ROOT_CODEX="${DEFAULT_ROOT_CODEX}"
+ROOT_HERMES="${DEFAULT_ROOT_HERMES}"
+ROOT_OPENCODE="${DEFAULT_ROOT_OPENCODE}"
+ROOT_CMD="${DEFAULT_ROOT_CMD}"
 
 # Backup base directory used by: global-skills backup
 BACKUP_BASE_DIR="${DEFAULT_BACKUP_BASE_DIR}"
@@ -305,7 +317,7 @@ status() {
   local root count
   echo "Using config: $CONFIG_FILE"
   for root in "${ALL_ROOTS[@]}"; do
-    count="$(find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+    count="$(find -L "$root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
     echo "$root: $count entries"
   done
 
@@ -321,7 +333,7 @@ status() {
 
 load_config
 
-for configured_root in "$ROOT_AGENTS" "$ROOT_COPILOT" "$ROOT_CURSOR" "$ROOT_ANTIGRAVITY" "$ROOT_CODEX"; do
+for configured_root in "${ALL_ROOTS[@]}"; do
   validate_safe_root "$configured_root" "skill root"
 done
 validate_safe_root "$BACKUP_BASE_DIR" "backup directory"
