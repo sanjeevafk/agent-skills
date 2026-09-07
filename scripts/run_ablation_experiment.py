@@ -297,6 +297,8 @@ def main():
     parser.add_argument("--judge-backend", default="cmd", choices=["cmd", "agy", "mock"], help="Judge backend")
     parser.add_argument("--judge-model", default="deepseek/deepseek-v4-pro", help="Judge model name")
     parser.add_argument("--out-results", type=Path, default=DEFAULT_RESULTS, help="Output results JSON path")
+    parser.add_argument("--exec-timeout", type=int, default=300, help="Executor subprocess timeout in seconds")
+    parser.add_argument("--judge-timeout", type=int, default=300, help="Judge subprocess timeout in seconds")
     parser.add_argument("--resume", action="store_true", help="Resume from existing progress")
     parser.add_argument("--dry-run", action="store_true", help="Perform offline dry-run test without API calls")
 
@@ -390,6 +392,7 @@ def main():
                     exec_prompt,
                     backend=args.executor_backend,
                     model=args.executor_model,
+                    timeout=args.exec_timeout,
                     dry_run=args.dry_run,
                 )
 
@@ -409,6 +412,7 @@ def main():
                     stdout,
                     backend=args.judge_backend,
                     model=args.judge_model,
+                    timeout=args.judge_timeout,
                     dry_run=args.dry_run,
                 )
 
@@ -430,6 +434,7 @@ def main():
                     "magnitude": mag_info,
                     "execution": {
                         "latency_s": round(exec_time, 2),
+                        "exec_timeout_s": args.exec_timeout,
                         "output_tokens": output_tokens,
                         "syntax_checked": syntax_checked,
                         "syntax_errors": syntax_errs,

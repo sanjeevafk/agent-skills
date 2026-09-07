@@ -33,7 +33,7 @@ const CreateUserSchema = z.object({
   age: z.number().int().min(0).max(150)
 })
 // Validate before processing
-export async function createUser(input: unknown) {
+export async function createUser(input) {
   # ... [syntax pattern continues] ...
   }
 }
@@ -41,7 +41,7 @@ export async function createUser(input: unknown) {
 
 #### File Upload Validation
 ```typescript
-function validateFileUpload(file: File) {
+function validateFileUpload(file) {
   // Size check (5MB max)
   const maxSize = 5 * 1024 * 1024
   if (file.size > maxSize) {
@@ -100,7 +100,7 @@ res.setHeader('Set-Cookie',
 
 #### Authorization Checks
 ```typescript
-export async function deleteUser(userId: string, requesterId: string) {
+export async function deleteUser(userId, requesterId) {
   // ALWAYS verify authorization first
   const requester = await db.users.findUnique({
     where: { id: requesterId }
@@ -141,7 +141,7 @@ CREATE POLICY "Users update own data"
 import DOMPurify from 'isomorphic-dompurify'
 
 // ALWAYS sanitize user-provided HTML
-function renderUserContent(html: string) {
+function renderUserContent(html) {
   const clean = DOMPurify.sanitize(html, {
     ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'p'],
     ALLOWED_ATTR: []
@@ -174,7 +174,7 @@ const securityHeaders = [
 #### CSRF Tokens
 ```typescript
 import { csrf } from '@/lib/csrf'
-export async function POST(request: Request) {
+export async function POST(request) {
   const token = request.headers.get('X-CSRF-Token')
   if (!csrf.verify(token)) {
     return NextResponse.json(
@@ -263,9 +263,9 @@ catch (error) {
 ```typescript
 import { verify } from '@solana/web3.js'
 async function verifyWalletOwnership(
-  publicKey: string,
-  signature: string,
-  message: string
+  publicKey,
+  signature,
+  message
 ) {
   try {
     const isValid = verify(
@@ -277,7 +277,7 @@ async function verifyWalletOwnership(
 
 #### Transaction Verification
 ```typescript
-async function verifyTransaction(transaction: Transaction) {
+async function verifyTransaction(transaction) {
   // Verify recipient
   if (transaction.to !== expectedRecipient) {
     throw new Error('Invalid recipient')

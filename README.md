@@ -19,7 +19,7 @@ However, in enterprise codebases loading 15 to 25 skills simultaneously, uncompr
 1. **424 Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
 2. **Structure-Preserving Static Compiler:** A high-performance Rust compiler (`crates/skills-compiler/`) and Python script (`scripts/compile_checklists_v2.py`) that extract imperative constraints while strictly preserving code blocks, type signatures, and tables, capturing **99.2% of full manual quality** while reducing prompt token overhead by **30.0%**.
 3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 scored blind cross-vendor LLM-as-a-Judge evaluations (450 designed runs: 18 tasks × 5 strategies × 5 runs; 54 runs unscored due to judge quota/incomplete cells).
-4. **Targeted Component Ablations & Execution Calibration:** Controlled experiments isolating the role of examples, tables, and types (42 runs), paired with dynamic subprocess execution calibration across 238 runs to validate LLM judge reliability.
+4. **Targeted Component Ablations & Execution Calibration:** Controlled experiments isolating the role of examples, tables, and types (69 runs: full 6-task × 3-condition × 3-run design plus same-task balanced references and TDD replication, compiler v0.2.0), paired with dynamic subprocess execution calibration across 238 runs to validate LLM judge reliability.
 5. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
 
 ---
@@ -90,8 +90,8 @@ We evaluated 5 instruction delivery strategies across 18 hard software engineeri
    By removing narrative prose distraction, `checklist_v2` prompts the model to focus its reasoning budget directly on code synthesis, producing **5,431 output tokens** (+18.4% deeper implementations than uncompressed manuals).
 4. **Multi-Skill Scaling Economics:**  
    In enterprise environments with 20 active repository skills, `checklist_v2` saves **~13,600 prompt tokens per turn** (680 tokens × 20), eliminating **~408,000 tokens per 30-turn developer session**.
-5. **Component Ablation & Execution Calibration:**  
-   Component ablations (42 scored runs) demonstrate that removing reference tables causes the sharpest score crash (dropping to **17.5/35**, $\Delta = -9.40$) despite modest token savings (32.8%), while stripping code examples triggers context collapse in TDD tasks (falling to **10.0/35**). A post-hoc execution calibration across $N=238$ executable runs under a 15-second sandbox timeout confirms strong syntax-to-correctness alignment in self-contained tasks ($r = +0.616, p = 0.001$).
+5. **Component Ablation & Execution Calibration:**
+   Component ablations (69 scored runs, same-harness contrasts with byte-verified prompt identity) reveal a test–retest noise floor of $\sigma = 6.09$ points on identical prompts, against which only TDD tracer-bullet anchor removal clearly and reference-stably exceeds noise ($\Delta = -8.50$ at $n=6$, 0/6 runs reaching 17+). Near-total prompt stripping (98.9% cut) shows no degradation ($\Delta = +2.00$, prior-knowledge floor), and the single true table-removal ($\Delta = +2.67$) and type-erasure ($\Delta = +2.00$) cases are noise-bounded at these skills' anchor densities. A measured multi-skill scaling study on an independent backbone (32 runs, K up to 20) finds quality flat across K with ~11.6k realized savings per turn. A post-hoc execution calibration across $N=238$ executable runs under a 15-second sandbox timeout confirms strong syntax-to-correctness alignment in self-contained tasks ($r = +0.616, p = 0.001$).
 
 ---
 
