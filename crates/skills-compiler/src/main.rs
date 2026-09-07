@@ -14,7 +14,7 @@ use manifest::{compute_sha256, CompilationManifest, SkillArtifactEntry};
 #[derive(Parser)]
 #[command(name = "skills-compiler")]
 #[command(about = "Adaptive, structure-preserving static compiler for coding agent skills (SKILL.md)")]
-#[command(version = "0.1.0")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -370,6 +370,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn chrono_lite_timestamp() -> String {
-    // Simple ISO 8601 UTC timestamp generator
-    "2026-08-29T19:15:00Z".to_string()
+    // Real UTC timestamp (ISO 8601) from system clock, no external deps.
+    // Days -> civil date via Howard Hinnant's days_from_civil inverse.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        m,
+        d,
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
 }
