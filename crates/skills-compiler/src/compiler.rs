@@ -12,6 +12,7 @@ pub struct CompilationOptions {
     pub keep_types: bool,
     pub keep_tables: bool,
     pub keep_invariants: bool,
+    pub keep_frontmatter: bool,
     pub max_code_lines: usize,
     pub header_directive: Option<String>,
 }
@@ -25,6 +26,7 @@ impl Default for CompilationOptions {
             keep_types: true,      // Default v2: preserve type contracts
             keep_tables: true,     // Default v2: preserve schema tables
             keep_invariants: true, // Default v2: preserve invariants
+            keep_frontmatter: false,
             max_code_lines: 14,
             header_directive: Some("[ENGINEERING IMPLEMENTATION STANDARDS & ARCHITECTURAL CONSTRAINTS]".to_string()),
         }
@@ -48,6 +50,7 @@ impl CompilationOptions {
             keep_types: false,
             keep_tables: false,
             keep_invariants: true,
+            keep_frontmatter: false,
             max_code_lines: 0,
             header_directive: Some("[CHECKLIST GUIDELINES]".to_string()),
         }
@@ -150,6 +153,16 @@ impl Compiler {
             }
         }
         text
+    }
+
+    pub fn extract_yaml_frontmatter<'a>(&self, text: &'a str) -> Option<String> {
+        if text.starts_with("---") {
+            let parts: Vec<&str> = text.splitn(3, "---").collect();
+            if parts.len() >= 3 {
+                return Some(format!("---{}---", parts[1]));
+            }
+        }
+        None
     }
 
     pub fn is_actionable(&self, text: &str) -> bool {
@@ -280,6 +293,11 @@ impl Compiler {
     }
 
     pub fn compile(&self, skill_md: &str, opts: &CompilationOptions) -> (String, CompilationMetrics) {
+        let frontmatter_opt = if opts.keep_frontmatter {
+            self.extract_yaml_frontmatter(skill_md)
+        } else {
+            None
+        };
         let raw_text = self.strip_yaml_frontmatter(skill_md);
         let lines: Vec<&str> = raw_text.lines().collect();
 
@@ -456,6 +474,10 @@ impl Compiler {
 
         // Clean redundant blank lines
         let mut final_lines: Vec<String> = Vec::new();
+        if let Some(ref fm) = frontmatter_opt {
+            final_lines.push(fm.clone());
+            final_lines.push(String::new());
+        }
         if let Some(ref dir) = opts.header_directive {
             final_lines.push(dir.clone());
             final_lines.push(String::new());
@@ -635,5 +657,15 @@ mod tests {
         assert!(!Compiler::is_typed_code_lang("bash"));
         assert!(!Compiler::is_typed_code_lang("sql"));
         assert!(!Compiler::is_typed_code_lang(""));
+    }
+
+    #[test]
+    fn keep_frontmatter_preserves_yaml_header() {
+        let md = "---\nname: my-skill\ndescription: A test skill\n---\n\n## Rules\n\n- Do the thing\n";
+        let mut o = v2_opts();
+        o.keep_frontmatter = true;
+        let (out, _) = compiler().compile(md, &o);
+        assert!(out.starts_with("---\nname: my-skill\ndescription: A test skill\n---"), "frontmatter preserved:\n{}", out);
+        assert!(out.contains("Do the thing"), "rule kept:\n{}", out);
     }
 }

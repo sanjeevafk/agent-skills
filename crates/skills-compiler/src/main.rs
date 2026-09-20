@@ -51,6 +51,10 @@ enum Commands {
         /// Max lines to retain per code block (0 to strip completely)
         #[arg(long)]
         max_code_lines: Option<usize>,
+
+        /// Retain YAML frontmatter in compiled output (for live agent skill deployment)
+        #[arg(long, default_value_t = false)]
+        keep_frontmatter: bool,
     },
 
     /// Batch compile skills from a tasks_ieee.json specification
@@ -81,6 +85,10 @@ enum Commands {
         /// Target domain profile
         #[arg(short, long, default_value = "general")]
         domain: Domain,
+
+        /// Retain YAML frontmatter in compiled output (for live agent skill deployment)
+        #[arg(long, default_value_t = false)]
+        keep_frontmatter: bool,
     },
 
     /// Generate complete ablation series for a skill (v2, no-examples, no-types, no-tables, v1)
@@ -123,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_types,
             no_tables,
             max_code_lines,
+            keep_frontmatter,
         } => {
             let content = fs::read_to_string(&input)?;
             let mut opts = CompilationOptions::for_domain(domain);
@@ -137,6 +146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(lines) = max_code_lines {
                 opts.max_code_lines = lines;
+            }
+            if keep_frontmatter {
+                opts.keep_frontmatter = true;
             }
 
             let (compiled, metrics) = compiler.compile(&content, &opts);
@@ -277,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Manifest saved to: {:?}", manifest_path);
         }
 
-        Commands::Batch { skills_dir, out_dir, domain } => {
+        Commands::Batch { skills_dir, out_dir, domain, keep_frontmatter } => {
             fs::create_dir_all(&out_dir)?;
             let entries: Vec<PathBuf> = walkdir::WalkDir::new(&skills_dir)
                 .into_iter()
@@ -297,7 +309,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or("unknown");
 
                 if let Ok(content) = fs::read_to_string(skill_path) {
-                    let opts = CompilationOptions::checklist_v2(domain);
+                    let mut opts = CompilationOptions::checklist_v2(domain);
+                    if keep_frontmatter {
+                        opts.keep_frontmatter = true;
+                    }
                     let (compiled, _) = local_compiler.compile(&content, &opts);
                     let out_path = out_dir.join(format!("{}.md", skill_name));
                     let _ = fs::write(out_path, compiled);
