@@ -19,7 +19,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_COMPILER = REPO_ROOT / "crates" / "skills-compiler" / "target" / "release" / "skills-compiler"
 DEFAULT_SKILLS_DIR = REPO_ROOT / "skills"
-CONFIG_FILE = Path(os.environ.get("GLOBAL_SKILLS_CONFIG", Path.home() / ".global-skills.conf"))
+CONFIG_FILE = Path(os.path.expandvars(os.path.expanduser(os.environ.get("GLOBAL_SKILLS_CONFIG", "~/.global-skills.conf")))).resolve()
 
 
 def parse_config(config_file: Path) -> dict:
@@ -64,26 +64,56 @@ def get_agent_roots(config: dict) -> list[Path]:
 
 
 def safe_copy_assets(src_dir: Path, dest_dir: Path):
-    """Copy non-SKILL.md assets with path containment checks and symlink safety."""
+    """Recursively copy non-SKILL.md assets with strict containment checks to prevent symlink traversal."""
     resolved_src = src_dir.resolve()
-    for item in src_dir.iterdir():
-        if item.name == "SKILL.md":
-            continue
-        # Check path containment to prevent directory traversal via symlinks
-        try:
-            resolved_item = item.resolve(strict=False)
-            if not resolved_item.is_relative_to(resolved_src):
-                print(f"Warning: Skipping out-of-tree symlink {item}", file=sys.stderr)
-                continue
-        except (ValueError, RuntimeError) as e:
-            print(f"Warning: Could not resolve {item}: {e}", file=sys.stderr)
-            continue
+    for root, dirs, files in os.walk(src_dir, followlinks=False):
+        rel_root = Path(root).relative_to(src_dir)
+        target_root = dest_dir / rel_root
+        target_root.mkdir(parents=True, exist_ok=True)
 
-        target = dest_dir / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, symlinks=False, dirs_exist_ok=True)
-        else:
-            shutil.copy2(item, target, follow_symlinks=False)
+        # Filter directories to avoid recursing into out-of-tree symlinked dirs
+        safe_dirs = []
+        for d in dirs:
+            d_path = Path(root) / d
+            if d_path.is_symlink():
+                try:
+                    resolved_d = d_path.resolve(strict=False)
+                    if not resolved_d.is_relative_to(resolved_src):
+                        print(f"Warning: Skipping out-of-tree symlink directory {d_path}", file=sys.stderr)
+                        continue
+                except (ValueError, RuntimeError) as e:
+                    print(f"Warning: Skipping unresolvable directory symlink {d_path}: {e}", file=sys.stderr)
+                    continue
+            safe_dirs.append(d)
+        dirs[:] = safe_dirs
+
+        for f in files:
+            if rel_root == Path(".") and f == "SKILL.md":
+                continue
+            f_path = Path(root) / f
+            if f_path.is_symlink():
+                try:
+                    resolved_f = f_path.resolve(strict=False)
+                    if not resolved_f.is_relative_to(resolved_src):
+                        print(f"Warning: Skipping out-of-tree file symlink {f_path}", file=sys.stderr)
+                        continue
+                except (ValueError, RuntimeError) as e:
+                    print(f"Warning: Skipping unresolvable file symlink {f_path}: {e}", file=sys.stderr)
+                    continue
+
+            target_file = target_root / f
+            shutil.copy2(f_path, target_file, follow_symlinks=False)
+
+
+def clean_destination(dest_dir: Path):
+    """Safely remove a destination skill directory, handling symlinks and real directories."""
+    if dest_dir.is_symlink() or os.path.lexists(dest_dir):
+        try:
+            dest_dir.unlink()
+        except OSError:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+    elif dest_dir.is_dir():
+        shutil.rmtree(dest_dir)
 
 
 def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = False):
@@ -104,7 +134,6 @@ def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = Fal
     compiled_count = 0
     fallback_count = 0
 
-    # Insecure /tmp hardcoded directory replaced with secure tempfile.TemporaryDirectory
     with tempfile.TemporaryDirectory(prefix="compiled_skills_") as tmp_dir:
         staging_dir = Path(tmp_dir)
 
@@ -119,7 +148,6 @@ def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = Fal
             orig_content = src_skill_md.read_text(encoding="utf-8", errors="replace")
             total_orig_chars += len(orig_content)
 
-            # Compile using native Rust compiler with --keep-frontmatter and 30s timeout
             try:
                 res = subprocess.run(
                     [str(compiler_bin), "compile", "--keep-frontmatter", "--input", str(src_skill_md)],
@@ -157,26 +185,39 @@ def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = Fal
                 if not skill_dir.is_dir():
                     continue
                 dest_skill_dir = root / skill_dir.name
-                # Clean destination directory before copying to prevent stale file accumulation
-                if dest_skill_dir.exists():
-                    shutil.rmtree(dest_skill_dir)
+                clean_destination(dest_skill_dir)
                 dest_skill_dir.mkdir(parents=True, exist_ok=True)
 
-                for item in skill_dir.iterdir():
-                    if item.is_dir():
-                        shutil.copytree(item, dest_skill_dir / item.name, symlinks=False, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(item, dest_skill_dir / item.name, follow_symlinks=False)
+                for root_sub, _, files_sub in os.walk(skill_dir, followlinks=False):
+                    rel_sub = Path(root_sub).relative_to(skill_dir)
+                    target_sub = dest_skill_dir / rel_sub
+                    target_sub.mkdir(parents=True, exist_ok=True)
+                    for f in files_sub:
+                        src_f = Path(root_sub) / f
+                        dst_f = target_sub / f
+                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
 
-        # Sync pi symlinks safely (handling stale or broken symlinks)
+        # Sync pi symlinks safely (handling stale or broken symlinks and cleaning orphans)
         pi_skills_dir = (Path.home() / ".pi" / "agent" / "skills").resolve()
         if pi_skills_dir.exists():
             print(f"Updating pi symlinks in {pi_skills_dir}...")
             agents_root = Path(os.path.expandvars(os.path.expanduser(config.get("ROOT_AGENTS", "~/.agents/skills")))).resolve()
+
+            # Clean orphaned symlinks pointing to non-existent skills
+            for item in pi_skills_dir.iterdir():
+                if item.is_symlink():
+                    try:
+                        resolved_item = item.resolve()
+                        if resolved_item.is_relative_to(agents_root) and not (staging_dir / item.name).exists():
+                            print(f"Removing orphaned Pi symlink: {item.name}")
+                            item.unlink()
+                    except Exception:
+                        if not os.path.lexists(item):
+                            item.unlink()
+
             for skill_dir in staging_dir.iterdir():
                 symlink_target = pi_skills_dir / skill_dir.name
                 rel_target = Path(os.path.relpath(agents_root / skill_dir.name, pi_skills_dir))
-                # Check for broken symlinks or existing files
                 if symlink_target.is_symlink() or os.path.lexists(symlink_target):
                     try:
                         if symlink_target.resolve() == (agents_root / skill_dir.name).resolve():
