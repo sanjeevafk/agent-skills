@@ -330,7 +330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if error_count > 0 {
-                eprintln!("Batch compilation completed with {} error(s)!", error_count);
+                return Err(format!("Batch compilation completed with {} error(s)!", error_count).into());
             } else {
                 println!("Batch compilation completed successfully!");
             }

@@ -146,22 +146,24 @@ impl Compiler {
     }
 
     pub fn parse_frontmatter<'a>(&self, text: &'a str) -> Option<(&'a str, &'a str)> {
-        if !text.starts_with("---") {
+        let text_no_bom = text.strip_prefix('\u{feff}').unwrap_or(text);
+        if !text_no_bom.starts_with("---") {
             return None;
         }
-        let rest = &text[3..];
+        let rest = &text_no_bom[3..];
         let first_nl = rest.find('\n')?;
-        if !rest[..first_nl].trim_end_matches('\r').trim().is_empty() {
+        if !rest[..first_nl].trim_end_matches(['\r', '\n']).trim().is_empty() {
             return None;
         }
         let search_start = 3 + first_nl + 1;
         let mut offset = 0;
-        for line in text[search_start..].split_inclusive('\n') {
-            let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n').trim();
-            if trimmed == "---" || trimmed == "..." {
+        for line in text_no_bom[search_start..].split_inclusive('\n') {
+            // Under YAML 1.2, closing document markers cannot be indented.
+            let trimmed_end = line.trim_end_matches(['\r', '\n']);
+            if trimmed_end == "---" || trimmed_end == "..." {
                 let closing_end = search_start + offset + line.len();
-                let fm = text[..closing_end].trim_end_matches(|c| c == '\r' || c == '\n');
-                let body = text[closing_end..].trim_start_matches(|c| c == '\r' || c == '\n');
+                let fm = text_no_bom[..closing_end].trim_end_matches(['\r', '\n']);
+                let body = text_no_bom[closing_end..].trim_start_matches(['\r', '\n']);
                 return Some((fm, body));
             }
             offset += line.len();
@@ -179,7 +181,7 @@ impl Compiler {
     }
 
     #[allow(dead_code)]
-    pub fn extract_yaml_frontmatter<'a>(&self, text: &'a str) -> Option<String> {
+    pub fn extract_yaml_frontmatter(&self, text: &str) -> Option<String> {
         self.parse_frontmatter(text).map(|(fm, _)| fm.to_string())
     }
 
@@ -716,5 +718,25 @@ mod tests {
         assert!(out.contains("| Col A | Col B |"), "table header kept:\n{}", out);
         assert!(out.contains("| --- | --- |"), "table divider kept:\n{}", out);
         assert!(out.contains("Some bullet"), "bullet kept:\n{}", out);
+    }
+
+    #[test]
+    fn frontmatter_indented_delimiter_not_closing() {
+        let md = "---\nname: indented-test\nnotes: |\n  Some block scalar\n  ---\n  still in frontmatter\n---\n\n## Rules\n\n- Keep going\n";
+        let mut o = v2_opts();
+        o.keep_frontmatter = true;
+        let (out, _) = compiler().compile(md, &o);
+        assert!(out.starts_with("---\nname: indented-test\nnotes: |\n  Some block scalar\n  ---\n  still in frontmatter\n---"), "indented --- does not close frontmatter:\n{}", out);
+        assert!(out.contains("Keep going"), "rule kept:\n{}", out);
+    }
+
+    #[test]
+    fn frontmatter_with_utf8_bom() {
+        let md = "\u{feff}---\nname: bom-skill\ndescription: UTF-8 BOM test\n---\n\n## Rules\n\n- Handle BOM\n";
+        let mut o = v2_opts();
+        o.keep_frontmatter = true;
+        let (out, _) = compiler().compile(md, &o);
+        assert!(out.starts_with("---\nname: bom-skill\ndescription: UTF-8 BOM test\n---"), "BOM stripped and frontmatter preserved:\n{}", out);
+        assert!(out.contains("Handle BOM"), "rule kept:\n{}", out);
     }
 }
