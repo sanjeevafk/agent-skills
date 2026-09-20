@@ -145,24 +145,42 @@ impl Compiler {
         }
     }
 
-    pub fn strip_yaml_frontmatter<'a>(&self, text: &'a str) -> &'a str {
-        if text.starts_with("---") {
-            let parts: Vec<&str> = text.splitn(3, "---").collect();
-            if parts.len() >= 3 {
-                return parts[2].trim_start_matches(|c| c == '\r' || c == '\n');
-            }
+    pub fn parse_frontmatter<'a>(&self, text: &'a str) -> Option<(&'a str, &'a str)> {
+        if !text.starts_with("---") {
+            return None;
         }
-        text
-    }
-
-    pub fn extract_yaml_frontmatter<'a>(&self, text: &'a str) -> Option<String> {
-        if text.starts_with("---") {
-            let parts: Vec<&str> = text.splitn(3, "---").collect();
-            if parts.len() >= 3 {
-                return Some(format!("---{}---", parts[1]));
+        let rest = &text[3..];
+        let first_nl = rest.find('\n')?;
+        if !rest[..first_nl].trim_end_matches('\r').trim().is_empty() {
+            return None;
+        }
+        let search_start = 3 + first_nl + 1;
+        let mut offset = 0;
+        for line in text[search_start..].split_inclusive('\n') {
+            let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n').trim();
+            if trimmed == "---" || trimmed == "..." {
+                let closing_end = search_start + offset + line.len();
+                let fm = text[..closing_end].trim_end_matches(|c| c == '\r' || c == '\n');
+                let body = text[closing_end..].trim_start_matches(|c| c == '\r' || c == '\n');
+                return Some((fm, body));
             }
+            offset += line.len();
         }
         None
+    }
+
+    #[allow(dead_code)]
+    pub fn strip_yaml_frontmatter<'a>(&self, text: &'a str) -> &'a str {
+        if let Some((_, body)) = self.parse_frontmatter(text) {
+            body
+        } else {
+            text
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn extract_yaml_frontmatter<'a>(&self, text: &'a str) -> Option<String> {
+        self.parse_frontmatter(text).map(|(fm, _)| fm.to_string())
     }
 
     pub fn is_actionable(&self, text: &str) -> bool {
@@ -293,12 +311,11 @@ impl Compiler {
     }
 
     pub fn compile(&self, skill_md: &str, opts: &CompilationOptions) -> (String, CompilationMetrics) {
-        let frontmatter_opt = if opts.keep_frontmatter {
-            self.extract_yaml_frontmatter(skill_md)
+        let (frontmatter_opt, raw_text) = if let Some((fm, body)) = self.parse_frontmatter(skill_md) {
+            (if opts.keep_frontmatter { Some(fm.to_string()) } else { None }, body)
         } else {
-            None
+            (None, skill_md)
         };
-        let raw_text = self.strip_yaml_frontmatter(skill_md);
         let lines: Vec<&str> = raw_text.lines().collect();
 
         let mut out_lines: Vec<String> = Vec::new();
@@ -475,7 +492,8 @@ impl Compiler {
         // Clean redundant blank lines
         let mut final_lines: Vec<String> = Vec::new();
         if let Some(ref fm) = frontmatter_opt {
-            final_lines.push(fm.clone());
+            let normalized_fm = fm.replace("\r\n", "\n");
+            final_lines.push(normalized_fm);
             final_lines.push(String::new());
         }
         if let Some(ref dir) = opts.header_directive {
@@ -667,5 +685,36 @@ mod tests {
         let (out, _) = compiler().compile(md, &o);
         assert!(out.starts_with("---\nname: my-skill\ndescription: A test skill\n---"), "frontmatter preserved:\n{}", out);
         assert!(out.contains("Do the thing"), "rule kept:\n{}", out);
+    }
+
+    #[test]
+    fn frontmatter_with_embedded_triple_dash_in_value() {
+        let md = "---\nname: complex-skill\ndescription: \"Handles foo --- bar correctly\"\n---\n\n## Rules\n\n- Always test edge cases\n";
+        let mut o = v2_opts();
+        o.keep_frontmatter = true;
+        let (out, _) = compiler().compile(md, &o);
+        assert!(out.starts_with("---\nname: complex-skill\ndescription: \"Handles foo --- bar correctly\"\n---"), "embedded --- preserved:\n{}", out);
+        assert!(out.contains("Always test edge cases"), "rule kept:\n{}", out);
+    }
+
+    #[test]
+    fn frontmatter_with_crlf_normalized() {
+        let md = "---\r\nname: crlf-skill\r\ndescription: Windows line endings\r\n---\r\n\r\n## Rules\r\n\r\n- Validate line endings\r\n";
+        let mut o = v2_opts();
+        o.keep_frontmatter = true;
+        let (out, _) = compiler().compile(md, &o);
+        assert!(!out.contains("\r\n"), "CRLF normalized to LF:\n{}", out);
+        assert!(out.starts_with("---\nname: crlf-skill\ndescription: Windows line endings\n---"), "frontmatter clean:\n{}", out);
+        assert!(out.contains("Validate line endings"), "rule kept:\n{}", out);
+    }
+
+    #[test]
+    fn no_frontmatter_with_table_not_corrupted() {
+        let md = "# Title\n\n| Col A | Col B |\n| --- | --- |\n| Val 1 | Val 2 |\n\n- Some bullet\n";
+        let o = v2_opts();
+        let (out, _) = compiler().compile(md, &o);
+        assert!(out.contains("| Col A | Col B |"), "table header kept:\n{}", out);
+        assert!(out.contains("| --- | --- |"), "table divider kept:\n{}", out);
+        assert!(out.contains("Some bullet"), "bullet kept:\n{}", out);
     }
 }

@@ -300,26 +300,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Found {} SKILL.md files. Compiling...", entries.len());
 
-            entries.iter().for_each(|skill_path| {
-                let local_compiler = Compiler::new();
+            let mut opts = CompilationOptions::checklist_v2(domain);
+            if keep_frontmatter {
+                opts.keep_frontmatter = true;
+            }
+
+            let mut error_count = 0;
+            for skill_path in &entries {
                 let skill_name = skill_path
                     .parent()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
 
-                if let Ok(content) = fs::read_to_string(skill_path) {
-                    let mut opts = CompilationOptions::checklist_v2(domain);
-                    if keep_frontmatter {
-                        opts.keep_frontmatter = true;
+                match fs::read_to_string(skill_path) {
+                    Ok(content) => {
+                        let (compiled, _) = compiler.compile(&content, &opts);
+                        let out_path = out_dir.join(format!("{}.md", skill_name));
+                        if let Err(e) = fs::write(&out_path, compiled) {
+                            eprintln!("Error writing {}: {}", out_path.display(), e);
+                            error_count += 1;
+                        }
                     }
-                    let (compiled, _) = local_compiler.compile(&content, &opts);
-                    let out_path = out_dir.join(format!("{}.md", skill_name));
-                    let _ = fs::write(out_path, compiled);
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", skill_path.display(), e);
+                        error_count += 1;
+                    }
                 }
-            });
+            }
 
-            println!("Batch compilation completed successfully!");
+            if error_count > 0 {
+                eprintln!("Batch compilation completed with {} error(s)!", error_count);
+            } else {
+                println!("Batch compilation completed successfully!");
+            }
         }
 
         Commands::Ablate { input, out_dir, domain } => {
