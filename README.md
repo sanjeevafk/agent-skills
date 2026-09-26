@@ -16,12 +16,12 @@ Modern software engineering agents rely on injected skill documents (`SKILL.md`,
 However, in enterprise codebases loading 15 to 25 skills simultaneously, uncompressed prompt injection causes severe context bloat (exceeding 50,000 tokens per message), while aggressive one-line rule extraction triggers **Context Collapse** in syntax-dense tasks.
 
 `agent-skills` provides:
-1. **424 Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
+1. **440 Curated Domain Skills:** Production-grade engineering patterns spanning Security, Distributed Systems, Testing (TDD/E2E), DevOps, C++ Performance, Databases, and Architecture.
 2. **Structure-Preserving Static Compiler:** A high-performance Rust compiler (`crates/skills-compiler/`) and Python script (`scripts/compile_checklists_v2.py`) that extract imperative constraints while strictly preserving code blocks, type signatures, and tables, capturing **99.2% of full manual quality** while reducing prompt token overhead by **30.0%**.
 3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 scored blind cross-vendor LLM-as-a-Judge evaluations (450 designed runs: 18 tasks × 5 strategies × 5 runs; 54 runs unscored due to judge quota/incomplete cells).
 4. **Targeted Component Ablations & Execution Calibration:** Controlled experiments isolating the role of examples, tables, and types (69 runs: full 6-task × 3-condition × 3-run design plus same-task balanced references and TDD replication, compiler v0.2.0), paired with dynamic subprocess execution calibration across 238 runs to validate LLM judge reliability.
 5. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
-6. **Two-Stage Zero-Token Skill Router:** A sub-millisecond dense retrieval pipeline (BGE-small bi-encoder + Laya cross-encoder) indexing all 440 repository skills into a 660 KB cache (`skills_embeddings.npy`), shortlisting candidates in **0.15 ms** on CPU and achieving **55.6% Top-1 / 61.1% Top-5 recall** across the IEEE benchmark suite.
+6. **Two-Stage Zero-Token Skill Router:** A sub-millisecond dense retrieval pipeline (BGE-small bi-encoder + Laya cross-encoder) indexing all 440 repository skills into a 660 KB cache (`skills_embeddings.npy`), shortlisting candidates in **0.15 ms** on CPU and achieving **55.6% Top-1 / 61.1% Top-5 recall** across the IEEE benchmark suite. Powered by [Laya](https://github.com/NandhaKishorM/laya) for calibrated, non-autoregressive decision making.
 
 ---
 
@@ -180,6 +180,12 @@ python3 scripts/run_execution_calibration.py
 ```
 
 All raw outputs, evaluation traces, and analysis scripts are available in [`benchmarks/`](benchmarks/).
+
+---
+
+## Acknowledgments & References
+
+* **[Laya](https://github.com/NandhaKishorM/laya)** (Convai Innovations / Nandha Kishor M): Fast, non-autoregressive System 1 decision engine with calibrated probabilities, utilized in `agent-skills` for Stage 2 cross-encoder skill routing.
 
 ---
 
