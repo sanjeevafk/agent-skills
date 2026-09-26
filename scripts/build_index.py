@@ -195,6 +195,40 @@ def build_index():
     INDEX_FILE.write_text(json.dumps(index_data, indent=2), encoding='utf-8')
     print(f"Indexed {len(skills_registry)} skills into {INDEX_FILE}")
 
+    # Auto-generate static vector cache if bi-encoder dependencies exist
+    _update_embeddings_cache()
+
+
+def _update_embeddings_cache():
+    embedding_script = REPO_ROOT / 'scripts' / 'build_skill_embeddings.py'
+    if not embedding_script.exists():
+        return
+
+    # Check candidate Python interpreters with sentence-transformers
+    candidates = [
+        sys.executable,
+        str(Path.home() / ".agent-reach-venv" / "bin" / "python3"),
+        str(REPO_ROOT / ".venv" / "bin" / "python3"),
+    ]
+
+    import subprocess
+    for py in candidates:
+        if not Path(py).exists():
+            continue
+        test_cmd = [py, "-c", "import sentence_transformers"]
+        try:
+            if subprocess.run(test_cmd, capture_output=True).returncode == 0:
+                print("\n=== Updating static vector embeddings (BGE-small) ===")
+                res = subprocess.run([py, str(embedding_script)], check=False)
+                if res.returncode == 0:
+                    print("Vector cache successfully synchronized.")
+                return
+        except Exception:
+            continue
+
+    print("\nNote: sentence-transformers not detected; skipping static vector cache update.")
+
 
 if __name__ == '__main__':
     build_index()
+

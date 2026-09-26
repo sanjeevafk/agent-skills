@@ -21,6 +21,7 @@ However, in enterprise codebases loading 15 to 25 skills simultaneously, uncompr
 3. **The IEEE 18-Task Hard Benchmark Suite:** An empirical evaluation harness measuring code correctness, maintainability, and token economics across 396 scored blind cross-vendor LLM-as-a-Judge evaluations (450 designed runs: 18 tasks × 5 strategies × 5 runs; 54 runs unscored due to judge quota/incomplete cells).
 4. **Targeted Component Ablations & Execution Calibration:** Controlled experiments isolating the role of examples, tables, and types (69 runs: full 6-task × 3-condition × 3-run design plus same-task balanced references and TDD replication, compiler v0.2.0), paired with dynamic subprocess execution calibration across 238 runs to validate LLM judge reliability.
 5. **Modular Skill Playbooks:** Pre-packaged JSON manifests (`playbooks/`) for loading targeted skill sets (`fullstack-nextjs`, `security-audit`, `senior-engineer`).
+6. **Two-Stage Zero-Token Skill Router:** A sub-millisecond dense retrieval pipeline (BGE-small bi-encoder + Laya cross-encoder) indexing all 440 repository skills into a 660 KB cache (`skills_embeddings.npy`), shortlisting candidates in **0.15 ms** on CPU and achieving **55.6% Top-1 / 61.1% Top-5 recall** across the IEEE benchmark suite.
 
 ---
 
@@ -38,8 +39,11 @@ After opening a new shell:
 # Verify installation and skills health
 skills status
 
-# Run full index build and command generation
+# Run full index build, command generation, and vector cache synchronization
 skills build-all
+
+# Route any prompt to its top skill in <0.2ms
+python3 scripts/laya_router.py "How do I secure Django REST endpoints?"
 ```
 
 ---
@@ -48,20 +52,28 @@ skills build-all
 
 ```
 agent-skills/
-|-- skills/                 [CANONICAL] 424 Modular Domain Skill Manuals
+|-- skills/                 [CANONICAL] 440 Modular Domain Skill Manuals
 |-- crates/
 |   `-- skills-compiler/    [COMPILER] High-Performance Rust Skill Static Compiler
 |-- playbooks/              [PRESETS] Curated Skill Bundles (Security, Fullstack, etc.)
 |-- rules/                  [STANDARDS] 16 System Standards & Software Design Principles
+|-- skills_embeddings.npy   [CACHE] Precomputed BGE-small Dense Vector Cache (660 KB)
+|-- skills_manifest.json     [MANIFEST] 440-Skill Dense Retrieval Metadata Map
 |-- benchmarks/             [RESEARCH] IEEE Benchmark, Ablations & Calibration Data
 |   |-- tasks_ieee.json     18 Hard SE Benchmark Task Specifications
 |   |-- checklists_v2/      Structure-Preserving Compiled Checklists
+|   |-- router_level1_results.json 18-Task Hit-Rate & Latency Evaluation
+|   |-- level2_results.json  End-to-End Task Code Generation & Blind Judge Traces
 |   |-- ablations/          Component-Stripped Ablation Variants (Examples, Tables, Types)
 |   |-- ablation_results.json 42 Scored Ablation Run Traces
 |   |-- calibration_report.md Post-Hoc Execution Calibration Report (238 Code Runs)
 |   |-- tables_ieee/        Publication-Ready LaTeX Tables & Pareto Plots
 |   `-- csv_ieee/           Summary & Raw Evaluation Metrics (396 Evals)
 |-- scripts/                [TOOLING] Compilers, Runners, Linter, and Indexers
+|   |-- build_skill_embeddings.py  Offline BGE-small Vector Cache Precomputation
+|   |-- laya_router.py      Two-Stage Skill Router (0.15ms Dot Product + Laya Decision)
+|   |-- benchmark_router.py Level 1 Hit-Rate & Latency Benchmark Runner
+|   `-- run_level2_benchmark.py Level 2 Task Execution & Blind Judge Harness
 |-- hooks/                  [LIFECYCLE] Terminal Statuslines & Pre-Execution Guards
 `-- docs/                   [DOCUMENTATION] Human Architecture Guides & Catalog
 ```
