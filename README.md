@@ -39,8 +39,9 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | **Upstream ECC Suite** | `collections/ecc-upstream/` | **293 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
 | **Scientific & Life Sciences** | `collections/scientific-skills/` | **117 skills** | Bioinformatics, genomics (`scanpy`, `biopython`), computational chemistry (`rdkit`, `diffdock`), and quantum computing (`qiskit`, `cirq`). |
 | **Academic Research Suite** | `collections/academic-research-skills/` | **5 modules** | End-to-end academic paper authoring pipeline, citation anti-hallucination verification, LaTeX/APA formatting, and simulated peer-review. |
-| **Enterprise Ops** | `collections/enterprise-ops/` | **45 skills** | Brand discovery, executive positioning, enterprise onboarding, and organizational workflow templates. |
+| **Enterprise Ops** | `collections/enterprise-ops/` | **39 skills** | Brand discovery, executive positioning, enterprise onboarding, and organizational workflow templates. |
 | **Media Production** | `collections/media-production/` | **9 skills** | Algorithmic video generation, Manim explainers, and media asset pipelines. |
+| **Reference Architectures** | `collections/reference-architectures/` | **28 systems** | Production RAG (Docling, LightRAG, Mem0, Graphiti, n8n) and web scraping pipelines (Crawl4AI v2, Ottomarkdown, PydanticAI) with distilled skill playbooks. |
 
 ---
 
