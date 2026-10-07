@@ -150,3 +150,8 @@ struct HotSegment {
 5. [ ] **Prune and batch algorithms before micro-tuning.**
 6. [ ] **Keep strings, provenance, and formatting off the success path.**
 7. [ ] **Measure and guard performance with gold end-to-end fixtures.**
+
+---
+
+## Detailed Reference Guide
+For the complete 460-line practical case study, architectural anti-patterns, and quantitative benchmarking analysis, refer to [references/cpp_guide_for_agents.md](references/cpp_guide_for_agents.md).
