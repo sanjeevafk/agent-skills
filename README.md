@@ -33,7 +33,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 
 | Suite / Collection | Location | Size | Primary Attributes & Scope |
 |---|---|---|---|
-| **Canonical Active Suite** | `canonical/` | **77 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), architecture (`archify`, `nextjs-15-expert`), and dynamic routing (`skill-router`). |
+| **Canonical Active Suite** | `canonical/` | **76 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), architecture (`archify`, `nextjs-15-expert`), and dynamic routing (`skill-router`). |
 | **Core Modular Catalog** | `skills/` | **515 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
 | **Cybersecurity Suite** | `collections/cybersecurity-skills/` | **818 skills** | Threat emulation, defensive posture, and compliance playbooks mapped to MITRE ATT&CK, NIST CSF 2.0, MITRE ATLAS, and D3FEND. |
 | **Upstream ECC Suite** | `collections/ecc-upstream/` | **293 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
