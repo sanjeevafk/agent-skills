@@ -45,6 +45,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | **Kaggle Suite** | `collections/kaggle-skills/` | **3 skills** | Official Kaggle hackathon judging workflows, standardized agent examinations, and benchmark authoring (`kbench`, `kaggle-benchmarks`). |
 | **Hugging Face Suite** | `collections/huggingface-skills/` | **25 skills** | Official Hugging Face Hub workflows, CLI/MCP tooling, datasets, spaces, evaluation, and model training (TRL, Sentence Transformers, SageMaker). |
 | **Impeccable Design Suite** | `collections/impeccable/` | **24 commands** | Comprehensive anti-slop frontend design system, 59 deterministic detector rules, UX critique/audit, and live browser rendering loop. |
+| **Open Code Review Suite** | `collections/open-code-review/` | **2 skills** | Alibaba's enterprise AI code review engine (`ocr`), diff-level review, full repo audits (`ocr scan`), and host-agent delegation mode. |
 
 ---
 
