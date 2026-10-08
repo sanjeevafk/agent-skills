@@ -5,6 +5,7 @@ A curated collection of programmatic video creation, animation, AI generation, a
 ## Included Skills
 
 - **remotion-video-creation**: React-based programmatic video rendering and animation.
+- **fframes-video**: GPU-accelerated Rust and SVG programmatic video creation, motion graphics, and sensory agent feedback.
 - **manim-video**: Python vector animations via 3Blue1Brown's Manim mathematical engine.
 - **fal-ai-media**: AI text-to-video, audio generation, and media synthesis via Fal.ai APIs.
 - **video-editing**: Automated FFmpeg video pipelines, subtitle burning, and clip composition.
