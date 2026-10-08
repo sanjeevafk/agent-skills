@@ -34,13 +34,13 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | Suite / Collection | Location | Size | Primary Attributes & Scope |
 |---|---|---|---|
 | **Canonical Active Suite** | `canonical/` | **76 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), and architecture (`archify`, `nextjs-15-expert`). |
-| **Core Modular Catalog** | `skills/` | **492 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
+| **Core Modular Catalog** | `skills/` | **493 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
 | **Cybersecurity Suite** | `collections/cybersecurity-skills/` | **818 skills** | Threat emulation, defensive posture, and compliance playbooks mapped to MITRE ATT&CK, NIST CSF 2.0, MITRE ATLAS, and D3FEND. |
 | **Upstream ECC Suite** | `collections/ecc-upstream/` | **293 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
 | **Scientific & Life Sciences** | `collections/scientific-skills/` | **117 skills** | Bioinformatics, genomics (`scanpy`, `biopython`), computational chemistry (`rdkit`, `diffdock`), and quantum computing (`qiskit`, `cirq`). |
 | **Academic Research Suite** | `collections/academic-research-skills/` | **5 modules** | End-to-end academic paper authoring pipeline, citation anti-hallucination verification, LaTeX/APA formatting, and simulated peer-review. |
 | **Enterprise Ops** | `collections/enterprise-ops/` | **39 skills** | Brand discovery, executive positioning, enterprise onboarding, and organizational workflow templates. |
-| **Media Production** | `collections/media-production/` | **9 skills** | Algorithmic video generation, Manim explainers, and media asset pipelines. |
+| **Media Production** | `collections/media-production/` | **10 skills** | Algorithmic video generation (Remotion, fframes, Manim), screen capture, and media asset pipelines. |
 | **Reference Architectures** | `collections/reference-architectures/` | **28 systems** | Production RAG (Docling, LightRAG, Mem0, Graphiti, n8n) and web scraping pipelines (Crawl4AI v2, Ottomarkdown, PydanticAI) with distilled skill playbooks. |
 | **Kaggle Suite** | `collections/kaggle-skills/` | **3 skills** | Official Kaggle hackathon judging workflows, standardized agent examinations, and benchmark authoring (`kbench`, `kaggle-benchmarks`). |
 | **Hugging Face Suite** | `collections/huggingface-skills/` | **25 skills** | Official Hugging Face Hub workflows, CLI/MCP tooling, datasets, spaces, evaluation, and model training (TRL, Sentence Transformers, SageMaker). |
