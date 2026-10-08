@@ -34,7 +34,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | Suite / Collection | Location | Size | Primary Attributes & Scope |
 |---|---|---|---|
 | **Canonical Active Suite** | `canonical/` | **76 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), and architecture (`archify`, `nextjs-15-expert`). |
-| **Core Modular Catalog** | `skills/` | **413 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
+| **Core Modular Catalog** | `skills/` | **492 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
 | **Cybersecurity Suite** | `collections/cybersecurity-skills/` | **818 skills** | Threat emulation, defensive posture, and compliance playbooks mapped to MITRE ATT&CK, NIST CSF 2.0, MITRE ATLAS, and D3FEND. |
 | **Upstream ECC Suite** | `collections/ecc-upstream/` | **293 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
 | **Scientific & Life Sciences** | `collections/scientific-skills/` | **117 skills** | Bioinformatics, genomics (`scanpy`, `biopython`), computational chemistry (`rdkit`, `diffdock`), and quantum computing (`qiskit`, `cirq`). |
@@ -47,6 +47,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | **Impeccable Design Suite** | `collections/impeccable/` | **24 commands** | Comprehensive anti-slop frontend design system, 59 deterministic detector rules, UX critique/audit, and live browser rendering loop. |
 | **Open Code Review Suite** | `collections/open-code-review/` | **2 skills** | Alibaba's enterprise AI code review engine (`ocr`), diff-level review, full repo audits (`ocr scan`), and host-agent delegation mode. |
 | **Financial Services Suite** | `collections/financial-services/` | **63 skills** | Anthropic's official financial agents and vertical plugins (private equity, investment banking, equity research, valuation, and fund admin). |
+| **Claude Agent Architectures** | `collections/claude-agent-architectures/` | **8 systems** | Distilled blueprints from `claude-cookbooks`: Chief of Staff, SRE incident responder, vulnerability detector, agent observability, specialist coordinator, production guardrails, outcome grading, and issue-to-PR pipeline. |
 
 ---
 
