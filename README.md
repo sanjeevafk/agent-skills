@@ -33,7 +33,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 
 | Suite / Collection | Location | Size | Primary Attributes & Scope |
 |---|---|---|---|
-| **Canonical Active Suite** | `canonical/` | **75 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), motion (`oil-motion`, `remotion`), research (`last30days`, `orx`), and architecture (`archify`, `nextjs-15-expert`). |
+| **Canonical Active Suite** | `canonical/` | **76 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), and architecture (`archify`, `nextjs-15-expert`). |
 | **Core Modular Catalog** | `skills/` | **413 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
 | **Cybersecurity Suite** | `collections/cybersecurity-skills/` | **818 skills** | Threat emulation, defensive posture, and compliance playbooks mapped to MITRE ATT&CK, NIST CSF 2.0, MITRE ATLAS, and D3FEND. |
 | **Upstream ECC Suite** | `collections/ecc-upstream/` | **293 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
@@ -44,6 +44,7 @@ To prevent context collapse and 20,000+ token prompt bloat while retaining deep 
 | **Reference Architectures** | `collections/reference-architectures/` | **28 systems** | Production RAG (Docling, LightRAG, Mem0, Graphiti, n8n) and web scraping pipelines (Crawl4AI v2, Ottomarkdown, PydanticAI) with distilled skill playbooks. |
 | **Kaggle Suite** | `collections/kaggle-skills/` | **3 skills** | Official Kaggle hackathon judging workflows, standardized agent examinations, and benchmark authoring (`kbench`, `kaggle-benchmarks`). |
 | **Hugging Face Suite** | `collections/huggingface-skills/` | **25 skills** | Official Hugging Face Hub workflows, CLI/MCP tooling, datasets, spaces, evaluation, and model training (TRL, Sentence Transformers, SageMaker). |
+| **Impeccable Design Suite** | `collections/impeccable/` | **24 commands** | Comprehensive anti-slop frontend design system, 59 deterministic detector rules, UX critique/audit, and live browser rendering loop. |
 
 ---
 
