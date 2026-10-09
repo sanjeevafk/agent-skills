@@ -613,7 +613,23 @@ def main():
     lines.append("")
     lines.append(f"To assess the **Construct Validity** of the IEEE 35-point scoring rubric and quantify LLM judge reliability, we executed concrete source code and unit test suites extracted directly from agent raw outputs across N = {len(calibration_records)} executable runs under a strict 15-second subprocess sandbox timeout.")
     lines.append("")
-    lines.append(f"Across the pooled heterogeneous benchmark, aggregate execution pass rate shows weak linear correlation with composite judge scores (**Pearson r = {pear_r:.3f}, p = {pear_p:.3f}**; **Spearman ρ = {spear_rho:.3f}, p = {spear_p:.3f}**). Crucially, subgroup decomposition reveals why: the cross-task aggregate is heavily confounded by ambient dependency requirements (e.g. uninstalled browser drivers or Redis daemons in isolated sandboxes). In self-contained tasks, syntax compilation aligns strongly with the judge's Correctness subscore (e.g. **`sec-django-hardening-ieee`**: **r = +0.616, p = 0.001**; **`arch-godclass-refactor-ieee`**: **r = +0.344, p = 0.108**).")
+    # Report the two largest *computed* syntax-vs-correctness correlations rather
+    # than hardcoding them. Previously this sentence carried literal values
+    # (r = +0.616 / +0.344) that did not update on re-run, so the claim could not
+    # track the data it described.
+    _syn_items = [
+        (name, v["r_syntax_correctness"], v["p_syntax_correctness"])
+        for name, v in task_subgroups.items()
+    ]
+    if _syn_items:
+        _top = sorted(_syn_items, key=lambda x: abs(x[1]), reverse=True)[:2]
+        _syn_clause = "; ".join(
+            f"**`{n}`**: **r = {r:+.3f}, p = {p:.3f}**" for n, r, p in _top
+        )
+    else:
+        _syn_clause = "no per-task subgroup with varying syntax status was observed"
+
+    lines.append(f"Across the pooled heterogeneous benchmark, aggregate execution pass rate shows weak linear correlation with composite judge scores (**Pearson r = {pear_r:.3f}, p = {pear_p:.3f}**; **Spearman ρ = {spear_rho:.3f}, p = {spear_p:.3f}**). Crucially, subgroup decomposition reveals why: the cross-task aggregate is heavily confounded by ambient dependency requirements (e.g. uninstalled browser drivers or Redis daemons in isolated sandboxes). Per-task subgroup correlations between syntax validity and the judge's Correctness subscore are reported in the table below; the two largest in magnitude are {_syn_clause}. These per-task values are computed at run time and are **not** persisted to a machine-readable artifact, so unlike the pooled figures they cannot be independently recomputed from this repository.")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -686,7 +702,7 @@ def main():
     lines.append("")
     lines.append("```markdown")
     lines.append("### Construct Validity & Execution Calibration")
-    lines.append(f"To assess whether the LLM judge evaluates functional engineering soundness rather than mere fluency, we executed a post-hoc execution calibration across N = {len(calibration_records)} executable task runs under a 15-second subprocess timeout. In the pooled heterogeneous sample, aggregate execution pass rate correlates weakly with composite scores (Pearson r = {pear_r:.3f}, p = {pear_p:.3f}; Spearman ρ = {spear_rho:.3f}, p = {spear_p:.3f}), driven by ambient dependency constraints in isolated sandboxes (e.g., Playwright or Redis). However, within self-contained environments, syntax compilation aligns strongly with the judge's Correctness subscore (e.g., sec-django-hardening: r = +0.616, p = 0.001; arch-godclass-refactor: r = +0.354, p = 0.090). Furthermore, residual outlier analysis reveals that the judge penalizes syntactically valid code when critical domain invariants (e.g., atomic replay handling) are violated, confirming that the multi-dimensional rubric measures architectural and security criteria beyond syntax.")
+    lines.append(f"To assess whether the LLM judge evaluates functional engineering soundness rather than mere fluency, we executed a post-hoc execution calibration across N = {len(calibration_records)} executable task runs under a 15-second subprocess timeout. In the pooled heterogeneous sample, aggregate execution pass rate correlates weakly with composite scores (Pearson r = {pear_r:.3f}, p = {pear_p:.3f}; Spearman ρ = {spear_rho:.3f}, p = {spear_p:.3f}), driven by ambient dependency constraints in isolated sandboxes (e.g., Playwright or Redis). Per-task subgroup correlations between syntax validity and the judge's Correctness subscore are computed at run time and listed in the table above; the two largest in magnitude are {_syn_clause}. Because these per-task records are not persisted to a machine-readable artifact, the pooled figures are the only construct-validity numbers reproducible from this repository. Residual outlier analysis reveals that the judge penalizes syntactically valid code when critical domain invariants (e.g., atomic replay handling) are violated, confirming that the multi-dimensional rubric measures architectural and security criteria beyond syntax.")
     lines.append("```")
     lines.append("")
 
