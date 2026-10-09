@@ -231,3 +231,91 @@ class TestAblationNoiseFloor:
             and r.get("condition") == "a2_no_examples"
         ]
         assert len(tdd) == 6, f"paper states tdd-A2 at n=6, archive holds {len(tdd)}"
+
+class TestJudgePositionBias:
+    """Audit in benchmarks/POSITION_BIAS_AUDIT.md — the manuscript does not report this.
+
+    The blind protocol permutes arms across labels A-E (§7.2). The judge has a
+    strong slot preference that exceeds every treatment effect, so these tests
+    pin both the magnitude of the bias and the fact that correcting for it
+    leaves the paper's conclusions intact.
+    """
+
+    @staticmethod
+    def _analysis():
+        import sys
+
+        sys.path.insert(0, str(REPO / "scripts"))
+        from analyze_position_bias import (  # noqa: PLC0415
+            correct,
+            load_rows,
+            position_effects,
+        )
+
+        rows = load_rows()
+        effects = position_effects(rows)
+        corrected = {}
+        for _, arm, pos, value in rows:
+            corrected.setdefault(arm, []).append(value - effects[pos])
+        return rows, effects, corrected
+
+    def test_judged_arm_instance_count(self):
+        rows, _, _ = self._analysis()
+        assert len(rows) == 396
+
+    def test_position_effects_are_large_and_monotone_in_slot(self):
+        _, effects, _ = self._analysis()
+        assert effects["A"] == pytest.approx(2.08, abs=0.01), (
+            "slot A is materially inflated; a judge change or re-run will shift this"
+        )
+        assert effects["D"] == pytest.approx(-1.58, abs=0.01)
+        # slot A penalty is 12x the paper's headline strategy effect
+        spread = effects["A"] - effects["D"]
+        assert spread > 0.21 * 10, "position spread dwarfs the treatment effect"
+
+    def test_position_effect_is_statistically_significant(self):
+        import statistics as st  # noqa: PLC0415
+
+        from scipy import stats  # noqa: PLC0415
+
+        rows, _, _ = self._analysis()
+        by_pos = {}
+        for _, _, pos, value in rows:
+            by_pos.setdefault(pos, []).append(value)
+        letters = sorted(by_pos)
+        _, p_anova = stats.f_oneway(*[by_pos[p] for p in letters])
+        assert p_anova < 0.01, (
+            f"position bias should be significant; got p={p_anova:.4f}"
+        )
+
+    def test_position_is_balanced_across_arms(self):
+        """Permutation worked: no arm systematically sits in a favoured slot."""
+        from collections import Counter  # noqa: PLC0415
+
+        rows, _, _ = self._analysis()
+        cross = Counter((arm, pos) for _, arm, pos, _ in rows)
+        cells = [v for v in cross.values()]
+        assert min(cells) >= 5, f"a slot-starved arm cell implies confounding: {cross}"
+
+    def test_correction_preserves_the_headline_null(self):
+        """Finding 1 must survive position correction."""
+        rows, _, corrected = self._analysis()
+        gap = (
+            sum(corrected["full"]) / len(corrected["full"])
+            - sum(corrected["checklist_v2"]) / len(corrected["checklist_v2"])
+        )
+        assert abs(gap) < 0.21, (
+            f"corrected full-v2 gap widened to {gap:+.3f}; paper reports 0.21"
+        )
+
+    def test_no_arm_significantly_beats_control_after_correction(self):
+        """The economics-first premise in §8.6.A."""
+        import statistics as st  # noqa: PLC0415
+
+        from scipy import stats  # noqa: PLC0415
+
+        _, _, corrected = self._analysis()
+        base = corrected["control"]
+        for arm in ("full", "retrieved", "checklist", "checklist_v2"):
+            _, p = stats.ttest_ind(corrected[arm], base, equal_var=False)
+            assert p > 0.05, f"{arm} significantly beats control after correction (p={p:.3f})"
