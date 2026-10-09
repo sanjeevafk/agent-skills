@@ -1,6 +1,6 @@
 ---
 name: pattern-reasoning-engines
-description: Structure agent problem solving with explicit reasoning paradigms: Chain-of-Thought (CoT), Tree of Thoughts (ToT), and self-verifying code execution.
+description: "Structure agent problem solving with explicit reasoning paradigms: Chain-of-Thought (CoT), Tree of Thoughts (ToT), and self-verifying code execution."
 metadata:
   category: agent-architecture
   tier: enterprise

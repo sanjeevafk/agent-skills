@@ -1,0 +1,466 @@
+I'll design a production-grade zero-downtime migration with proper trigger-based delta tracking, partition management, and safe cutover.
+
+## Zero-Downtime Declarative Partitioning: `audit_logs` (500M Rows)
+
+---
+
+### 1. Pre-Migration Analysis & Prerequisites
+
+```sql
+-- Verify partitioning metadata extension availability
+SELECT * FROM pg_extension WHERE extname = 'pg_partman';
+
+-- Check current stats for sizing estimates
+SELECT
+    pg_size_pretty(pg_relation_size('audit_logs'))          AS total_size,
+    pg_size_pretty(pg_total_relation_size('audit_logs'))   AS with_indexes,
+    COUNT(*)                                               AS row_count,
+    MIN(created_at)                                        AS oldest,
+    MAX(created_at)                                        AS newest,
+    COUNT(DISTINCT DATE_TRUNC('month', created_at))        AS distinct_months
+FROM audit_logs;
+```
+
+### 2. Create the Partitioned Table
+
+```sql
+BEGIN;
+
+CREATE TABLE audit_logs_partitioned (
+    id              BIGINT       NOT NULL DEFAULT nextval('audit_logs_id_seq'),
+    -- PARTITION KEY MUST be first (enforcement by PG)
+    created_at      TIMESTAMPTZ  NOT NULL,
+
+    entity_type     VARCHAR(64)  NOT NULL,
+    entity_id       BIGINT       NOT NULL,
+    action          VARCHAR(32)  NOT NULL,
+    details         JSONB        DEFAULT '{}',
+    performed_by    BIGINT       REFERENCES users(id),
+    ip_address      INET,
+    user_agent      TEXT,
+
+    CONSTRAINT audit_logs_pkey PRIMARY KEY (id, created_at),
+    -- UNIQUE constraints require partition key
+    CONSTRAINT uq_entity_action
+        UNIQUE (entity_type, entity_id, action, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Composite index covering the common query pattern
+-- (action, performed_by, created_at DESC)
+CREATE INDEX idx_audit_logs_query
+    ON audit_logs_partitioned (entity_type, performed_by, created_at DESC)
+    INCLUDE (details, ip_address);
+
+-- Partial index for performance hot-spot: recent logs only
+CREATE INDEX idx_audit_logs_recent
+    ON audit_logs_partitioned (created_at DESC)
+    WHERE created_at > NOW() - INTERVAL '90 days'
+    INCLUDE (entity_type, action, details);
+
+-- Status/action lookup (typical filtering column)
+CREATE INDEX idx_audit_logs_action_status
+    ON audit_logs_partitioned (action, created_at DESC);
+
+COMMIT;
+```
+
+**Key decisions:**
+- `PRIMARY KEY (id, created_at)` — composite PK required for partitioned tables
+- `UNIQUE` constraints include `created_at` (partition key) — mandatory in PG
+- Partial index on last 90 days keeps the most-used index ~10% of total size
+
+### 3. Trigger-Based Delta Tracking (Concurrent Writes During Migration)
+
+```sql
+-- Drop old triggers if re-running
+DROP TRIGGER IF EXISTS trg_audit_logs_insert ON audit_logs;
+DROP TRIGGER IF EXISTS trg_audit_logs_update ON audit_logs;
+DROP TRIGGER IF EXISTS trg_audit_logs_delete ON audit_logs;
+
+CREATE OR REPLACE FUNCTION f_audit_logs_trigger()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_rec record;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Delete in partitioned table matches via PK + partition key
+        DELETE FROM audit_logs_partitioned
+        WHERE id = OLD.id AND created_at = OLD.created_at;
+        RETURN OLD;
+
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Must delete old partition row and insert new one
+        -- If the UPDATE changed created_at, it moves to a different partition
+        DELETE FROM audit_logs_partitioned
+        WHERE id = OLD.id AND created_at = OLD.created_at;
+
+        SELECT INTO v_rec * FROM NEW;
+        INSERT INTO audit_logs_partitioned (
+            id, created_at, entity_type, entity_id, action,
+            details, performed_by, ip_address, user_agent
+        ) VALUES (
+            v_rec.id, v_rec.created_at, v_rec.entity_type,
+            v_rec.entity_id, v_rec.action, v_rec.details,
+            v_rec.performed_by, v_rec.ip_address, v_rec.user_agent
+        );
+        RETURN NEW;
+
+    ELSIF TG_OP = 'INSERT' THEN
+        INSERT INTO audit_logs_partitioned (
+            id, created_at, entity_type, entity_id, action,
+            details, performed_by, ip_address, user_agent
+        ) VALUES (
+            NEW.id, NEW.created_at, NEW.entity_type,
+            NEW.entity_id, NEW.action, NEW.details,
+            NEW.performed_by, NEW.ip_address, NEW.user_agent
+        );
+        RETURN NEW;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_logs_insert
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION f_audit_logs_trigger();
+
+CREATE TRIGGER trg_audit_logs_update
+    AFTER UPDATE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION f_audit_logs_trigger();
+
+CREATE TRIGGER trg_audit_logs_delete
+    AFTER DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION f_audit_logs_trigger();
+```
+
+### 4. Backfill Script (Manageable Batches)
+
+```sql
+-- ============================================================
+-- BACKFILL WITH BATCHED APPORTIONING AND LOCK TIMEOUT PROTECTION
+-- Estimated duration: 2-4 hours depending on hardware
+-- ============================================================
+
+DO $$
+DECLARE
+    v_batch_size    CONSTANT BIGINT := 10000;
+    v_processed     BIGINT := 0;
+    v_total         BIGINT;
+    v_month_start   DATE;
+    v_month_end     DATE;
+    v_part_name     TEXT;
+    v_batch_num     BIGINT := 0;
+    v_last_report   BIGINT := 0;
+    v_loop_count    INT := 0;
+    v_max_loops     CONSTANT INT := 10000;  -- safety guard
+BEGIN
+    -- Safety: bail out early if something is catastrophically wrong
+    PERFORM set_config('lock_timeout', '5s', true);
+    PERFORM set_config('statement_timeout', '300s', true);
+
+    SELECT COUNT(*) INTO v_total FROM audit_logs;
+
+    RAISE NOTICE 'Starting backfill: % rows to migrate', v_total;
+
+    <<outer_loop>>
+    LOOP
+        EXIT WHEN v_processed >= v_total OR v_loop_count >= v_max_loops;
+
+        -- Fetch a batch with explicit ordering
+        INSERT INTO audit_logs_partitioned (
+            id, created_at, entity_type, entity_id, action,
+            details, performed_by, ip_address, user_agent
+        )
+        SELECT id, created_at, entity_type, entity_id, action,
+               details, performed_by, ip_address, user_agent
+        FROM audit_logs
+        WHERE id > (
+            SELECT COALESCE(MAX(id), 0) FROM audit_logs_partitioned
+        )
+        ORDER BY id
+        LIMIT v_batch_size;
+
+        -- Report progress
+        v_processed := v_processed + v_batch_size;
+        v_loop_count := v_loop_count + 1;
+
+        IF mod(v_loop_count, 100) = 0 THEN
+            RAISE NOTICE 'Processed % / % (%.1f%%)',
+                v_processed, v_total,
+                (v_processed::FLOAT / v_total) * 100;
+        END IF;
+
+        -- Brief yield to avoid starvation under heavy load
+        PERFORM pg_sleep(0.01);
+    END LOOP outer_loop;
+
+    RAISE NOTICE 'Backfill complete: % rows processed in % loops',
+        v_processed, v_loop_count;
+END $$;
+```
+
+**Sync residual deltas post-batch (catches writes during backfill):**
+
+```sql
+-- Insert-or-update mode: catches rows inserted/updated during backfill
+INSERT INTO audit_logs_partitioned (
+    id, created_at, entity_type, entity_id, action,
+    details, performed_by, ip_address, user_agent
+)
+SELECT o.id, o.created_at, o.entity_type, o.entity_id, o.action,
+       o.details, o.performed_by, o.ip_address, o.user_agent
+FROM audit_logs o
+INNER JOIN audit_logs_partitioned n
+    USING (id, created_at)
+WHERE true  -- placeholder for update logic; below uses upsert
+ON CONFLICT (id, created_at)
+DO UPDATE SET
+    entity_type       = EXCLUDED.entity_type,
+    entity_id         = EXCLUDED.entity_id,
+    action            = EXCLUDED.action,
+    details           = EXCLUDED.details,
+    performed_by      = EXCLUDED.performed_by,
+    ip_address        = EXCLUDED.ip_address,
+    user_agent        = EXCLUDED.user_agent;
+
+-- Delete rows no longer present (orphan cleanup)
+DELETE FROM audit_logs_partitioned p
+USING audit_logs o
+WHERE p.id = o.id
+  AND p.created_at = o.created_at;
+```
+
+### 5. Cutover Procedure
+
+```sql
+-- ============================================================
+-- ZERO-DOWNTIME CUTOVER
+-- Run during low-traffic window, but technically instant
+-- ============================================================
+
+BEGIN;
+
+-- Step 1: Pause accepting new writes to old table
+ALTER TABLE audit_logs DISABLE TRIGGER ALL;
+
+-- Step 2: Final delta sync (catches last few seconds of writes)
+-- Uses upsert + delete patterns above (already shown)
+-- Re-run the delta sync block here
+
+-- Step 3: Rename old table
+ALTER TABLE audit_logs RENAME TO audit_logs_old;
+
+-- Step 4: Promote partitioned table
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+-- Step 5: Restore sequence alignment
+-- Find the max ID in the new table
+WITH max_id AS (
+    SELECT COALESCE(MAX(id), 0) AS m FROM audit_logs
+)
+SELECT setval('audit_logs_id_seq', (SELECT m FROM max_id) + 1, false);
+
+-- Step 6: Re-create dependent objects that reference audit_logs
+-- Foreign keys pointing to audit_logs(id) will fail because
+-- the PK is now composite (id, created_at). Handle per case:
+
+-- Option A: Update FK references to use partition key
+-- ALTER TABLE audit_events
+--     DROP CONSTRAINT fk_audit_event_log,
+--     ADD CONSTRAINT fk_audit_event_log
+--         FOREIGN KEY (log_id, log_created_at)
+--         REFERENCES audit_logs(id, created_at);
+
+-- Option B: Keep audit_logs as-is and create a view for compatibility
+-- This is preferred if downstream FKs are numerous and fragile
+
+COMMIT;
+```
+
+### 6. Post-Cutover Cleanup (Deferred)
+
+```sql
+-- Wait 24-48 hours post-cutover before dropping old table
+
+-- Verify row counts match
+DO $$
+DECLARE
+    v_old  BIGINT;
+    v_new  BIGINT;
+BEGIN
+    SELECT COUNT(*) INTO v_old FROM audit_logs_old;
+    SELECT COUNT(*) INTO v_new FROM audit_logs;
+
+    IF v_old != v_new THEN
+        RAISE EXCEPTION 'Row count mismatch! Old: %, New: %', v_old, v_new;
+    END IF;
+
+    RAISE NOTICE 'Verification passed: % rows in both tables', v_new;
+END $$;
+
+-- After confidence period
+DROP SCHEMA IF EXISTS public.audit_logs_backup CASCADE;
+ALTER TABLE audit_logs_old RENAME TO audit_logs_backup;
+-- KEEP audit_logs_backup for at least 30 days
+-- Then: DROP TABLE audit_logs_backup;
+```
+
+### 7. Partition Pruning Verification
+
+```sql
+-- Enable debugging for manual inspection
+SET enable_partition_pruning = on;
+
+-- Explain plan: should show "Partitions selected: 1" for point queries
+EXPLAIN (COSTS OFF, ANALYZE, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE created_at >= '2025-01-01' AND created_at < '2025-02-01';
+
+-- Expected output snippet:
+-- Append  (actual rows=...)
+--   ->  Seq Scan on audit_logs_2025_01  (actual rows=..., filtered=0)
+-- Planning Time: ...
+-- Execution Time: ...
+-- Note: Only ONE partition scanned
+
+-- Multi-month query
+EXPLAIN (COSTS OFF, ANALYZE)
+SELECT * FROM audit_logs
+WHERE created_at >= '2025-01-01' AND created_at < '2025-04-01';
+-- Should show 3 partitions scanned
+
+-- Verify pruning is disabled vs enabled
+SET enable_partition_pruning = off;
+EXPLAIN (COSTS OFF, ANALYZE)
+SELECT * FROM audit_logs
+WHERE created_at = '2025-06-15 12:00:00';
+-- Should scan ALL partitions (diagnostic comparison)
+
+SET enable_partition_pruning = on;
+```
+
+### 8. Future Partition Management with pg_partman
+
+```sql
+-- Install pg_partman if not present
+CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA partman;
+
+-- Configure automatic partition creation
+SELECT partman.create_parent(
+    p_parent_table   := 'public.audit_logs',
+    p_control        := 'created_at',
+    p_type           := 'range',
+    p_interval       := '1 month',
+    p_premake        := 3,           -- pre-create next 3 months
+    p_inherit        := true,        -- inherit policies, indexes, constraints
+    p_start_partition := DATE_TRUNC('month', NOW())  -- start from current month
+);
+
+-- Verify configured partitions
+SELECT parent_table, partition_prefix, partition_interval,
+       parent_sequence, infinite_time_partition
+FROM partman.part_config
+WHERE parent_table = 'public.audit_logs';
+
+-- List all partitions managed by partman
+SELECT * FROM partman.show_partitions('public.audit_logs');
+
+-- Manually run the partitioner (also configurable as scheduled job)
+SELECT partman.run_maintenance();
+
+-- Set up auto-maintenance via cron (recommended: every 6 hours)
+-- */6 * * * * psql -d yourdb -c "SELECT partman.run_maintenance();"
+
+-- Optional: automate retention policy (drop partitions older than 2 years)
+-- Requires partman > 4.5.0
+UPDATE partman.part_config
+SET retention = '2 years',
+    retention_keep_table = false
+WHERE parent_table = 'public.audit_logs';
+
+-- Schedule automated maintenance via pg_cron (if installed)
+-- CREATE EXTENSION pg_cron;
+-- SELECT cron.schedule('partman-audit_logs', '0 */6 * * *',
+--     'SELECT partman.run_maintenance()');
+```
+
+### 9. Index Recreation on Existing Data (Fastest Path)
+
+```sql
+-- Instead of relying solely on pg_partman inheritance,
+-- rebuild large indexes in parallel (PostgreSQL 12+)
+-- Use separate connections per index to maximize throughput
+
+-- In shell (or run sequentially):
+-- \conninfo  # note your DB name and port
+
+REINDEX TABLE CONCURRENTLY audit_logs_2025_01_idx_audit_logs_query;
+REINDEX TABLE CONCURRENTLY audit_logs_2025_02_idx_audit_logs_query;
+-- Repeat for all historical partitions...
+```
+
+### 10. Monitoring Queries
+
+```sql
+-- Track migration progress
+SELECT
+    schemaname,
+    relname AS table_name,
+    n_live_tup AS estimated_rows,
+    seq_scan,
+    idx_scan
+FROM pg_stat_user_tables
+WHERE relname IN ('audit_logs', 'audit_logs_old')
+ORDER BY relname;
+
+-- Check partition sizes
+SELECT
+    child.relname    AS partition,
+    pg_size_pretty(pg_relation_size(child.oid)) AS size,
+    child.reltuples  AS estimated_rows
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
+WHERE parent.relname = 'audit_logs'
+ORDER BY child.relname;
+
+-- Monitor trigger overhead on old table during migration
+SELECT
+    schemaname, relname,
+    n_tup_ins, n_tup_upd, n_tup_del
+FROM pg_stat_user_tables
+WHERE relname = 'audit_logs_old'
+  AND schemaname = 'public';
+```
+
+---
+
+### Rollback Plan
+
+If anything fails mid-migration:
+
+```sql
+-- Emergency rollback
+BEGIN;
+ALTER TABLE audit_logs RENAME TO audit_logs_partitioned_fail;
+ALTER TABLE audit_logs_old RENAME TO audit_logs;
+-- Triggers on audit_logs_old still fire — no data loss
+SELECT setval('audit_logs_id_seq', ...);  -- restore sequence
+COMMIT;
+
+-- Clean up failed attempt
+DROP TABLE audit_logs_partitioned_fail CASCADE;
+```
+
+### Summary of Key Guarantees
+
+| Concern | Approach |
+|---|---|
+| **Zero downtime** | Triggers mirror writes; atomic rename for cutover |
+| **Lock minimization** | Lock timeout 5s, batch size 10K, `SKIP LOCKED` equivalent via sequential ID walk |
+| **Foreign key safety** | Composite PK change documented — update FKs to `(id, created_at)` or use compatible view |
+| **Automatic partitions** | `pg_partman` premakes 3 months ahead |
+| **Retention** | Configured for 2-year rolling window |
+| **Pruning verified** | `EXPLAIN (ANALYZE)` confirms single-partition scans |
+| **Sequence aligned** | `setval()` post-cutover prevents ID collision |
+| **Rollback path** | Renames only — no data copied, fully reversible until drop |

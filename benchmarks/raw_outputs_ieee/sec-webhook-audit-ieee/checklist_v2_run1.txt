@@ -1,0 +1,233 @@
+[exit=0 latency=30.80s]
+**Verifying signatures after JSON parsing and using in-memory replay tracking leaves your payment pipeline vulnerable to unauthenticated DoS attacks, cluster-wide double-processing, and timing side-channels.**
+
+---
+
+### Vulnerability Analysis (Ranked by Severity)
+
+**1 → Critical: In-memory replay storage fails across workers, restarts, and concurrent requests.** A Python `dict` is local to a single process; multiple Uvicorn workers or multi-instance deployments cannot share state. A server restart wipes the ledger entirely, and simultaneous identical requests cause a check-then-act race condition that executes duplicate payouts or double-credits customer balances.
+
+**2 → High: JSON deserialization before signature verification exposes the server to DoS and parser exploits.** Parsing untrusted payloads with Pydantic or `request.json()` consumes CPU and memory before proving authenticity. Attackers can flood the endpoint with deeply nested JSON bombs or malformed payloads that crash the parser before authentication ever runs.
+
+**3 → High: Lack of rotating secret support causes payment dropouts during credential rollover.** Third-party processors rotate secrets by providing both the old and new secrets during a grace window. Enforcing a single static key forces downtime or dropped webhook deliveries during key rotations.
+
+**4 → Medium: Non-constant-time signature comparison leaks HMAC digests via timing attacks.** Using standard `==` string equality terminates comparison on the first mismatched byte, allowing attackers to incrementally deduce valid signatures through microsecond-level response time measurements.
+
+**5 → Medium: Missing timestamp verification permits replay attacks after cache eviction.** If the event ledger relies solely on an event ID with a time-to-live expiration, an attacker can re-send intercepted valid webhooks after the cache entry expires.
+
+**6 → Low: Uncaught internal exceptions leak stack traces and processor internals.** Bubbling raw exceptions up to the HTTP response exposes infrastructure topology, database schema details, and third-party error structures to unauthorized clients.
+
+---
+
+### Corrected Production Implementation
+
+```python
+import hashlib
+import hmac
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+import redis.asyncio as redis
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field, ValidationError
+
+# Configure structured logging without sensitive data
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("webhook_processor")
+
+app = FastAPI(title="Secure Payment Webhook Handler")
+
+# -----------------------------------------------------------------------------
+# Configuration & Environment Validation
+# -----------------------------------------------------------------------------
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+PRIMARY_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_PRIMARY")
+FALLBACK_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_FALLBACK")  # Used during rotation
+
+if not PRIMARY_WEBHOOK_SECRET:
+    raise RuntimeError("CRITICAL: WEBHOOK_SECRET_PRIMARY environment variable is not configured.")
+
+ACTIVE_SECRETS: List[str] = [PRIMARY_WEBHOOK_SECRET]
+if FALLBACK_WEBHOOK_SECRET:
+    ACTIVE_SECRETS.append(FALLBACK_WEBHOOK_SECRET)
+
+# -----------------------------------------------------------------------------
+# Schema Definitions
+# -----------------------------------------------------------------------------
+class PaymentData(BaseModel):
+    transaction_id: str = Field(..., min_length=1, max_length=128)
+    amount_cents: int = Field(..., gt=0)
+    currency: str = Field(..., min_length=3, max_length=3)
+    customer_id: str = Field(..., min_length=1, max_length=128)
+
+class WebhookPayload(BaseModel):
+    event_id: str = Field(..., min_length=1, max_length=128)
+    event_type: str = Field(..., min_length=1, max_length=64)
+    timestamp: int = Field(..., gt=0)
+    data: PaymentData
+
+# -----------------------------------------------------------------------------
+# Redis Client for Distributed Locking & Replay Ledger
+# -----------------------------------------------------------------------------
+redis_client: Optional[redis.Redis] = None
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global redis_client
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if redis_client:
+        await redis_client.aclose()
+
+# -----------------------------------------------------------------------------
+# Security Helpers
+# -----------------------------------------------------------------------------
+def verify_hmac_signature(
+    raw_body: bytes,
+    signature_header: Optional[str],
+    secrets: List[str],
+    tolerance_seconds: int = 300
+) -> bool:
+    """
+    Validates HMAC signature and timestamp tolerance in constant time.
+    Expected header format: t=<timestamp>,v1=<hex_signature>
+    """
+    if not signature_header:
+        return False
+
+    header_parts: Dict[str, str] = {}
+    for item in signature_header.split(","):
+        if "=" in item:
+            k, v = item.strip().split("=", 1)
+            header_parts[k] = v
+
+    timestamp_str = header_parts.get("t")
+    received_signature = header_parts.get("v1")
+
+    if not timestamp_str or not received_signature:
+        return False
+
+    # Prevent replay attacks by checking timestamp drift (5 minutes default)
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError:
+        return False
+
+    current_time = int(time.time())
+    if abs(current_time - timestamp) > tolerance_seconds:
+        logger.warning("Webhook timestamp rejected: drift exceeds tolerance window.")
+        return False
+
+    # Compute expected signature over: timestamp.raw_body
+    signed_payload = f"{timestamp}.".encode("utf-8") + raw_body
+
+    # Support zero-downtime secret rotation by testing active secrets
+    for secret in secrets:
+        expected_signature = hmac.new(
+            key=secret.encode("utf-8"),
+            msg=signed_payload,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison prevents timing attacks
+        if hmac.compare_digest(expected_signature, received_signature):
+            return True
+
+    return False
+
+# -----------------------------------------------------------------------------
+# Core Webhook Endpoint
+# -----------------------------------------------------------------------------
+@app.post("/api/v1/webhooks/payment", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_signature: Optional[str] = Header(None, alias="X-Signature")
+) -> Response:
+    # 1. Read raw body before parsing to protect parser and generate accurate HMAC
+    try:
+        raw_body = await request.body()
+    except Exception:
+        logger.error("Failed to read raw request body.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Bad request")
+
+    # 2. Authenticate signature BEFORE parsing or allocating JSON resources
+    if not verify_hmac_signature(raw_body, x_signature, ACTIVE_SECRETS):
+        logger.warning("Unauthorized webhook delivery: invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature"
+        )
+
+    # 3. Parse and validate JSON structure against strict Pydantic schema
+    try:
+        payload = WebhookPayload.model_validate_json(raw_body)
+    except ValidationError:
+        logger.warning("Webhook payload schema validation failed.")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid payload")
+
+    # 4. Distributed atomic ledger check using Redis (SET NX EX)
+    # Prevents duplicate processing and race conditions across multiple instances
+    ledger_key = f"webhook:ledger:{payload.event_id}"
+    lock_ttl_seconds = 86400  # 24-hour replay protection window
+
+    if not redis_client:
+        logger.error("Redis client unavailable for idempotency validation.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Processing error")
+
+    # Atomically acquire lock / mark event as 'processing'
+    is_new_event = await redis_client.set(ledger_key, "processing", nx=True, ex=lock_ttl_seconds)
+
+    if not is_new_event:
+        current_status = await redis_client.get(ledger_key)
+        if current_status == "completed":
+            logger.info("Duplicate webhook received; already processed: %s", payload.event_id)
+            return Response(content='{"status":"already_processed"}', media_type="application/json")
+        
+        # Another worker is actively handling this event
+        logger.info("Concurrent webhook duplicate detected; currently in progress: %s", payload.event_id)
+        return Response(content='{"status":"in_progress"}', status_code=status.HTTP_202_ACCEPTED, media_type="application/json")
+
+    # 5. Process business logic with safe error isolation
+    try:
+        logger.info("Processing webhook event: %s, type: %s", payload.event_id, payload.event_type)
+
+        # Execute business logic (e.g., fulfill orders, update balances)
+        await execute_payment_fulfillment(payload)
+
+        # Mark event as successfully completed in ledger
+        await redis_client.set(ledger_key, "completed", ex=lock_ttl_seconds)
+
+        return Response(content='{"status":"success"}', media_type="application/json")
+
+    except Exception:
+        # Release lock so processor retries can re-attempt delivery
+        await redis_client.delete(ledger_key)
+        
+        # Redact stack trace and internal database errors from HTTP response
+        logger.exception("Internal error processing webhook event: %s", payload.event_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal processing error"
+        )
+
+async def execute_payment_fulfillment(payload: WebhookPayload) -> None:
+    """Isolated business logic placeholder."""
+    pass
+```
+
+---
+
+### Key Architectural Fixes Applied
+
+**→ Atomic distributed state ledger.** Replaced the in-memory dictionary with Redis `SET key status NX EX 86400`, resolving both cross-worker memory isolation and concurrent TOCTOU race conditions.
+
+**→ Raw body signature verification.** `await request.body()` runs before JSON parsing, rejecting forged or malicious payloads before computing expensive deserialization logic.
+
+**→ Rotating secret loop.** Supports simultaneous active and grace keys with constant-time `hmac.compare_digest()` to eliminate timing side-channels and prevent downtime during key rollovers.
+
+**→ Enforced timestamp tolerance.** Webhook timestamp headers are bounded to a 300-second window, preventing replayed valid requests even after the cache expires.
+
+**→ Sanitized error boundaries.** Internal exceptions, database connection details, and processor stack traces are logged locally with identifiers only, returning generic JSON errors to the client.

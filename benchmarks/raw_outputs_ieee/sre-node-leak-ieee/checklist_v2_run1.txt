@@ -1,0 +1,380 @@
+[exit=0 latency=33.19s]
+# Node.js RSS Memory Leak — Production Diagnosis Plan
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### Enable Signal-Based Snapshotting (Pre-Mortem)
+
+Ensure your startup command includes:
+
+```bash
+node --heapsnapshot-signal=SIGUSR1 --max-old-space-size=3500 ./dist/index.js
+```
+
+This lets Ops trigger a heap dump without restarting:
+
+```bash
+# Find the PID
+PID=$(pgrep -f "node.*index.js")
+
+# Trigger snapshot — written to CWD, auto-named
+kill -SIGUSR1 $PID
+# Output: <pid>-<timestamp>.heapsnapshot
+
+# Repeat 6h apart for diff-ready pairs
+```
+
+### Container-Safe Patterns
+
+Mount a separate ephemeral volume so snapshots don't compete for the same disk pressure causing OOM:
+
+```yaml
+# k8s snippet
+volumes:
+  - name: snap-vol
+    emptyDir: { medium: Memory, sizeLimit: 1Gi }
+volumeMounts:
+  - name: snap-vol
+    mountPath: /tmp/heapsnapshots
+env:
+  - name: NODE_EXTRA_ARGS
+    value: "--heapsnapshot-signal=SIGUSR1"
+```
+
+Capture command adapted for k8s:
+
+```bash
+kubectl exec <pod> -- bash -c '
+  PID=$(pgrep -f "node.*index")
+  SNAP="/tmp/heapsnapshots/dump_$(date +%s)_$PID.heapsnapshot"
+  kill -SIGUSR1 $PID && sleep 2 && ls -lh "$SNAP"* || echo "no snapshot yet"
+'
+```
+
+### What You Need Per Analysis Cycle
+
+| Item | Purpose |
+|------|---------|
+| T₀ snapshot | Baseline (~300MB RSS) |
+| T₁ snapshot | Mid-growth (~2GB RSS) |
+| T₂ snapshot | Pre-OOM (>3.5GB RSS) |
+
+Load **all three** into Chrome DevTools simultaneously. Use the *Comparison* view (three-way diff) to isolate objects present only at T₂.
+
+---
+
+## Phase 2: Identifying Retainer Chains
+
+### Step A — Open in Chrome DevTools Memory Tab
+
+1. Load T₀, T₁, T₂ snapshots (File → Load)
+2. Switch to **Comparison** mode: Select all three → Compare T₀ vs T₂
+3. Filter constructor to `Closure` and `Native` → filter text `Buffer`
+
+### Step B — Trace a Single Closure Back to Root
+
+Pick the largest closure group by "Shallow Size":
+
+```
+Click closure entry → Right panel shows:
+  ┌─ Retainers
+  │  ├─ Array [events] ← event-emitter internal _events array
+  │  │   └─ EventEmitter instance (your registry)
+  │  │       └─ Global reference (module singleton? class static?)
+  │  └─ WeakMap ← possible metadata cache keyed by request ID
+  │      └─ Request object (held alive longer than request lifecycle)
+  │          └─ Huge String (request body ~2MB captured in closure)
+  └─ Closure Details
+      └─ Scope vars: req, res, body, logger, requestId
+          body: 2097152 bytes  ← THIS is the leak
+```
+
+**Reading the chain:** Follow arrows from the leaf (your closure) upward. The moment you see a `Global`, `Module.exports`, `Process global`, or `EventEmitter._events[]` node, you've found the retention root. That root must stop holding a reference.
+
+### Step C — Do the Same for Buffers
+
+Filter to `Buffer`. Group by retainers. Look for patterns:
+
+```
+Buffer #47291 (Shallow: 4MB, Retained: 4MB)
+  ┌─ Retainers
+  │  ├─ Object { logs }         ← array in a module-scoped variable
+  │  │   └─ Module exports       ← this array never clears
+  │  └─ TypedArray backing store ← actual heap allocation
+```
+
+The retainer chain tells you *who* holds the buffer. It's almost always:
+- An unbounded array pushed to (response bodies cached for logging)
+- A Map/Set keyed by something that never gets deleted
+- A closure variable referencing a Buffer that outlives the request
+
+---
+
+## Phase 3: Confirming Emitter Registry Leak
+
+### Heuristic Check — Count Listeners at Runtime
+
+Add this to your startup (non-invasive):
+
+```js
+const EventEmitter = require('events');
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.on = function (...args) {
+  const count = this.listenerCount();
+  if (count > 100) {
+    console.warn(`[LEAK-WARN] ${this.constructor.name}#${this.id || ''} has ${count} listeners`,
+      new Error().stack);
+  }
+  return origOn.apply(this, args);
+};
+```
+
+If you see stacks climbing past ~100 listeners consistently, the registry is leaking.
+
+### Code-Level Confirmation — Scan for These Patterns
+
+```bash
+# Pattern 1: EventEmitter instantiated per-request (creates N emitters)
+grep -rn 'new EventEmitter()' src/ --include='*.js' --include='*.ts'
+
+# Pattern 2: Listener added but never removed (anonymous function as handler)
+grep -rn '\.on\(.*=>' src/ --include='*.js' --include='*.ts' | head -50
+
+# Pattern 3: EventEmitter stored in long-lived container without cleanup
+grep -rn 'EventEmitter\|eventemitter' src/ --include='*.js' --include='*.ts'
+```
+
+### Automated Detection During Run
+
+```js
+// Add to a diagnostic endpoint: GET /debug/events
+app.get('/debug/events', (_req, res) => {
+  const counts = [];
+  for (const mod of Object.values(require.cache)) {
+    for (const key of Object.keys(mod.exports || {})) {
+      const val = mod.exports[key];
+      if (val instanceof EventEmitter) {
+        counts.push({
+          module: mod.filename,
+          key,
+          listeners: val.listenerCount(),
+          names: val.eventNames()
+        });
+      }
+    }
+  }
+  counts.sort((a, b) => b.listeners - a.listeners);
+  res.json(counts.filter(c => c.listeners > 10));
+});
+```
+
+Hit this endpoint at different RSS levels. If a single EventEmitter's listener count grows linearly with requests, that's your leak.
+
+---
+
+## Phase 4: Likely Root Causes & Fixes
+
+### Cause 1 — Event Emitter Listener Accumulation (Most Common)
+
+**Pattern:** Anonymous listeners registered per request/event, never removed.
+
+```js
+// ❌ LEAKS — anonymous function, cannot be removed
+dataStream.on('chunk', async (chunk) => {
+  await process(chunk);        // captures `this`, `res`, request context
+  logResponse(chunk);
+});
+
+// ✅ FIXED — named reference, removable
+function handleChunk(chunk) {
+  process(chunk);
+  logResponse(chunk);
+}
+dataStream.on('chunk', handleChunk);
+
+// On teardown:
+server.on('close', () => {
+  dataStream.removeAllListeners('chunk');
+  dataStream.destroy();
+});
+```
+
+**Another variant — EventEmitter per connection/session:**
+
+```js
+class SessionManager {
+  constructor() {
+    this.emitters = new Map();  // N entries, never cleaned
+  }
+  
+  createSession(id) {
+    const ee = new EventEmitter();
+    ee.on('message', msg => { /* captures session state */ });
+    this.emitters.set(id, ee);
+    return ee;
+    // ❌ No corresponding delete in destroy/close handler
+  }
+}
+
+// ✅ FIX: Clean up on session end
+destroySession(id) {
+  const ee = this.emitters.get(id);
+  if (ee) {
+    ee.removeAllListeners();
+    ee.destroy?.();
+    this.emitters.delete(id);  // ← THIS LINE IS THE FIX
+  }
+}
+```
+
+### Cause 2 — Response Logging Middleware Buffering Buffers
+
+**Pattern:** Entire response body collected into a Buffer array for logging purposes.
+
+```js
+// ❌ LEAKS — accumulates full response bodies indefinitely
+const responseLog = [];          // module-scoped, unbounded
+app.use(async (req, res, next) => {
+  const originalEnd = res.end;
+  res.end = function(...args) {
+    if (args[0]) {
+      responseLog.push(Buffer.from(args[0]));  // keeps ALL responses in memory
+    }
+    originalEnd.apply(this, args);
+  };
+  next();
+});
+
+// ✅ FIXED — stream to disk/file, keep rolling window
+import { createWriteStream } from 'fs';
+import { rotateLog } from './log-rotation';
+
+const responseFile = createWriteStream('/var/log/responses.log', { flags: 'a' });
+
+app.use(async (req, res, next) => {
+  const chunks = [];
+  const originalWrite = res.write;
+  const originalEnd = res.end;
+
+  res.write = function(chunk) {
+    if (chunk) chunks.push(Buffer.from(chunk));
+    return originalWrite.apply(this, arguments);
+  };
+
+  res.end = function(...args) {
+    if (args[0]) chunks.push(Buffer.from(args[0]));
+    
+    // Write summary, discard body
+    const totalSize = chunks.reduce((sum, c) => sum + c.length, 0);
+    responseFile.write(`${Date.now()} ${req.method} ${req.path} ${totalSize}bytes\n`);
+    chunks.length = 0;           // ← release immediately
+    
+    originalEnd.apply(this, args);
+  };
+  
+  next();
+});
+```
+
+**Even better — don't buffer at all. Log headers/status/metadata only:**
+
+```js
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    logger.info({
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration: Date.now() - start,
+      contentLength: res.getHeader('content-length')
+    });
+  });
+  
+  next();
+});
+```
+
+### Cause 3 — Closures Capturing Large Scoped Variables
+
+```js
+// ❌ Each listener captures `requestBody` (potentially 1-5MB)
+eventBus.on('process', async (payload) => {
+  await heavyComputation(requestBody, payload);  // requestBody captured
+  saveToDb(requestBody);                          // and here
+});
+
+// ✅ FIXED — pass only what you need as arguments
+eventBus.on('process', async (payload, ...neededArgs) => {
+  await heavyComputation(neededArgs[0], payload);
+  saveToDb(neededArgs[1]);
+});
+```
+
+### Cause 4 — Internal `setMaxListeners` Not Set on High-Volume Emitters
+
+```js
+// Default warning fires at 10. After 10 leaks become dangerous silently.
+const emitter = new EventEmitter();
+emitter.setMaxListeners(0);  // Disable the warning (not recommended)
+// BETTER:
+emitter.setMaxListeners(50);  // Set conscious upper bound, then audit
+```
+
+---
+
+## Phase 5: Verification Strategy
+
+### Run With GC Tracing (Staging First)
+
+```bash
+node --trace-gc --heapsnapshot-signal=SIGUSR1 ./dist/index.js
+```
+
+Watch stderr for GC frequency and freed bytes. A healthy app after fixing the leak should show:
+- Gen 0 collections: frequent, freeing 50%+ of live objects
+- Gen 1 collections: occasional, stable total heap after GC
+- RSS stabilizing after restart instead of climbing
+
+### Metrics to Confirm the Fix
+
+| Metric | Before Fix | After Fix |
+|--------|-----------|-----------|
+| RSS at 48h | ~4GB | ~350MB |
+| GC pause frequency | Increasing over time | Stable |
+| EventEmitter listener count per instance | Linear growth | Flat, bounded |
+| Buffer array length in middleware | Linear growth | Resets to 0 every response |
+| Requests before OOM | ~2M | Unlimited (resource-bound, not memory-bound) |
+
+### Post-Fix Deployment Checklist
+
+1. [ ] Deploy fix to staging, run `autocannon -c 100 -d 300 http://localhost:3000/health` while monitoring RSS
+2. [ ] Verify RSS plateaus within 15 minutes under sustained load
+3. [ ] Deploy to production behind canary (1 pod first)
+4. [ ] Watch Grafana: RSS graph should flatten after initial GC cycle
+5. [ ] Keep the `/debug/events` endpoint behind auth for 1 week post-deploy to monitor
+6. [ ] Add `process.on('warning', ...)` alerting for MaxListenersExceededWarning in production logs
+
+---
+
+## Summary Decision Tree
+
+```
+RSS climbs 300MB → 4GB over 48h
+│
+├─ Heap snapshots show closure growth retained by EventEmitter
+│  └─→ Listener count per emitter > 100? 
+│       YES: Named handlers + removeAllListeners + emitter cleanup
+│       NO:  Closures capturing large variables → reduce captured scope
+│
+├─ Heap snapshots show Buffer growth from response-logging middleware
+│  └─→ Are bodies buffered in an unbounded array?
+│       YES: Stream to file, rolling window, or drop body logging entirely
+│       NO:  Check if Buffer pool (fastify/bull/etc.) growing → configure pool size
+│
+└─ Both present → Fix both simultaneously. Either alone may leave enough leak
+                  to still hit OOM in edge cases.
+```

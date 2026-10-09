@@ -1,0 +1,547 @@
+[exit=0 latency=36.49s]
+Here's the full investigation design and remediation plan.
+
+---
+
+## 1. Profiling Instruments to Attach Under Real Traffic
+
+You have three correlated signals — DB connections up, query count up, p99 blown out while p50 barely moves and CPU/memory are flat. That pattern points to **requests serializing behind database wait time**, not compute or memory pressure. You need instruments that separate *where* the latency is spent across those three axes: connection lifecycle, query execution, and Python-level call chains.
+
+### A. Continuous Python Profiler (Flame Graphs)
+
+**Instrument:** `py-spy` running in record mode against the production pod(s), or `pyinstrument --record` with a sampling interval of 1ms.
+
+```bash
+# py-spy: low-overhead, works on live processes, no recompilation
+py-spy record -o profile.svg \
+  --pid $(pgrep -f "uvicorn main:") \
+  --subprocesses \
+  --interval 1000 \
+  --duration 300 \
+  --output-format speedscope  # also outputs JSON for viz
+```
+
+**Why this over cProfile:** cProfile instruments every function call — orders of magnitude overhead, will change the tail behavior you're trying to measure. py-spy uses signal-based sampling (~100-1000 Hz), adding ~1-3% overhead, which preserves the statistical integrity of p99 measurements.
+
+**Alternative for automated CI integration:** Wrap the worker process with `pyinstrument`'s CLI recorder or use `scylladb/py-spy-docker` if deployed in containers:
+
+```dockerfile
+# Dockerfile addition for runtime profiling capability
+RUN apt-get update && apt-get install -y libunwind-dev gcc \
+    && pip install pyinstrument psutil
+```
+
+### B. SQL Query Tracing (OpenTelemetry + SQLAlchemy)
+
+**Instrument:** OpenTelemetry tracing with `opentelemetry-instrumentation-sqlalchemy`, configured to capture full query text, bind parameters, and execution time per query span.
+
+```python
+# trace_config.py
+from opentelemetry import trace
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPPubExporter
+
+trace.set_tracer_provider(TracerProvider())
+exporter = OTLPTraceExporter(endpoint="otel-collector:4317")
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
+
+# Patch SQLAlchemy — wraps every execute() as a child span
+SQLAlchemyInstrumentor().instrument()
+
+# Add custom attribute: whether this query was served from the driver cache
+import sqlalchemy.engine
+_original_execute = sqlalchemy.engine.CursorResult.__init__
+
+def _patched_init(self, statement, params, *args, **kwargs):
+    _original_execute(self, statement, params, *args, **kwargs)
+    self._has_cached_bind = hasattr(statement, 'cached')
+
+sqlalchemy.engine.CursorResult.__init__ = _patched_init
+```
+
+**What to look for in traces:**
+
+| Signal | N+1 | Pool Saturation | Lock Contention |
+|--------|-----|-----------------|-----------------|
+| Per-request query count | >> normal (10-100x) | Normal per-request, but many parallel requests hitting limit | Normal query count, high queue_time duration |
+| Span durations | Many tiny spans (<5ms each) | First N spans fast, rest queue at ConnectionQueue.acquire() | Spans show `wait_timeout` or `Lock.wait` |
+| Span tree shape | Fan-out: one root request → many query children | Sequential: requests stack waiting for pool slot | Sequential within a partition/table |
+
+### C. Connection Pool Metrics (Prometheus/StatsD)
+
+**Instrument:** SQLAlchemy's built-in `QueuePool` emits events. Attach a listener and push metrics via prometheus-client.
+
+```python
+# pool_metrics.py
+import time
+from sqlalchemy import event
+from sqlalchemy.pool import QueuePool
+from prometheus_client import Histogram, Gauge, Counter, start_http_server
+
+# Start metrics HTTP server on port 9090 for Prometheus scraping
+start_http_server(9090)
+
+pool_size = Gauge('db_pool_connections_current', 'Active DB connections')
+pool_max = Gauge('db_pool_connections_max', 'Max pool size')
+pool_idle = Gauge('db_pool_idle_connections', 'Idle connections available')
+acquire_latency = Histogram('db_pool_acquire_seconds', 'Time to acquire a connection from pool', buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0))
+checkout_counter = Counter('db_pool_checkouts_total', 'Total connection checkouts')
+checkout_overflow = Counter('db_pool_checkout_overflow_total', 'Checkouts beyond pool_size')
+
+@event.listens_for(QueuePool, "checkin")
+def receive_checkin(conn):
+    pool_size.set(QueuePool.checkedin())
+
+@event.listens_for(QueuePool, "checkout")
+def receive_checkout(dbapi_conn, connection_record, connection_proxy):
+    checkout_counter.inc()
+    # Detect if we're beyond the base pool_size (recycle/overflow)
+    max_size = connection_proxy._pool.maxsize
+    checkedout = QueuePool.checkedout()
+    if checkedout > max_size:
+        checkout_overflow.inc()
+
+@event.listens_for(QueuePool, "connect")
+def receive_connect(dbapi_conn, connection_record):
+    pass  # new connection created — track if overflow is happening
+
+@event.listens_for(QueuePool, "poll")
+def receive_poll(connection_record):
+    """Called before a connection is returned to the pool (idle polling)."""
+    pass
+
+@event.listens_for(QueuePool, "connect_fail")
+def receive_connect_fail(dbapi_conn, connection_record, connect_error):
+    pass  # connection creation failed
+
+class PoolMetricsListener:
+    """Intercept session usage to correlate queries with pool state."""
+    
+    def __init__(self):
+        self.acquisition_starts = {}
+    
+    def on_before_cursor_execute(self, conn, cursor, statement, 
+                                  parameters, context, executemany):
+        req_id = getattr(context, '_request_id', None)
+        if req_id:
+            self.acquisition_starts[req_id] = time.monotonic()
+    
+    def on_after_cursor_execute(self, conn, cursor, statement,
+                                 parameters, context, executemany):
+        req_id = getattr(context, '_request_id', None)
+        if req_id and req_id in self.acquisition_starts:
+            elapsed = time.monotonic() - self.acquisition_starts.pop(req_id)
+            acquire_latency.observe(elapsed)
+
+# Install listener on engine
+listener = PoolMetricsListener()
+engine = create_engine(DATABASE_URL, poolclass=QueuePool)
+event.listen(engine, "before_cursor_execute", listener.on_before_cursor_execute)
+event.listen(engine, "after_cursor_execute", listener.on_after_cursor_execute)
+```
+
+**Key metrics to graph together (Grafana panel):**
+
+```
+# Panel 1: Pool saturation ratio
+db_pool_connections_current / db_pool_connections_max
+
+# Panel 2: Acquire latency distribution
+histogram_quantile(0.50, rate(db_pool_acquire_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(db_pool_acquire_seconds_bucket[5m]))
+
+# Panel 3: Request query count (from trace attributes)
+rate(http_requests_total{status=~"2.."}[5m]) 
+
+# Panel 4: Queries per request (computed from OTel)
+sum(rate(trace_spans_duration_count{span_kind="client",service_name="db-query"}[5m])) 
+/ sum(rate(trace_spans_duration_count{span_kind="server",service_name="api"}[5m]))
+```
+
+---
+
+## 2. Distinguishing N+1 Queries vs Pool Saturation vs Lock Contention
+
+These three problems produce similar surface symptoms (high latency, elevated DB connections) but have different root causes and require different remedies. Here's how to tell them apart using the instruments above.
+
+### Decision Matrix
+
+```
+                    ┌─────────────────────────────────┐
+                    │  p50 ≈ normal, p99 ≫ p50?       │
+                    │  CPU flat, mem flat?              │
+                    └──────────┬──────────────────────┘
+                               │ YES
+                    ┌──────────▼──────────────────────┐
+                    │  Check: queries-per-request       │
+                    │  (from OTEL query spans)          │
+                    └──────────┬──────────────────────┘
+                           ╱      ╲                      ╱
+                   HIGH     │      │    NORMAL           │
+               (>10× baseline)│      │                  │
+                     ╱        │      │                  ▼
+              ┌────▼────┐   │  ┌───▼──────────────────────┐
+              │  N+1    │   │  │ Pool Saturation?          │
+              │ Pattern │   │  │                           │
+              └─────────┘   │  │  ◄─ Acquire latency      │
+                            │  │    p99 > 0.5s?           │
+                            │  │    Pool at capacity?     │
+                        NO  │  └────┬────────────────────┘
+                         ╱   │       │
+                  ┌─────▼───▼┐      │ CONGESTION
+                  │Lock/Row  │      │ DETECTED
+                  │Contention│      │
+                  └──────────┘      │
+                           ╱       │
+                  ╱ queue_time  ╱
+              HIGH?           ╱
+              ╱               │
+        ┌────▼────┐          │
+        │ Row/Table│          │
+        │ Level    │          │
+        │ Lock     │          │
+        └─────────┘          │
+```
+
+### Specific Discriminators
+
+**N+1 Query Pattern:**
+- **Trace signature:** One API span fans into 10-100+ identical child spans (same SQL text, different bind parameters)
+- **Flame graph signature:** Repeated calls to ORM loader methods (`LoaderContext.load_row`, `Query.populate_result`) stacked deep in the call chain; the top frames are all ORM unit-of-work flush/load operations
+- **Query log signature:** Same parameterized query repeated with different binds (`SELECT * FROM users WHERE id = ?`)
+- **Connection behavior:** Connections stay busy but individually light — each holds a connection for a short time but opens many sequential ones
+
+```python
+# Detect N+1 at instrumentation time
+# Inject into your repository layer
+import hashlib
+from collections import defaultdict
+
+_query_counts_per_request = defaultdict(int)
+_query_signatures = defaultdict(set)
+
+def detect_n_plus_one(request_ctx):
+    req_id = request_ctx.id
+    sql_hash = hashlib.md5(sql_text.strip().lower()).hexdigest()[:8]
+    signatures = _query_signatures[req_id]
+    counts = _query_counts_per_request[req_id]
+    
+    counts += 1
+    signatures.add(sql_hash)
+    
+    unique_queries = len(signatures)
+    total_queries = counts
+    
+    if total_queries > 50 and unique_queries <= 5:
+        # Classic N+1: few unique SQL patterns, many executions
+        report_n_plus_one(req_id, total_queries, unique_queries, signatures)
+```
+
+**Pool Saturation:**
+- **Trace signature:** Multiple API spans with identical timing profiles showing `QueuePool.acquire()` taking >100ms; the wait appears in the pool acquire method, not in query execution
+- **Flame graph signature:** Stacks blocked inside `queue.Queue.get()` or `threading.Condition.wait()` in the pool's acquire path; these appear as "waiting" frames consuming significant wall-clock time
+- **Metrics signature:** `db_pool_connections_current` flatlines at `max_overflow + pool_size`; `db_pool_acquire_seconds_p99` jumps to match p99 request latency
+- **Timing signature:** The gap between when a request starts and its first query executes equals the acquire latency — everything happens after the acquire completes
+
+```python
+# Correlate pool state with request latency
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+async def monitor_pool_saturation():
+    """Run as background task — pushes pool health to OTel."""
+    while True:
+        pool = engine.pool
+        status = pool.status()  # "timeout", "full", "ok"
+        yield {
+            "pool_active": pool.checkedout(),
+            "pool_max": pool.size() + pool._max_overflow,
+            "pool_status": status,
+            "acquire_queue_depth": await pool.async_queue_depth(),
+        }
+        await asyncio.sleep(2)
+```
+
+**Lock Contention (PostgreSQL-specific):**
+- **Trace signature:** Query spans show high duration despite single execution; `wait_timeout` appears in query metadata
+- **pg_stat_activity view:** Many rows in `state = 'idle in transaction'` holding locks, or `state = 'active'` waiting on `LockWait`
+- **Flame graph signature:** No extra Python frames — stacks unwind quickly through acquire() and into the actual query execution, which itself blocks on `pg_advisory_lock` or row-level lock waits
+- **Log signature:** PostgreSQL logs contain `process X still waiting for ShareLock... after Y ms`
+
+```sql
+-- Run this during an incident window to confirm lock contention
+SELECT pid, now() - xact_start AS duration, 
+       state, wait_event_type, wait_event,
+       left(query, 120) AS query_preview
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND datname = current_database()
+ORDER BY xact_start ASC
+LIMIT 20;
+```
+
+---
+
+## 3. Reading the Flame Graph
+
+A flame graph visualizes where CPU-bound and wall-clock time are spent across all sampled stack traces. Each horizontal bar is a function; width = proportion of samples; vertical = call depth.
+
+### Anatomy of the Stack (Top to Bottom)
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │         kernel futex_wait                │ ← Blocked on syscall
+                    ├─────────────────────────────────────────┤
+                    │          queue.Queue.get()               │ ← Waiting for connection
+                    ├─────────────────────────────────────────┤
+                    │   QueuePool._checkout()                  │ ← Pool-level wait
+                    ├─────────────────────────────────────────┤
+                    │   Session.execute()                      │ ← Your ORM call
+                    ├─────────────────────────────────────────┤
+                    │   UserResource.get()                     │ ← Repository method
+                    ├─────────────────────────────────────────┤
+                    │   router.get_user()                      │ ← Endpoint handler
+                    ├─────────────────────────────────────────┤
+                    │   Starlette.dispatch_middleware()        │ ← Framework layer
+                    └─────────────────────────────────────────┘
+                              ▲ narrow ▲ wide
+                             
+Wider bars = more samples = hot path
+```
+
+### What to Look For in Each Scenario
+
+**If flame graph shows wide bands at the bottom (ORM/framework level):**
+```
+        ┌────────────┐   thin   ┌──────────┐   WIDE   ┌──────────────┐
+        │ dispatch()  │──────►  │ repo_xxx() │──────►  │ pool.acquire │  
+        └────────────┘          └──────────┘           └──────────────┘
+        
+→ Pool saturation. Fix: increase pool size, optimize long-running queries.
+```
+
+**If flame graph shows deep recursion with repeated narrow bars:**
+```
+        ┌────────────┐   ┌────────────┐   ┌────────────┐
+        │ get_users() │──►│ load_orders │──►│ load_items │──►...
+        └────────────┘   └────────────┘   └────────────┘
+         
+→ N+1. Fix: eager loading, batch joins, IN clause batching.
+```
+
+**If flame graph is uniformly thin with occasional wide spikes:**
+```
+        ┌────────────┐   ┌───────┐   ┌────────────┐
+        │ api_handler │   │ ...   │   │ api_handler │
+        └────────────┘   └───────┘   └────────────┘
+           (thin)        (gap)         (wide spike)
+           
+→ Intermittent lock contention or GC pauses (if using PyPy/JIT).
+```
+
+### Practical Viewing Workflow
+
+```bash
+# 1. Record flame graph from production
+py-spy record -o profile.raw.pyspy --pid $PID --duration 300
+
+# 2. Convert to SVG
+py-spy render -i profile.raw.pyspy > profile.svg
+
+# 3. View locally — search for functions matching your symptoms
+#    - grep for QueuePool, acquire, checkout → pool saturation
+#    - grep for populate_result, load_row, unitofwork → N+1 ORM
+#    - grep for futex, epoll_wait, poll → OS-level blocking (locks/I/O)
+
+# 4. Drill down: filter to specific endpoints
+py-spy record -o endpoint_profile.pyspy \
+  --pid $PID \
+  --func-pattern "get_order_details|list_products" \
+  --duration 120
+```
+
+---
+
+## 4. Proposed Fixes Ranked by Expected P99 Impact
+
+### Fix 1: N+1 Query Elimination [HIGH IMPACT — Estimated p99 reduction: 1400-1700ms]
+
+If the investigation confirms N+1 (which the query count spike strongly suggests):
+
+**A. Eager-load relationships with joined/subquery strategies:**
+
+```python
+# Before (N+1: loads N orders then N × M items per order)
+order = session.query(Order).filter(Order.id == order_id).one()
+items = [session.query(OrderItem).filter(OrderItem.order_id == o.id).all() 
+         for o in orders]  # N queries here
+
+# After (2 queries total regardless of N)
+order = (session.query(Order)
+         .options(joinedload(Order.items), selectinload(Order.items))
+         .filter(Order.id == order_id)
+         .one())
+```
+
+**B. IN-batching for unavoidable separate queries:**
+
+```python
+# Before: N individual SELECTs
+for user_id in user_ids:
+    user = session.query(User).filter(User.id == user_id).first()
+
+# After: 1 query with batched IDs (still paginated for very large batches)
+from itertools import chunked
+
+chunks = list(chunked(user_ids, 500))
+results = {}
+for chunk in chunks:
+    chunk_results = session.query(User).filter(User.id.in_(chunk)).all()
+    results.update({u.id: u for u in chunk_results})
+```
+
+**C. Django/SQLAlchemy autoflush audit:** Ensure `autoflush=False` on read-only sessions to prevent implicit INSERT/UPDATE before reads:
+
+```python
+sessionmaker = sessionmaker(bind=engine, autoflush=False)
+```
+
+### Fix 2: Database Indexing [HIGH IMPACT — Estimated p99 reduction: 200-800ms]
+
+The increased query count likely means queries are now table-scanning instead of index-seek. Audit slow queries immediately:
+
+```sql
+-- Find the missing indexes causing the scan
+EXPLAIN ANALYZE <your_slowest_query>;
+
+-- Look for "Seq Scan" vs "Index Scan" — Seq Scans on large tables are the killer
+-- Create compound indexes for WHERE + ORDER BY combos discovered in traces
+CREATE INDEX idx_orders_user_created ON orders(user_id, created_at DESC);
+CREATE INDEX idx_items_order_product ON order_items(order_id, product_id);
+```
+
+**Index strategy based on trace data:**
+- Export all unique SQL texts from OTEL spans
+- Run `EXPLAIN ANALYZE` on each
+- Prioritize the top 5 by aggregate latency contribution
+- Use `pg_stat_user_tables` to find tables with increasing sequential scans
+
+```sql
+-- Identify tables with rising seq scans (run periodically)
+SELECT relname, seq_scan, idx_scan, 
+       seq_tup_read, idx_tup_fetch,
+       CASE WHEN seq_scan > 100 THEN 'INDEX_NEEDED' 
+            ELSE 'OK' END AS recommendation
+FROM pg_stat_user_tables
+ORDER BY seq_scan DESC NULLS LAST
+LIMIT 20;
+```
+
+### Fix 3: Connection Pool Tuning [MEDIUM-HIGH IMPACT — Estimated p99 reduction: 100-400ms]
+
+Align pool size with observed concurrency:
+
+```python
+# Formula: pool_size = (cpu_count * 2) + effective_db_connections
+# But derive it empirically:
+
+# Step 1: Measure peak concurrent connections (from pool metrics)
+peak_connections = histogram_value("db_pool_connections_current", percentile=95)
+
+# Step 2: Calculate recommended pool size
+recommended_pool = int(peak_connections * 1.5)  # headroom
+recommended_max_overflow = recommended_pool // 2
+
+# Step 3: Apply — DO NOT use pool_size=20 with async (common mistake)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=50,                # adjust based on your measurement
+    max_overflow=20,             # allows temporary bursts
+    pool_pre_ping=True,          # detect stale connections
+    pool_recycle=3600,           # recycle after 1 hour
+    pool_timeout=30,             # fail-fast after 30s wait instead of hanging
+)
+
+# IMPORTANT: If using asyncpg, use AsyncAdapt or native async:
+from sqlalchemy.ext.asyncio import create_async_engine
+
+async_engine = create_async_engine(
+    DATABASE_URL_ASYNC,
+    pool_size=25,          # smaller because async doesn't block threads
+    max_overflow=10,
+    pool_timeout=30,
+    pool_pre_ping=True,
+    connect_args={"command": "SET statement_timeout = '10s'", "server_settings": {"idle_in_transaction_session_timeout": "5s"}}
+)
+```
+
+**Critical rule:** Never let `pool_timeout` exceed your API's timeout. If the API times out at 30s, set pool_timeout to 25s so failures happen at the right layer.
+
+### Fix 4: Query Decomposition and Pagination [MEDIUM IMPACT — Estimated p99 reduction: 50-200ms]
+
+Long-running queries dominate p99. Cap them:
+
+```python
+# Enforce per-query time limits via PostgreSQL statement_timeout
+async def safe_query(session, stmt, timeout_ms=5000):
+    """Execute with automatic timeout enforcement."""
+    await session.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
+    try:
+        result = await session.execute(stmt)
+        return result
+    finally:
+        await session.execute(text("RESET statement_timeout"))
+
+# Paginate aggressively — never fetch full result sets
+async def get_paginated(ctx, model, page=1, page_size=100):
+    offset = (page - 1) * page_size
+    rows = await ctx.db.execute(
+        select(model).limit(page_size).offset(offset)
+    )
+    total = await ctx.db.execute(select(func.count()).select_from(model.subquery()))
+    return PaginatedResponse(rows=rows, total=total.scalar())
+```
+
+### Fix 5: Caching Layer [LOW-MEDIUM IMPACT — Depends on read/write ratio]
+
+Cache only stable, frequently-read data. Avoid caching paths where N+1 was the issue — fixing the query is better than caching bad queries:
+
+```python
+# Redis cache with TTL and race-condition guard
+from functools import lru_cache
+import redis
+
+redis_client = redis.Redis(host="cache-primary", decode_responses=True)
+
+CACHE_TTL = 300  # 5 minutes
+
+def cached_get(key, fetch_fn, ttl=CACHE_TTL):
+    """Simple cache with lock-on-miss to prevent thundering herd."""
+    data = redis_client.get(key)
+    if data:
+        return json.loads(data)
+    
+    with redis_client.lock(f"lock:{key}", timeout=2):
+        data = redis_client.get(key)  # double-check after acquiring lock
+        if data:
+            return json.loads(data)
+        
+        result = fetch_fn()
+        redis_client.setex(key, ttl, json.dumps(result))
+        return result
+```
+
+---
+
+## Investigation Execution Plan (Order Matters)
+
+| Step | Action | Timebox | Output |
+|------|--------|---------|--------|
+| 1 | Deploy pool metrics collector + OTEL SQL instrumentation | 30 min | Real-time Grafana dashboard with pool saturation + query counts |
+| 2 | Run py-spy record for 10 minutes under production traffic | 10 min (+ recording) | Flame graph identifying bottleneck category |
+| 3 | Export OTEL traces, run N+1 detection script on query span trees | 30 min | List of N+1 patterns or confirmation they don't exist |
+| 4 | Query `pg_stat_activity` and `pg_stat_user_tables` for lock contention evidence | 10 min | Confirmation/no of row/table locks |
+| 5 | Implement Fix 1 (N+1 elimination) or Fix 3 (pool tuning) based on findings | TBD | Rollback-ready PR with metric baselines |
+| 6 | Verify p99 returns to <250ms with post-fix py-spy + Grafana comparison | 10 min | Before/after metrics confirmation |

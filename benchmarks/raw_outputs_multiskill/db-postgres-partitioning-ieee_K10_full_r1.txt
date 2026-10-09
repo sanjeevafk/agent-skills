@@ -1,0 +1,358 @@
+I'll design a comprehensive zero-downtime partitioning strategy for your 500M-row audit_logs table. This uses the expand-contract pattern with concurrent backfill and pg_partman for automation.
+
+## Phase 1: Pre-Migration Setup
+
+First, let's establish the migration infrastructure:
+
+```sql
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Migration tracking table
+CREATE TABLE IF NOT EXISTS migration_status (
+    migration_name TEXT PRIMARY KEY,
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    last_backfill_id BIGINT DEFAULT 0,
+    rows_migrated BIGINT DEFAULT 0,
+    status TEXT DEFAULT 'pending'
+);
+
+INSERT INTO migration_status (migration_name, status)
+VALUES ('audit_logs_partitioning', 'pending')
+ON CONFLICT (migration_name) DO NOTHING;
+```
+
+## Phase 2: Create Partitioned Table (Expand)
+
+Create the new partitioned table alongside the existing one:
+
+```sql
+-- New partitioned table (rename after cutover)
+CREATE TABLE audit_logs_new (
+    id BIGSERIAL,
+    org_id BIGINT NOT NULL,
+    user_id BIGINT,
+    action TEXT NOT NULL,
+    resource_type TEXT,
+    resource_id TEXT,
+    metadata JSONB DEFAULT '{}',
+    ip_address INET,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, created_at)  -- partition key must be in PK
+) PARTITION BY RANGE (created_at);
+
+-- Create initial monthly partitions (adjust range as needed)
+CREATE TABLE audit_logs_new_2024_01 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE audit_logs_new_2024_02 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+CREATE TABLE audit_logs_new_2024_03 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+-- ... continue for all months in your data range
+
+-- Create default partition for overflow safety
+CREATE TABLE audit_logs_new_default PARTITION OF audit_logs_new DEFAULT;
+
+-- Indexes on partitioned table (created concurrently to avoid locks)
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_org_created
+    ON audit_logs_new (org_id, created_at);
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_action
+    ON audit_logs_new (action, created_at);
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_metadata
+    ON audit_logs_new USING gin (metadata);
+```
+
+## Phase 3: Concurrent Backfill Script
+
+This PL/pgSQL procedure handles batched backfill with lock timeouts:
+
+```sql
+CREATE OR REPLACE FUNCTION backfill_audit_logs_batch(
+    p_batch_size INT DEFAULT 50000,
+    p_lock_timeout_ms INT DEFAULT 5000,
+    p_max_runtime_seconds INT DEFAULT 3600
+)
+RETURNS TABLE(rows_migrated BIGINT, last_id BIGINT, completed BOOLEAN) AS $$
+DECLARE
+    v_start_time TIMESTAMPTZ := clock_timestamp();
+    v_last_id BIGINT;
+    v_rows_migrated BIGINT := 0;
+    v_batch_count BIGINT;
+    v_total_migrated BIGINT := 0;
+BEGIN
+    -- Get last processed ID
+    SELECT last_backfill_id INTO v_last_id
+    FROM migration_status
+    WHERE migration_name = 'audit_logs_partitioning';
+
+    -- Update status
+    UPDATE migration_status
+    SET status = 'backfilling', started_at = NOW()
+    WHERE migration_name = 'audit_logs_partitioning';
+
+    LOOP
+        -- Check runtime limit
+        IF EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) > p_max_runtime_seconds THEN
+            RETURN QUERY SELECT v_total_migrated, v_last_id, FALSE;
+            RETURN;
+        END IF;
+
+        -- Set lock timeout for this batch
+        PERFORM set_config('lock_timeout', p_lock_timeout_ms::TEXT || 'ms', true);
+        PERFORM set_config('statement_timeout', '300000', true); -- 5 min max per batch
+
+        -- Insert batch with ON CONFLICT for idempotency
+        WITH batch AS (
+            SELECT id
+            FROM audit_logs
+            WHERE id > v_last_id
+            ORDER BY id
+            LIMIT p_batch_size
+            FOR UPDATE SKIP LOCKED
+        ),
+        inserted AS (
+            INSERT INTO audit_logs_new (id, org_id, user_id, action, resource_type, resource_id, metadata, ip_address, created_at)
+            SELECT a.id, a.org_id, a.user_id, a.action, a.resource_type, a.resource_id, a.metadata, a.ip_address, a.created_at
+            FROM audit_logs a
+            INNER JOIN batch b ON a.id = b.id
+            ON CONFLICT (id, created_at) DO NOTHING
+            RETURNING a.id
+        )
+        SELECT COUNT(*), MAX(id) INTO v_batch_count, v_last_id
+        FROM inserted;
+
+        -- Exit when no more rows
+        EXIT WHEN v_batch_count = 0;
+
+        v_total_migrated := v_total_migrated + v_batch_count;
+
+        -- Update progress
+        UPDATE migration_status
+        SET last_backfill_id = v_last_id,
+            rows_migrated = v_total_migrated
+        WHERE migration_name = 'audit_logs_partitioning';
+
+        -- Brief pause to reduce load
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+
+    -- Mark complete
+    UPDATE migration_status
+    SET status = 'backfill_complete', completed_at = NOW()
+    WHERE migration_name = 'audit_logs_partitioning';
+
+    RETURN QUERY SELECT v_total_migrated, v_last_id, TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Execute backfill (can be run multiple times safely)
+SELECT * FROM backfill_audit_logs_batch(
+    p_batch_size => 50000,
+    p_lock_timeout_ms => 5000,
+    p_max_runtime_seconds => 7200  -- 2 hours per run
+);
+```
+
+## Phase 4: Dual-Write Trigger (Expand)
+
+Keep tables in sync during backfill:
+
+```sql
+CREATE OR REPLACE FUNCTION audit_logs_dual_write()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO audit_logs_new (id, org_id, user_id, action, resource_type, resource_id, metadata, ip_address, created_at)
+    VALUES (NEW.id, NEW.org_id, NEW.user_id, NEW.action, NEW.resource_type, NEW.resource_id, NEW.metadata, NEW.ip_address, NEW.created_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_logs_dual_write
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_logs_dual_write();
+```
+
+## Phase 5: Cutover (Contract)
+
+Atomic rename for minimal downtime:
+
+```sql
+-- Run during low-traffic window
+BEGIN;
+
+-- Final sync of any remaining rows
+INSERT INTO audit_logs_new (id, org_id, user_id, action, resource_type, resource_id, metadata, ip_address, created_at)
+SELECT id, org_id, user_id, action, resource_type, resource_id, metadata, ip_address, created_at
+FROM audit_logs
+WHERE id > (SELECT last_backfill_id FROM migration_status WHERE migration_name = 'audit_logs_partitioning')
+ON CONFLICT (id, created_at) DO NOTHING;
+
+-- Atomic rename
+ALTER TABLE audit_logs RENAME TO audit_logs_old;
+ALTER TABLE audit_logs_new RENAME TO audit_logs;
+
+-- Rename partitions
+ALTER TABLE audit_logs_new_2024_01 RENAME TO audit_logs_2024_01;
+ALTER TABLE audit_logs_new_2024_02 RENAME TO audit_logs_2024_02;
+-- ... rename all partitions
+
+-- Update trigger to remove dual-write
+DROP TRIGGER trg_audit_logs_dual_write ON audit_logs_old;
+
+-- Update status
+UPDATE migration_status
+SET status = 'cutover_complete', completed_at = NOW()
+WHERE migration_name = 'audit_logs_partitioning';
+
+COMMIT;
+```
+
+## Phase 6: pg_partman Automation
+
+Configure automatic future partition creation:
+
+```sql
+-- Create parent table in pg_partman
+SELECT partman.create_parent(
+    p_parent_table := 'public.audit_logs',
+    p_control := 'created_at',
+    p_type := 'range',
+    p_interval := '1 month',
+    p_premake := 3,           -- Create 3 months ahead
+    p_start_partition := '2024-01-01'
+);
+
+-- Configure maintenance
+UPDATE partman.part_config
+SET
+    retention = '24 months',           -- Keep 24 months of data
+    retention_keep_table = true,       -- Keep table structure
+    retention_keep_index = true,       -- Keep indexes
+    infinite_partition = true,         -- Never stop creating partitions
+    automatic_maintenance = 'on'       -- Enable auto-maintenance
+WHERE parent_table = 'public.audit_logs';
+
+-- Run maintenance (schedule via pg_cron or external scheduler)
+SELECT partman.run_maintenance('public.audit_logs');
+
+-- Optional: Schedule with pg_cron
+SELECT cron.schedule('audit-logs-maintenance', '0 2 * * *',
+    $$SELECT partman.run_maintenance('public.audit_logs')$$);
+```
+
+## Phase 7: Partition Pruning Verification
+
+Verify the query planner correctly prunes partitions:
+
+```sql
+-- Enable partition pruning logging
+SET auto_explain.log_min_duration = 0;
+SET auto_explain.log_analyze = true;
+SET auto_explain.log_buffers = true;
+
+-- Test query with date range (should prune to single partition)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT *
+FROM audit_logs
+WHERE created_at >= '2024-06-01'
+  AND created_at < '2024-07-01'
+  AND org_id = 123;
+
+-- Expected output should show:
+-- "Seq Scan on audit_logs_2024_06" (only one partition scanned)
+
+-- Verify pruning with partition information
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+FROM pg_tables
+WHERE tablename LIKE 'audit_logs_%'
+ORDER BY tablename;
+
+-- Check partition pruning effectiveness
+SELECT
+    query,
+    calls,
+    mean_exec_time,
+    rows
+FROM pg_stat_statements
+WHERE query LIKE '%audit_logs%'
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+
+-- Verify no default partition usage (should be empty)
+SELECT COUNT(*) as default_partition_rows
+FROM audit_logs_default;
+```
+
+## Phase 8: Post-Migration Validation
+
+```sql
+-- Row count comparison
+SELECT
+    (SELECT COUNT(*) FROM audit_logs_old) as old_table_rows,
+    (SELECT COUNT(*) FROM audit_logs) as new_table_rows,
+    (SELECT rows_migrated FROM migration_status WHERE migration_name = 'audit_logs_partitioning') as reported_migrated;
+
+-- Verify no data gaps
+SELECT
+    MIN(created_at) as earliest_record,
+    MAX(created_at) as latest_record,
+    COUNT(DISTINCT date_trunc('month', created_at)) as months_covered
+FROM audit_logs;
+
+-- Check index usage on partitioned table
+SELECT
+    indexrelname,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public'
+  AND relname LIKE 'audit_logs%'
+ORDER BY idx_scan DESC;
+```
+
+## Rollback Plan
+
+If issues arise before cutover:
+
+```sql
+-- Simply drop the new table and trigger
+DROP TRIGGER trg_audit_logs_dual_write ON audit_logs_old;
+DROP FUNCTION audit_logs_dual_write();
+DROP TABLE audit_logs_new CASCADE;
+
+-- Reset migration status
+UPDATE migration_status
+SET status = 'rolled_back', completed_at = NOW()
+WHERE migration_name = 'audit_logs_partitioning';
+```
+
+## Key Configuration Recommendations
+
+```sql
+-- For the migration session
+SET work_mem = '256MB';              -- Larger work memory for sorts
+SET maintenance_work_mem = '1GB';    -- For index creation
+SET max_parallel_maintenance_workers = 4;
+SET effective_io_concurrency = 200;  -- For SSD storage
+
+-- Permanent settings for partitioned table
+ALTER TABLE audit_logs SET (
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_analyze_scale_factor = 0.005,
+    fillfactor = 90                    -- Leave room for HOT updates
+);
+```
+
+This strategy ensures:
+- **Zero downtime**: Dual-write trigger keeps tables in sync during backfill
+- **Resumable**: Backfill can be stopped/started safely
+- **Lock-safe**: Uses SKIP LOCKED and lock timeouts
+- **Automated**: pg_partman handles future partitions
+- **Verifiable**: Pruning queries confirm optimal partition elimination

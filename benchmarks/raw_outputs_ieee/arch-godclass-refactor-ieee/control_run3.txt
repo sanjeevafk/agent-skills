@@ -1,0 +1,917 @@
+[exit=0 latency=71.46s]
+## Refactoring Campaign: OrderService (1,400 LOC / 34 Fields)
+
+### Phase 0 — Characterization Tests & Golden Master Strategy
+
+You have zero tests and no guarantee behavior will survive. First commit = lock down current behavior. Every subsequent commit compares against this baseline.
+
+#### 0a. Execution-Level Snapshot: Interceptor + Replay Engine
+
+Build a thin proxy that sits *in front* of every real collaborator inside OrderService, captures the full side-effect transcript for every `public` method call, and writes deterministic JSON to disk. After the run, compare outputs byte-for-byte.
+
+```python
+# characterization/transcript_runner.py — the heart of golden-master
+import json, time, hashlib, functools
+from pathlib import Path
+from typing import Any
+
+OUTPUT_DIR = Path("tests/golden_snapshots")
+OUTPUT_DIR.mkdir(parents=True, existists=False)
+
+class TranscriptCollector:
+    """Intercepts all DB calls, email sends, and audit log writes.
+    
+    Each invocation records:
+      1. The exact SQL text + parameter values used
+      2. The email recipient, subject, body hash, attachments metadata
+      3. Audit log record keys + severity
+    
+    The transcript is a list of ordered "effects" that get hashed
+    deterministically per-order so the same inputs always produce
+    the same output file.
+    """
+    def __init__(self):
+        self.effects: list[dict] = []
+    
+    def record_sql(self, operation: str, table: str, sql: str, params: dict | None):
+        # Canonicalize: remove whitespace differences, sort param keys
+        cleaned = ' '.join(sql.split())
+        sanitized_params = dict(sorted((k, str(v)) for k, v in (params or {}).items()))
+        self.effects.append({
+            "type": "sql",
+            "operation": operation,           # INSERT|UPDATE|DELETE|SELECT
+            "table": table,
+            "sql_hash": hashlib.sha256(cleaned.encode()).hexdigest()[:12],
+            "cleaned_sql": cleaned,
+            "param_count": len(sanitized_params),
+            "params_fingerprint": hashlib.sha256(
+                json.dumps(sanitized_params).encode()
+            ).hexdigest()[:8],
+        })
+    
+    def record_email(self, to: str, subject: str, body_plain: str, 
+                     body_html: str | None, attachments: list[dict]):
+        self.effects.append({
+            "type": "email",
+            "to": to,
+            "subject_hash": hashlib.sha256(subject.encode()).hexdigest()[:12],
+            "body_md5": hashlib.md5(body_plain.encode()).hexdigest(),
+            "has_html": body_html is not None,
+            "attachment_count": len(attachments),
+        })
+    
+    def record_audit(self, action: str, entity_type: str, entity_id: str, 
+                     severity: str, detail: str):
+        self.effects.append({
+            "type": "audit",
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "severity": severity,
+            "detail_hash": hashlib.sha256(detail.encode()).hexdigest()[:12],
+        })
+    
+    def snapshot_key(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.effects, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
+
+def freeze_order_result(order_result: Any) -> dict:
+    """Convert any rich result object to pure-JSON-serializable form."""
+    # If results carry datetime, Decimal, UUID — normalize here
+    return {
+        "order_id": str(order_result.order_id),
+        "status": order_result.status,
+        "total_cents": int(order_result.total_cents),
+        "line_items": [
+            {"sku": li.sku, "qty": li.qty, "unit_price_cents": int(li.unit_price_cents)}
+            for li in order_result.line_items
+        ],
+        "created_at": str(order_result.created_at),
+    }
+
+
+def record_execution(order_service, method_name: str, args, kwargs) -> dict:
+    """Execute one OrderService public method + collect full transcript.
+    
+    This replaces every real collaborator temporarily via monkey-patch
+    or dependency injection swap (see §0b below). Returns the
+    golden-master JSON payload.
+    """
+    collector = TranscriptCollector()
+    
+    # --- Patch collaborators ---
+    _patch_db(order_service, collector)
+    _patch_emailer(order_service, collector)
+    _patch_logger(order_service, collector)
+    
+    # Execute
+    start = time.monotonic()
+    result = getattr(order_service, method_name)(*args, **kwargs)
+    elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+    
+    # Revert patches (or rely on scoped DI swap)
+    _unpatch_all(order_service)
+    
+    frozen_result = freeze_order_result(result)
+    snapshot = {
+        "method": method_name,
+        "input_hash": hashlib.sha256(
+            json.dumps({"args": args, "kwargs": kwargs}, default=str).encode()
+        ).hexdigest(),
+        "result": frozen_result,
+        "effects": collector.effects,
+        "elapsed_ms": elapsed_ms,
+        "snapshot_key": collector.snapshot_key(),
+    }
+    return snapshot
+
+
+def _patch_db(service, collector):
+    raw_conn = service._db_connection          # or however it owns its connection
+    original_execute = raw_conn.execute
+        
+    @functools.wraps(original_execute)
+    def traced_execute(sql, params=None):
+        parsed = _parse_statement(sql)         # heuristic parser
+        collector.record_sql(parsed["op"], parsed["tbl"], sql, params)
+        return original_execute(sql, params)
+    
+    raw_conn.execute = traced_execute
+
+
+def _patch_emailer(service, collector):
+    orig_send = service._mailer.send
+    @functools.wraps(orig_send)
+    def traced_send(to, subject, body_plain, body_html=None, attachments=None):
+        collector.record_email(to, subject, body_plain, body_html, attachments or [])
+        return orig_send(to, subject, body_plain, body_html=body_html, attachments=attachments)
+    service._mailer.send = traced_send
+
+
+def _patch_logger(service, collector):
+    orig_write = service._auditor.write
+    @functools.wraps(orig_write)
+    def traced_write(action, entity_type, entity_id, severity, detail):
+        collector.record_audit(action, entity_type, entity_id, severity, detail)
+        return orig_write(action, entity_type, entity_id, severity, detail)
+    service._auditor.write = traced_write
+
+
+def _parse_statement(sql: str) -> dict:
+    """Naive but sufficient statement classifier."""
+    upper = sql.strip().upper()
+    op = upper[:6]                              # SELECT|INSERT|UPDATE|DELETE
+    table_map = {
+        "INSERT INTO orders": "orders",
+        "UPDATE orders SET": "orders",
+        "INSERT INTO order_lines": "order_lines",
+        "INSERT INTO order_payments": "payments",
+        "SELECT FROM payments": "payments",
+    }
+    tbl = "unknown"
+    for key, val in table_map.items():
+        if key.upper() in sql.upper():
+            tbl = val
+            break
+    return {"op": op, "tbl": tbl}
+```
+
+#### 0b. Auto-Generating Golden-Snapshot Test Cases
+
+Don't hand-write each case. Build a **test generator** that discovers all public methods and exercises them with edge-case payloads:
+
+```python
+# tests/golden_master/test_generators.py
+import pytest
+import json
+from pathlib import Path
+from characterization.transcript_runner import record_execution, OUTPUT_DIR
+
+GOLDEN_DIR = OUTPUT_DIR
+SEED_FILE = Path("tests/golden_snapshots/.seed_ids.json")
+
+def _load_seed(id_prefix: str) -> str:
+    """Deterministic IDs so re-runs produce identical data."""
+    seeds = json.loads(SEED_FILE.read_text())
+    seq = seeds.get(id_prefix, 0)
+    seeds[id_prefix] = seq + 1
+    SEED_FILE.write_text(json.dumps(seeds, indent=2))
+    return f"{id_prefix}_{seq:04d}"
+
+
+def _golden_path(method: str, input_hash: str) -> Path:
+    return GOLDEN_DIR / f"{method}_{input_hash}.json"
+
+
+def _assert_golden(method: str, snapshot: dict):
+    """Read expected file; if missing, CREATE it (first-run mode).
+       On subsequent runs, COMPARE byte-for-byte.
+       
+       -- GATHER_MODE=1 env var tells this to *write* rather than assert.
+    """
+    import os
+    golden_path = _golden_path(method, snapshot["input_hash"])
+    
+    if os.environ.get("GATHER_MODE") == "1":
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+        print(f"[GATHER] Wrote {golden_path}")
+        return
+    
+    if not golden_path.exists():
+        pytest.fail(
+            f"NO GOLDEN SNAPSHOT FOR '{method}' (input_hash={snapshot['input_hash']}).\n"
+            f"Run with GATHER_MODE=1 to create baseline."
+        )
+    
+    expected = json.loads(golden_path.read_text())
+    assert snapshot["result"] == expected["result"], \
+        f"RESULT MISMATCH for {method}: expected {expected['result']} != got {snapshot['result']}"
+    assert snapshot["effects"] == expected["effects"], \
+        f"EFFECTS MISMATCH for {method}:\n" \
+        f"  expected {len(expected['effects'])} effects, got {len(snapshot['effects'])}\n" \
+        f"  diff keys: {set(e['snapshot_key'] for e in expected['effects']) ^ set(e['snapshot_key'] for e in snapshot['effects'])}"
+
+
+def _run_sweep(order_service_factory, method_spec):
+    """Drive one method with a fixture payload; store + assert golden."""
+    method_name = method_spec["method"]
+    fixtures = method_spec["fixtures"]   # list of {name, args, kwargs}
+    
+    for i, fixture in enumerate(fixtures):
+        svc = order_service_factory()
+        snap = record_execution(
+            svc, method_name,
+            fixture.get("args", ()),
+            fixture.get("kwargs", {}),
+        )
+        name = f"{method_name}/{fixture['name']}"
+        snap["_case_name"] = name
+        yield name, snap
+
+
+@pytest.fixture
+def order_svc():
+    """Create OrderService wired to test DB (SQLite in-memory),
+    test mailer (noop stub), test auditor (list collector)."""
+    from src.order_service import OrderService
+    db = create_test_db()          # sqlite :memory: seeded with fixtures
+    mailer = NoOpMailer()
+    auditor = ListAuditor()
+    return OrderService(db=db, mailer=mailer, auditor=auditor)
+
+
+# ---- Fixture definitions -------------------------------------------------------
+
+VALID_ORDER_PAYLOAD = {
+    "customer_email": "alice@example.com",
+    "line_items": [
+        {"sku": "WIDGET-001", "qty": 2},
+        {"sku": "GADGET-003", "qty": 1},
+    ],
+    "discount_code": None,
+    "shipping_method": "standard",
+}
+
+INVALID_ITEMS_PAYLOAD = {**VALID_ORDER_PAYLOAD, "line_items": [{"sku": "NONEXISTENT", "qty": 1}]}
+NEGATIVE_QTY_PAYLOAD = {**VALID_ORDER_PAYLOAD, "line_items": [{"sku": "WIDGET-001", "qty": -5}]}
+EXPIRED_DISCOUNT_PAYLOAD = {**VALID_ORDER_PAYLOAD, "discount_code": "EXPIRED2023"}
+MAX_ITEMS_PAYLOAD = {**VALID_ORDER_PAYLOAD, "line_items": [{"sku": "WIDGET-001", "qty": 1}] * 51}
+
+METHOD_SPECS = [
+    {
+        "method": "create_order",
+        "fixtures": [
+            {"name": "valid_standard", "kwargs": VALID_ORDER_PAYLOAD},
+            {"name": "valid_express", "kwargs": {**VALID_ORDER_PAYLOAD, "shipping_method": "express"}},
+            {"name": "valid_discount", "kwargs": {**VALID_ORDER_PAYLOAD, "discount_code": "SAVE10"}},
+            {"name": "invalid_sku", "kwargs": INVALID_ITEMS_PAYLOAD},
+            {"name": "negative_qty", "kwargs": NEGATIVE_QTY_PAYLOAD},
+            {"name": "max_items_overflow", "kwargs": MAX_ITEMS_PAYLOAD},
+        ],
+    },
+    {
+        "method": "apply_payment",
+        "fixtures": [
+            {"name": "successful_card", "args": ["ORD_0001", "visa", "4111...1111"], "kwargs": {"amount_cents": 5997}},
+            {"name": "declined_card", "args": ["ORD_0001", "visa", "4000...0002"], "kwargs": {"amount_cents": 5997}},
+        ],
+    },
+    {
+        "method": "cancel_order",
+        "fixtures": [
+            {"name": "cancel_new_order", "args": ["ORD_0001"], "kwargs": {"reason": "customer_request"}},
+            {"name": "cancel_shipped_order", "args": ["ORD_0002"], "kwargs": {"reason": "customer_request"}},
+        ],
+    },
+    {
+        "method": "update_status",
+        "fixtures": [
+            {"name": "new_to_processing", "args": ["ORD_0001", "processing"], "kwargs": {}},
+            {"name": "invalid_transition", "args": ["ORD_0001", "shipped"], "kwargs": {}},  # skip processing
+        ],
+    },
+]
+
+
+# ---- Dynamic test generation ----------------------------------------------------
+
+def generate_golden_tests():
+    """Call once to register tests via pytest's hook. Enables `pytest -v` listing."""
+    for spec in METHOD_SPECS:
+        method_name = spec["method"]
+        
+        @pytest.mark.parametrize("payload", spec["fixtures"])
+        def test_order_service_(payload, order_svc, method=method_name):
+            svc = order_svc
+            snap = record_execution(svc, method, (), {"**payload": payload})
+            _assert_golden(method, snap)
+```
+
+#### 0c. How to Gather the Baseline (First Run)
+
+```bash
+export GATHER_MODE=1
+pytest tests/golden_master/ -v
+# Creates: tests/golden_snapshots/create_order_<hash>.json, etc.
+unset GATHER_MODE
+pytest tests/golden_master/ -v
+# Every subsequent run: FAILS if ANY effect/result diverges from saved baseline.
+```
+
+Key design decisions:
+- **Effects include SQL fingerprints** (not raw SQL with IDs) so schema-level changes (adding columns) don't break golden matches prematurely.
+- **Email bodies are hashed**, not stored plaintext, so personalization tokens don't cause noise.
+- **`result` field comparison** catches logic regressions independently of side effects.
+
+---
+
+### Phase 1 — Identify Collaborators & Extract Interfaces
+
+Before writing a single line of replacement code, identify the four external dependencies baked into OrderService's 1,400 lines:
+
+| Internal reference | Role | Why it's tangled |
+|---|---|---|
+| `_db_connection` / raw SQL strings | Persistence | CRUD + queries scattered across 6+ methods |
+| `_mailer` (sendgrid/Mandrill/etc.) | Notifications | Sent in `create_order`, `cancel_order`, `update_status` |
+| `_auditor` (write_log / insert_audit_row) | Audit trail | Called after every state mutation |
+| `_tax_engine` / `_pricing_calculator` inline methods (often nested functions) | Tax + Pricing | Business rules computed in-place, ~400 combined LOC |
+
+**Extract order:** Interface the Database/SQL layer *first*. Here's why:
+
+1. **Highest coupling**: Raw SQL strings litter the most methods. Getting this right creates a clear seam.
+2. **Easiest to test independently**: SQLite in-memory works fine for unit tests; email/tax need more setup.
+3. **Enables immediate isolation**: Once you can pass a fake `OrderRepository` to a stub OrderService, you can start exercising *all* methods against an in-memory DB without touching network resources.
+4. **No behavioral ambiguity**: SQL reads/writes are deterministic given fixed seed data. Email content and tax rates depend on external state that may drift.
+
+#### Interface Definitions
+
+```python
+# src/interfaces/repository.py — Data access contract
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
+from typing import Optional
+
+
+class OrderStatus(Enum):
+    NEW = "new"
+    PROCESSING = "processing"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class LineItem:
+    sku: str
+    qty: int
+    unit_price_cents: int
+
+
+@dataclass
+class Order:
+    order_id: str
+    customer_email: str
+    line_items: list[LineItem]
+    status: OrderStatus
+    subtotal_cents: int
+    discount_cents: int
+    tax_cents: int
+    shipping_cents: int
+    total_cents: int
+    created_at: str          # ISO-8601 string (easier to serialize)
+    updated_at: Optional[str] = None
+    shipping_method: str = "standard"
+    discount_code: Optional[str] = None
+    payment_status: str = "pending"
+
+
+class OrderRepository(ABC):
+    """Abstracts all database interactions.
+    
+    Replaces direct cursor.execute() calls inside OrderService.
+    """
+    
+    @abstractmethod
+    def save_order(self, order: Order) -> str:
+        """INSERT order + order_lines; returns order_id."""
+    
+    @abstractmethod
+    def get_order(self, order_id: str) -> Optional[Order]:
+        """SELECT orders JOIN order_lines WHERE order_id=?"""
+    
+    @abstractmethod
+    def update_order_status(self, order_id: str, status: OrderStatus) -> bool:
+        """UPDATE orders SET status=?, updated_at=? WHERE order_id=?
+        
+        Returns True if a row was actually updated (for optimistic checks).
+        """
+    
+    @abstractmethod
+    def upsert_payment(self, order_id: str, method: str, last_four: str,
+                       amount_cents: int, transaction_id: str) -> str:
+        """INSERT/UPSERT payments record."""
+    
+    @abstractmethod
+    def get_order_by_customer(self, email: str, limit: int = 10) -> list[Order]:
+        """SELECT ... WHERE customer_email=? ORDER BY created_at DESC LIMIT ?"""
+
+
+# src/interfaces/mailer.py
+
+from abc import ABC, abstractmethod
+
+class Mailer(ABC):
+    """Abstracts email sending."""
+    
+    @abstractmethod
+    def send_order_confirmation(self, to: str, order: Order) -> str:
+        """Return message_id for audit purposes."""
+    
+    @abstractmethod
+    def send_order_update(self, to: str, order: Order, 
+                          new_status: str, reason: str | None) -> str:
+    
+    @abstractmethod
+    def send_order_cancelled(self, to: str, order: Order, 
+                             reason: str) -> str:
+
+
+# src/interfaces/auditor.py
+
+from abc import ABC, abstractmethod
+
+class Auditor(ABC):
+    """Abstracts audit trail writes."""
+    
+    @abstractmethod
+    def log(self, action: str, entity_type: str, entity_id: str,
+            severity: str, detail: str) -> None:
+        """Record audit event."""
+
+
+# src/interfaces/pricing.py
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+
+@dataclass(frozen=True)
+class PriceBreakdown:
+    subtotal_cents: int
+    discount_cents: int
+    shipping_cents: int
+    tax_cents: int
+    total_cents: int
+    shipping_method: str
+    discount_code_applied: bool
+
+
+class PricingCalculator(ABC):
+    """Encapsulates all pricing/discount/shipping/tax math.
+    
+    Currently lives as private methods on OrderService.
+    Moving here eliminates ~400 LOC of business logic from OrderService.
+    """
+    
+    @abstractmethod
+    def calculate(self, items: list[dict], shipping_method: str,
+                  discount_code: str | None,
+                  tax_jurisdiction: str | None) -> PriceBreakdown:
+        """Validate items → apply discounts → compute shipping → compute tax.
+        
+        Args:
+            items: [{"sku": str, "qty": int}, ...]
+            shipping_method: "standard" | "express" | "overnight"
+            discount_code: promo code or None
+            tax_jurisdiction: zip code or None
+            
+        Raises:
+            InvalidSkuError if any SKU cannot be priced
+            NegativeQuantityError if qty < 0
+            MaxItemsExceededError if len(items) > 50
+        """
+
+
+# Validation interfaces — keep validation close but extractable later
+
+# src/interfaces/validator.py
+
+from abc import ABC, abstractmethod
+
+class OrderValidator(ABC):
+    @abstractmethod
+    def validate_create(self, payload: dict) -> list[str]:
+        """Return list of error messages (empty = valid)."""
+    
+    @abstractmethod
+    def validate_cancel(self, order_status: str, reason: str) -> list[str]:
+    
+    @abstractmethod
+    def validate_status_transition(self, from_status: str, to_status: str) -> list[str]:
+```
+
+---
+
+### Phase 2 — Target Module Boundaries
+
+Here's the final architectural target — clean bounded contexts, no more god class:
+
+```
+src/order/
+├── __init__.py
+├── order_service.py              # Thin orchestrator (~200 LOC, down from 1,400)
+├── domain/
+│   ├── __init__.py
+│   ├── order.py                  # Order + LineItem value objects (DDD-lite)
+│   ├── order_factory.py          # Builds valid Order aggregates
+│   └── exceptions.py             # Domain-specific errors
+├── pricing/
+│   ├── __init__.py
+│   ├── calculator.py             # PricingCalculator impl (extracted inline methods)
+│   ├── discount_rules.py         # Discount code evaluation engine
+│   ├── shipping_rates.py         # Shipping cost lookup
+│   └── tax_engine.py             # Tax rate computation
+├── persistence/
+│   ├── __init__.py
+│   ├── order_repository.py       # SQLAlchemy/ADO.NET/DataMapper impl
+│   └── models.py                 # ORM model classes matching DB schema
+├── notifications/
+│   ├── __init__.py
+│   ├── mailer.py                 # Mailer impl (SendGrid/Mandrill adapter)
+│   └── templates/
+│       ├── confirmation.html.j2
+│       ├── update.html.j2
+│       └── cancelled.html.j2
+├── auditing/
+│   ├── __init__.py
+│   └── auditor.py               # Auditor impl (writes to audit_log table)
+├── validation/
+│   ├── __init__.py
+│   └── validators.py            # OrderValidator impl (separate module later)
+└── ports/
+    ├── __init__.py
+    ├── repositories.py           # Repository ABCs (above)
+    ├── mailer.py                 # Mailer ABC
+    ├── auditor.py                # Auditor ABC
+    └── pricing.py                # PricingCalculator ABC
+```
+
+Each module has exactly **one responsibility**. Cross-module imports flow inward (domain ← pricing, persistence, notifications; service ← everything; never the reverse). This is clean hexagonal/clean architecture — no circular dependencies.
+
+---
+
+### Phase 3 — Incremental Strangler Steps
+
+Each step ships as a deployable merge. Every commit passes the golden-master suite. The public API of OrderService never changes — callers don't know anything happened.
+
+#### Step 1: Inject Dependencies (Zero Behavior Change)
+
+**Goal**: Make OrderService accept its collaborators via constructor instead of creating them internally. This is the prerequisite for swapping implementations in tests.
+
+```python
+# Before (inside order_service.py):
+class OrderService:
+    def __init__(self):
+        self._db_connection = psycopg2.connect(...)     # hard-coded DSN
+        self._mailer = SendGridMailer(api_key="sk_...")
+        self._auditor = DatabaseAuditor(self._db_connection)
+        self._tax_cache = TTLCache(maxsize=100, ttl=300)
+
+# After:
+class OrderService:
+    def __init__(
+        self,
+        repo: OrderRepository,
+        mailer: Mailer,
+        auditor: Auditor,
+        pricing: PricingCalculator | None = None,
+    ):
+        self._repo = repo
+        self._mailer = mailer
+        self._auditor = auditor
+        self._pricing = pricing or _InlinePricing()  # keeps current behavior
+```
+
+All existing callers still work — they just pass the same objects explicitly now. Golden master passes because nothing changed at runtime.
+
+> **Commit message**: `refactor(order): inject collaborators via constructor for testability`
+
+#### Step 2: Extract Repository Layer
+
+**Goal**: Replace all raw `cursor.execute()` calls with `OrderRepository` methods. Keep the existing SQL-based repository implementation (`SqliteOrderRepository` or `PostgresOrderRepository`) so behavior is identical.
+
+Strategy:
+1. Create the `OrderRepository` ABC (already defined above).
+2. Implement `SqlQueryOrderRepository` that wraps the existing connection and executes the same SQL the OrderService was already using. Map query results back to `Order` value objects.
+3. Go method-by-method in OrderService: find each `execute()`, replace with the corresponding repository call.
+4. Golden master passes after each method replaced (check SQL fingerprint count stays constant).
+
+```python
+# src/persistence/sql_query_repository.py — drops-in as a straight wrapper
+
+class SqlQueryOrderRepository(OrderRepository):
+    def __init__(self, connection):
+        self._conn = connection
+    
+    def save_order(self, order: Order) -> str:
+        txn = self._conn.begin()
+        try:
+            oid = uuid4().hex[:12].upper()
+            self._conn.execute(
+                "INSERT INTO orders (order_id, customer_email, status, ...) VALUES (?, ?, ?, ...)",
+                (oid, order.customer_email, order.status.value, ...),
+            )
+            for item in order.line_items:
+                self._conn.execute(
+                    "INSERT INTO order_lines (order_id, sku, qty, unit_price_cents) VALUES (?, ?, ?, ?)",
+                    (oid, item.sku, item.qty, item.unit_price_cents),
+                )
+            txn.commit()
+            return oid
+        except Exception:
+            txn.rollback()
+            raise
+        # ... similar for get_order, update_order_status, upsert_payment, get_order_by_customer
+```
+
+Replace calls inside OrderService:
+
+```python
+# Inside OrderService.create_order():
+
+# BEFORE:
+oid = str(uuid.uuid4().hex[:12].upper())
+self._db_connection.execute(
+    "INSERT INTO orders (order_id, customer_email, ...) VALUES (?, ?, ...)",
+    (oid, email, ...)
+)
+for item in payload["line_items"]:
+    self._db_connection.execute(
+        "INSERT INTO order_lines (order_id, sku, qty, unit_price_cents) VALUES (?, ?, ?, ?)",
+        (oid, item["sku"], item["qty"], price_cents),
+    )
+
+# AFTER:
+oid = self._repo.save_order(order)  # one call replaces the entire block
+```
+
+After replacing ALL SQL in OrderService, verify:
+- **Zero raw `execute(` calls remain** in OrderService (grep confirms).
+- **Golden master effects match exactly** (same SQL fingerprints, same parameter counts).
+
+> **Commit message**: `feat(persistence): extract SqlQueryOrderRepository wrapping existing SQL`
+
+#### Step 3: Extract Pricing Calculator
+
+**Goal**: Move ~200–400 LOC of inline pricing/discount/shipping/tax logic into `PricingCalculator`.
+
+Identify the private methods in OrderService:
+
+```python
+# Likely exists somewhere in OrderService:
+def _calculate_subtotal(self, items): ...
+def _apply_discount(self, code, subtotal): ...
+def _calculate_shipping(self, method, weight): ...
+def _calculate_tax(self, jurisdiction, taxable_total): ...
+def _compute_totals(self, subtotal, discount, shipping, tax): ...
+```
+
+Reveal them (make them public temporarily or use IDE extract-refactor):
+
+```python
+# src/pricing/calculator.py — extracted from OrderService._calculate_* methods
+
+class SqlQueryPricingCalculator(PricingCalculator):
+    """Drop-in replacement for OrderService's internal pricing methods."""
+    
+    def calculate(self, items, shipping_method, discount_code, tax_jurisdiction):
+        subtotal = sum(self._unit_price(item["sku"]) * item["qty"] for item in items)
+        discount = self._apply_discount(discount_code, subtotal)
+        shipping = self._shipping_cost(shipping_method)
+        taxable = subtotal - discount
+        tax = self._tax(tax_jurisdiction, taxable)
+        return PriceBreakdown(...)
+    
+    def _unit_price(self, sku: str) -> int:
+        # Uses a PRICING_CATALOG dict or database lookup (whatever OrderService currently uses)
+        ...
+    
+    def _apply_discount(self, code: str | None, subtotal: int) -> int:
+        # Discount rules extracted from _calculate_discount
+        ...
+```
+
+Replace the call site in OrderService:
+
+```python
+# In OrderService._build_order_data() or wherever totals are computed:
+
+# BEFORE:
+subtotal = self._calculate_subtotal(validated_items)
+discount = self._apply_discount(payload.get("discount_code"), subtotal)
+shipping = self._calculate_shipping(payload["shipping_method"], weight)
+tax = self._calculate_tax(jurisdiction, subtotal - discount)
+totals = self._compute_totals(subtotal, discount, shipping, tax)
+
+# AFTER:
+breakdown = self._pricing.calculate(
+    validated_items,
+    payload["shipping_method"],
+    payload.get("discount_code"),
+    jurisdiction,
+)
+```
+
+Verify golden master: `result.total_cents` and all financial fields must be bitwise-identical.
+
+> **Commit message**: `refactor(pricing): extract PricingCalculator from OrderService inline methods`
+
+#### Step 4: Extract Notification Delivery
+
+**Goal**: Move email-sending logic into template-driven Mailer impl.
+
+This is usually simpler than pricing because the patterns repeat:
+
+```python
+# OrderService currently does:
+#   1. Render HTML string (concatenation or Jinja)
+#   2. Call self._mailer.send(to, subject, body_html)
+
+# After extraction:
+#   self._mailer.send_order_confirmation(email, order)
+#   self._mailer.send_order_update(email, order, new_status, reason)
+#   self._mailer.send_order_cancelled(email, order, reason)
+```
+
+Replace each `_mailer.send()` call with the appropriate typed method. The underlying transport (SendGrid, Mandrill) doesn't change — just the contract.
+
+Verify email hashes in golden master match exactly.
+
+> **Commit message**: `refactor(notifications): extract typed email methods from OrderService`
+
+#### Step 5: Extract Auditor
+
+**Goal**: Same as notifications — replace raw audit writes with `Auditor.log()` calls.
+
+Trivial mechanical change. Verify audit fingerprint counts match.
+
+> **Commit message**: `refactor(auditing): wrap audit writes behind Auditor interface`
+
+#### Step 6: Extract Validators
+
+**Goal**: Move validation logic into `OrderValidator`.
+
+Find all the `if qty <= 0:`, `if len(items) > 50:`, `if status not in allowed:` blocks in OrderService. Move them to `OrderValidator.validate_create()`, etc.
+
+> **Commit message**: `refactor(validation): extract validation rules behind OrderValidator interface`
+
+#### Step 7: Thin the Orchestrator
+
+**Goal**: OrderService is now ~200 lines of orchestrator code that delegates to collaborators.
+
+At this point, OrderService looks like:
+
+```python
+class OrderService:
+    def __init__(self, repo, mailer, auditor, pricing):
+        self._repo = repo
+        self._mailer = mailer
+        self._auditor = auditor
+        self._pricing = pricing
+        self._validator = OrderValidator()
+    
+    def create_order(self, payload):
+        errors = self._validator.validate_create(payload)
+        if errors:
+            raise ValidationError(errors)
+        
+        validated_items = self._validate_sku_existance(payload["line_items"])
+        breakdown = self._pricing.calculate(...)
+        order = OrderFactory.build(payload, validated_items, breakdown)
+        oid = self._repo.save_order(order)
+        self._mailer.send_order_confirmation(payload["customer_email"], order)
+        self._auditor.log("ORDER_CREATED", "order", oid, "info", ...)
+        return self._repo.get_order(oid)
+    
+    # ... create_order, apply_payment, cancel_order, update_status
+    # Each is now 15-30 lines of delegation + orchestration.
+```
+
+**Delete the private methods** that were moved to collaborators. OrderService has no calculation logic left — it purely wires things together.
+
+> **Commit message**: `refactor(order): thin OrderService to orchestrator, delete migrated methods`
+
+#### Step 8: Delete the God Class (Strangler Complete)
+
+If there are remaining fragments of old logic that didn't fit cleanly, move them. Then:
+
+- Rename `OrderService` to `LegacyOrderService` (optional, for gradual rollout).
+- Or mark the old class as `@deprecated` and redirect all callers to the new composition.
+- Remove any remaining direct SQL from the file.
+
+> **Commit message**: `chore(order): remove legacy code, OrderService is now a clean orchestrator`
+
+---
+
+### Phase 4 — Proving Behavior Preservation at Every Commit
+
+This is the non-negotiable discipline. At **every single commit** that modifies OrderService or its collaborators:
+
+#### 4a. Golden Master Suite Must Pass
+
+```bash
+# Run ALL golden snapshots — not just affected ones
+pytest tests/golden_master/ -v --tb=short
+
+# Failures mean behavior regressed. Roll back the commit.
+```
+
+Why **all**, not just affected? Because subtle cross-cutting bugs exist — a change to `_apply_discount` affects both `create_order` and `cancel_order` refund amounts. Only full-suite regression catches this.
+
+#### 4b. Side-Effect Comparison Checklist
+
+For each commit, verify three dimensions:
+
+| Dimension | What it proves | How checked |
+|---|---|---|
+| **Result fidelity** | Computation is correct | `snapshot["result"] == expected["result"]` asserts in golden tests |
+| **SQL fingerprint stability** | Same queries, same params, same count | Effects array equality check |
+| **Email/content parity** | Same recipients, subjects, body structure | Hash comparison on effects |
+| **Audit trail integrity** | Same actions logged, same entities touched | Audit entry count + action/hash matching |
+
+#### 4c. Integration Checkpoints
+
+Run these gates **before merging** any strangler step:
+
+```bash
+# 1. Unit tests (once they exist alongside characterization tests)
+pytest tests/unit/ -v
+
+# 2. Golden master (behavior preservation — always required)
+pytest tests/golden_master/ -v
+
+# 3. Diff sanity checks
+git diff --stat | grep -q "\.py$"  # ensure only expected files changed
+grep -rn "_db_connection\.execute" src/order/order_service.py  # should be empty after Step 2
+```
+
+#### 4d. Database Schema Guarantee
+
+Never alter the schema during refactoring. The SQL in `SqlQueryOrderRepository` is a 1:1 mirror of what OrderService already executes. Schema changes belong in a separate migration ticket, verified by integration tests that spin up the real database.
+
+> **Rule**: Golden master protects *business behavior*, not schema. If the schema changes, that's a feature ticket — not part of a purity refactor.
+
+#### 4e. Coverage Floor
+
+After the characterization suite gathers all paths, measure:
+
+```bash
+coverage run -m pytest tests/golden_master/
+coverage report --show-missing
+```
+
+Every method exercised by the golden master is confirmed covered. If the suite hits 95%+ of OrderService's branches before refactoring starts, post-refactor coverage should not drop below that floor.
+
+---
+
+### Execution Summary
+
+| Order | What | Why First | Risk Level |
+|---|---|---|---|
+| 0 | Characterization tests + gather baseline | Locks behavior before touching code | Medium (requires building the interceptor) |
+| 1 | Constructor injection | Enables all future swaps; no logic change | Low |
+| 2 | Repository abstraction | Highest coupling point; replaces raw SQL everywhere | Low-Medium |
+| 3 | Pricing calculator | Largest isolated logic block (~400 LOC) | Low (pure math) |
+| 4 | Mailer types | Pure delegation; no branching logic | Low |
+| 5 | Auditor | Trivial copy; same pattern as mailer | Low |
+| 6 | Validators | Straightforward guard conditions | Low |
+| 7 | Delete dead methods | Cleanup after all migrations prove safe | Low |
+| 8 | Final verification + schema cleanup | Confirm zero SQL remains in OrderService | Low |
+
+**Total strategic risk**: minimal, provided golden master gate is never skipped. The public API never changes, the database schema never changes, and every commit is self-validating. You can ship Step 2 even if Steps 3-8 haven't started — each step is independently verifiable and independently reversible.

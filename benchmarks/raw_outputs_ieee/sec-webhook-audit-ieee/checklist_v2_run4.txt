@@ -1,0 +1,492 @@
+[exit=0 latency=30.95s]
+# Security Review: FastAPI Payment Webhook
+
+## Vulnerabilities (Ordered by Severity)
+
+### 1. HIGH — Signature Verified After Body Parsing
+Checking HMAC *after* deserializing JSON means you process untrusted payload data before confirming authenticity. This opens two vectors:
+- **CPU/memory DoS**: An attacker floods your server with gigabytes of bogus payloads per second, forcing expensive JSON parsing and validation for every one.
+- **Type confusion / parser exploits**: Malformed bytes can crash Python's `json` module or trigger billion-laughs-style expansion in certain parsers.
+
+**Fix:** Compute and verify the HMAC against the *raw request body bytes* *before* calling `await request.json()`. Reject early if the MAC doesn't match.
+
+### 2. CRITICAL — In-Memory Replay-ID Dict
+An in-memory `dict` used as the replay-event ledger has three fatal flaws:
+- **Lost across worker processes** — with multiple uvicorn workers, Worker B never sees IDs stored by Worker A, so duplicate events slip through on one worker while another rejects them.
+- **Lost on restart** — a deploy, crash, or OOM kill wipes the entire ledger, creating a replay window.
+- **Unbounded memory growth** — the dict grows monotonically until eviction kicks in. No TTL, no cap, no cleanup.
+
+**Fix:** Use a persistent table (`webhook_events`) with a periodic cleanup task. Accept either a DB-level UNIQUE constraint or SELECT…FOR UPDATE to enforce idempotency.
+
+### 3. CRITICAL — No Idempotency Under Concurrency
+If the same webhook fires twice simultaneously and both arrive before either finishes, two independent request handlers could both pass validation, check the ID (still not yet committed), and execute the payment handler twice. That's a double-payout.
+
+**Fix:** Acquire a row lock on the event record *before* running the handler, ensuring only one coroutine proceeds past the INSERT/SELECT gate.
+
+### 4. MEDIUM — Secret Rotation Has No Transition Period
+If "rotating" means overwriting the active secret atomically, you'll reject legitimate post-broadcast deliveries from the processor, which may be delayed in transit.
+
+**Fix:** Maintain a secrets list ordered by expiry, validate against the latest, but *verify* against all non-expired entries. Only promote new entries.
+
+### 5. MEDIUM — Error Leaking
+Processor errors or stack traces sent back in HTTP responses let an attacker fingerprint your internals and debug infrastructure.
+
+**Fix:** Catch all exceptions, log internally, return `500 {"error": "Processing failed"}` with no details.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+payment_webhook.py — Secure FastAPI payment webhook endpoint.
+
+Security controls:
+  • HMAC-SHA256 verified against raw body BEFORE parsing
+  • Rotating secret support (verify against all active keys)
+  • Persistent replay/event-id ledger with row-level locking
+  • Idempotent processing (only one execution per event_id)
+  • Safe error handling (no internal details leaked)
+"""
+
+import hashlib
+import hmac
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Optional
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+import psycopg2
+from psycopg2 import extras
+from psycopg2.pool import SimpleConnectionPool
+from contextlib import contextmanager
+from functools import wraps
+
+# ---------------------------------------------------------------------------
+# Configuration — all from env, never hardcoded
+# ---------------------------------------------------------------------------
+DATABASE_URL: str = _env_or_die("DATABASE_URL")
+WEBHOOK_SECRET_KEY: str = _env_or_die("WEBHOOK_SECRET_KEY")
+WEBHOOK_SIGNATURE_HEADER: str = _env_or_die(
+    "WEBHOOK_SIGNATURE_HEADER", default="X-Webhook-Signature"
+)
+SIGNATURE_TOLERANCE_SECONDS: int = int(
+    _env_or_die("SIGNATURE_TOLERANCE_SECONDS", default="300")
+)  # 5 min clock skew
+MAX_EVENTS_IN_LEDGER: int = int(
+    _env_or_die("MAX_EVENTS_IN_LEDGER", default="1_000_000")
+)
+PROCESSOR_NAME: str = _env_or_die("PAYMENT_PROCESSOR_NAME", default="acme-pay")
+
+logger = logging.getLogger(__name__)
+
+
+def _env_or_die(key: str, default: Optional[str] = None) -> str:
+    """Return env value or raise — prevents silent fallback."""
+    val = _env(key, default=default)
+    if val is None:
+        raise RuntimeError(f"Required environment variable {key!r} is not set")
+    return val
+
+
+def _env(key: str, default: Optional[str] = None) -> Optional[str]:
+    import os
+    return os.environ.get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# Database connection pool
+# ---------------------------------------------------------------------------
+_db_pool: Optional[SimpleConnectionPool] = None
+
+
+def get_db():
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL,
+            connect_timeout=5,
+        )
+    return _db_pool
+
+
+@contextmanager
+def db_transaction():
+    """Yield a cursor inside an explicit transaction with autocommit off."""
+    pool = get_db()
+    conn = pool.getconn()
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.exception("rollback failed")
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Signature helpers
+# ---------------------------------------------------------------------------
+
+def _hmac_sha256(raw_body: bytes, secret: str) -> str:
+    """Return hex-encoded HMAC-SHA256."""
+    return hmac.new(
+        secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+
+
+class SecretVersion(BaseModel):
+    """One entry in the secret rotation roster."""
+    id: str
+    secret: str
+    expires_at: datetime
+
+    def is_active(self) -> bool:
+        return self.expires_at > datetime.now(timezone.utc)
+
+
+def _load_active_secrets() -> list[SecretVersion]:
+    """
+    Load secret versions ordered newest-first.
+    In production this typically queries a secrets manager (AWS SM, GCP Secret Manager).
+    For this example we treat WEBHOOK_SECRET_KEY as the current primary and allow
+    a secondary via WEBHOOK_SECRET_KEY_BACKUP.
+    """
+    now = datetime.now(timezone.utc)
+    primary = SecretVersion(
+        id="current",
+        secret=WEBHOOK_SECRET_KEY,
+        expires_at=now + timedelta(days=90),
+    )
+    backup_secret = _env("WEBHOOK_SECRET_KEY_BACKUP")
+    if backup_secret:
+        return [primary, SecretVersion(
+            id="backup",
+            secret=backup_secret,
+            expires_at=now + timedelta(days=90),
+        )]
+    return [primary]
+
+
+def verify_hmac_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Verify HMAC-SHA256 against ALL active secrets.
+    Returns True on first match — verifies against every candidate for
+    constant-time behavior (avoids leaking which key matched).
+    """
+    expected_digests = [_hmac_sha256(raw_body, s.secret) for s in _load_active_secrets()]
+    # hmac.compare_digest is constant-time; we OR results outside it.
+    return any(hmac.compare_digest(signature, d) for d in expected_digests)
+
+
+# ---------------------------------------------------------------------------
+# Event ledger (persistent, with idempotency guarantee)
+# ---------------------------------------------------------------------------
+
+_LEDGER_DDL = """\
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id      TEXT PRIMARY KEY,
+    source        TEXT   NOT NULL DEFAULT %(processor)s,
+    status        TEXT   NOT NULL DEFAULT 'pending',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at  TIMESTAMPTZ
+);
+
+-- Background cleanup index (covers expired rows efficiently)
+CREATE INDEX IF NOT EXISTS idx_webhook_events_created_at
+    ON webhook_events (created_at DESC);
+"""
+
+
+def ensure_ledger_schema():
+    """Create the ledger table if it does not exist. Call once at startup."""
+    with db_transaction() as cur:
+        cur.execute(_LEDGER_DDL, {"processor": PROCESSOR_NAME})
+
+
+def claim_event_id(event_id: str) -> tuple[bool, str]:
+    """
+    Try to insert a new event_id into the ledger.
+
+    Returns:
+        (True,  "accepted") — first arrival, proceed with processing
+        (False, "duplicate") — already seen, skip processing
+    """
+    try:
+        with db_transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO webhook_events (event_id, source, status)
+                VALUES (%s, %s, 'pending')
+                """,
+                (event_id, PROCESSOR_NAME),
+            )
+            return True, "accepted"
+    except psycopg2.errors.UniqueViolation:
+        return False, "duplicate"
+
+
+def update_event_status(event_id: str, status: str, processed_at: Optional[datetime] = None):
+    """Mark an event as completed/failed so subsequent checks see it."""
+    with db_transaction() as cur:
+        cur.execute(
+            """
+            UPDATE webhook_events
+               SET status = %s, processed_at = COALESCE(%s, processed_at)
+             WHERE event_id = %s
+            """,
+            (status, processed_at, event_id),
+        )
+
+
+def purge_old_events(before: datetime):
+    """Delete ledger entries older than *before*. Called by a periodic task."""
+    with db_transaction() as cur:
+        cur.execute(
+            "DELETE FROM webhook_events WHERE created_at < %s",
+            (before,),
+        )
+        deleted = cur.rowcount
+    logger.info("Purged %d old webhook_event records", deleted)
+
+
+# ---------------------------------------------------------------------------
+# Cleanup background task
+# ---------------------------------------------------------------------------
+
+_purge_interval = int(_env("EVENT_PURGE_INTERVAL_SECS", default="3600"))  # hourly
+
+
+def _get_retention_window() -> timedelta:
+    """How long to keep event IDs in the ledger. 1 hour is generous enough."""
+    return timedelta(hours=int(_env("EVENT_RETENTION_HOURS", default="1")))
+
+
+async def scheduled_cleanup():
+    """Background task: purge events older than retention window."""
+    while True:
+        try:
+            purge_old_events(datetime.now(timezone.utc) - _get_retention_window())
+        except Exception:
+            logger.exception("cleanup purge failed")
+        await asyncio.sleep(_purge_interval)
+
+
+import asyncio
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models for validated input
+# ---------------------------------------------------------------------------
+
+class PaymentEventData(BaseModel):
+    """Minimal schema for the webhook payload — validated *after* auth."""
+    event_id: str = Field(..., min_length=1, max_length=128)
+    amount: Decimal = Field(..., gt=Decimal("0.00"))
+    currency: str = Field(..., pattern=r"^[A-Z]{3}$", min_length=3, max_length=3)
+    customer_id: str = Field(..., min_length=1, max_length=128)
+    metadata: dict = Field(default_factory=dict)
+
+    @field_validator("customer_id")
+    @classmethod
+    def _strip_whitespace(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("customer_id must not be blank")
+        return stripped
+
+
+# ---------------------------------------------------------------------------
+# Safe error handling
+# ---------------------------------------------------------------------------
+
+class _InternalError(Exception):
+    """Marker exception so our outer handler knows it came from the processor."""
+    pass
+
+
+def safe_processor(fn):
+    """Catch everything inside the business handler and re-raise as InternalError."""
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except _InternalError:
+            raise
+        except Exception as exc:
+            logger.exception("payment processor raised: %s", exc)
+            raise _InternalError(str(exc))
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Business handler (idempotent — called once per event_id)
+# ---------------------------------------------------------------------------
+
+@safe_processor
+async def process_payment(event: PaymentEventData) -> None:
+    """
+    Apply the payment for *one* accepted event_id.
+
+    Because claim_event_id holds the DB UNIQUE constraint, concurrent
+    callers are serialized by the Postgres lock — only one wins and
+    reaches this function.
+    """
+    # Simulate real work (DB write, payout, etc.)
+    logger.info(
+        "Processing payment: event=%s customer=%s amount=%s %s",
+        event.event_id, event.customer_id, event.amount, event.currency,
+    )
+    # ... actual payout logic goes here ...
+
+    update_event_status(event.event_id, "completed")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app & endpoint
+# ---------------------------------------------------------------------------
+app = FastAPI(title=f"{PROCESSOR_NAME} Webhook", version="1.0.0")
+
+
+@app.on_event("startup")
+def _startup():
+    ensure_ledger_schema()
+    asyncio.create_task(scheduled_cleanup())
+
+
+@app.post("/webhook")
+async def webhook_endpoint(request: Request):
+    # ---- Step 1: Read RAW body FIRST ----------------------------------------
+    raw_body: bytes = await request.body()
+    if len(raw_body) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Empty request body"},
+        )
+
+    # ---- Step 2: Verify HMAC BEFORE any JSON parsing -------------------------
+    signature = request.headers.get(WEBHOOK_SIGNATURE_HEADER)
+    if not signature:
+        logger.warning("missing signature header from %s", request.client.host)
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Missing signature"},
+        )
+
+    # Also check timestamp header to limit replay window
+    timestamp_header = request.headers.get("X-Webhook-Timestamp")
+    if timestamp_header:
+        try:
+            ts = float(timestamp_header)
+        except ValueError:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid timestamp"},
+            )
+        if abs(time.time() - ts) > SIGNATURE_TOLERANCE_SECONDS:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Timestamp outside tolerance window"},
+            )
+
+    if not verify_hmac_signature(raw_body, signature):
+        logger.warning(
+            "HMAC mismatch from %s (signature=%s..)",
+            request.client.host,
+            signature[:32],
+        )
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Invalid signature"},
+        )
+
+    # ---- Step 3: Parse & validate JSON ONLY AFTER auth succeeded -------------
+    try:
+        payload = raw_body  # we already have it
+        data = json.loads(payload)  # type: ignore[name-defined]
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.warning("bad JSON body from %s: %s", request.client.host, exc)
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Malformed request body"},
+        )
+
+    try:
+        event_data = PaymentEventData(**data)
+    except Exception as exc:
+        logger.warning("payload validation failed: %s", exc)
+        # Never expose Pydantic field names or regexes back to the caller
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Request validation failed"},
+        )
+
+    # ---- Step 4: Claim the event_id (idempotency gate) -----------------------
+    accepted, reason = claim_event_id(event_data.event_id)
+    if not accepted:
+        logger.info("replayed/skipped event=%s", event_data.event_id)
+        return JSONResponse(
+            status_code=200,  # 200 OK — processor expects success signal
+            content={"status": "already_processed"},
+        )
+
+    # ---- Step 5: Process -----------------------------------------------------
+    try:
+        await process_payment(event_data)
+        return JSONResponse(status_code=200, content={"status": "processed"})
+    except _InternalError:
+        # Log went out above; don't leak anything back.
+        logger.error("internal processing failure for event=%s", event_data.event_id)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Processing failed"},
+        )
+    except Exception:
+        logger.exception("unexpected error handling webhook event=%s", event_data.event_id)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Processing failed"},
+        )
+```
+
+---
+
+## SQL Migration (run once)
+
+```sql
+-- migrations/001_create_webhook_events.sql
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id      TEXT PRIMARY KEY,
+    source        TEXT   NOT NULL DEFAULT 'acme-pay',
+    status        TEXT   NOT NULL DEFAULT 'pending',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at  TIMESTAMPTZ
+);
+
+CREATE INDEX idx_webhook_events_created_at
+    ON webhook_events (created_at DESC);
+```
+
+---
+
+## Summary of Fixes
+
+| # | Vulnerability | Fix |
+|---|---|---|
+| 1 | HMAC verified after JSON parse | Signature computed against `request.body()` bytes *before* `json.loads()` |
+| 2 | In-memory replay dict lost across workers/restarts | Persistent PostgreSQL table with `PRIMARY KEY` uniqueness constraint |
+| 3 | Concurrent duplicate webhooks cause double-processing | INSERT races serialize at the DB level — only one succeeds, others get `200 OK` silently |
+| 4 | Secret overwrite breaks deliveries during rotation | Multi-key HMAC verification against all non-expired secrets |
+| 5 | Processor errors leak to client | `_safe_processor` wrapper catches all exceptions, returns generic `{"error": "Processing failed"}` |

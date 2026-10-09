@@ -1,0 +1,397 @@
+## Security Review: FastAPI Payment Webhook
+
+### Vulnerabilities (Ordered by Severity)
+
+| # | Severity | Vulnerability | Impact |
+|---|----------|---------------|--------|
+| 1 | **CRITICAL** | Signature verified AFTER JSON parsing | Unauthenticated payload processing enables DoS, parser exploits, resource exhaustion |
+| 2 | **CRITICAL** | In-memory dict for replay-ids | Fails across workers/restarts; race conditions allow duplicate processing |
+| 3 | **HIGH** | Non-constant-time signature comparison | Timing side-channel leaks expected HMAC byte-by-byte |
+| 4 | **HIGH** | No idempotency guard (check-then-act race) | Concurrent duplicates both pass check before insert |
+| 5 | **HIGH** | Processor errors exposed to clients | Stack traces, internal paths, DB details leaked |
+| 6 | **MEDIUM** | No timestamp validation | Stale events replayable indefinitely |
+| 7 | **MEDIUM** | Single static secret | Rotation causes downtime/failed requests |
+| 8 | **MEDIUM** | Missing Content-Type enforcement | Parser confusion, deserialization attacks |
+| 9 | **LOW** | No rate limiting | Brute-force surface on signature |
+
+---
+
+### Corrected Implementation
+
+```python
+"""
+production_webhook.py
+
+Payment webhook endpoint with defense-in-depth security:
+- Signature verification BEFORE body parsing (raw bytes)
+- Constant-time HMAC comparison
+- Persistent replay-id ledger with atomic insert
+- Idempotency under concurrency (DB UNIQUE constraint)
+- Secret rotation support (multiple valid secrets)
+- Timestamp freshness validation
+- Sanitized error responses (no internals leaked)
+- Structured logging (no secrets/PII)
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import FastAPI, Request, Response, HTTPException, status, Depends
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import (
+    Column, String, DateTime, Boolean, create_engine, text, UniqueConstraint
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+# ---------------------------------------------------------------------------
+# Configuration (all secrets from env — never hardcoded)
+# ---------------------------------------------------------------------------
+WEBHOOK_SECRETS = [
+    s for s in os.environ.get("WEBHOOK_SECRETS", "").split(",") if s
+]
+if not WEBHOOK_SECRETS:
+    raise RuntimeError("WEBHOOK_SECRETS environment variable required")
+
+WEBHOOK_TTL_SECONDS = int(os.environ.get("WEBHOOK_TTL_SECONDS", "300"))
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "1048576"))  # 1 MB
+ALLOWED_CONTENT_TYPE = "application/json"
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./webhooks.db")
+
+# ---------------------------------------------------------------------------
+# Logging (redact secrets + PII)
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("webhook")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ---------------------------------------------------------------------------
+# Database (persistent, ACID-compliant replay ledger)
+# ---------------------------------------------------------------------------
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+class ProcessedEvent(Base):
+    """Idempotency ledger — one row per unique event_id.
+    
+    The UNIQUE constraint on event_id makes concurrent duplicate
+    detection atomic at the database level, eliminating the
+    check-then-act race condition entirely.
+    """
+    __tablename__ = "processed_events"
+    
+    event_id = Column(String(64), primary_key=True)
+    processed_at = Column(DateTime(timezone=True), nullable=False)
+    success = Column(Boolean, nullable=False)
+    
+    __table_args__ = (
+        UniqueConstraint("event_id", name="uq_event_id"),
+    )
+
+
+Base.metadata.create_all(engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models (strict validation at boundary)
+# ---------------------------------------------------------------------------
+class PaymentEvent(BaseModel):
+    event_id: str = Field(..., min_length=1, max_length=64)
+    event_type: str = Field(..., pattern="^(payment\\.success|payment\\.failed|payment\\.refunded)$")
+    amount: int = Field(..., gt=0, le=10_000_000_000)  # >0, <10B cents
+    currency: str = Field(..., pattern="^[A-Z]{3}$")
+    customer_id: str = Field(..., min_length=1, max_length=64)
+    timestamp: datetime
+
+
+class WebhookResponse(BaseModel):
+    status: str
+    event_id: str
+
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+def _verify_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Constant-time HMAC verification against rotating secrets.
+    
+    Attempts verification against each valid secret so rotation
+    does not cause failed requests. hmac.compare_digest prevents
+    timing side-channel attacks.
+    """
+    if not signature_header:
+        return False
+    
+    for secret in WEBHOOK_SECRETS:
+        expected = hmac.new(
+            secret.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if hmac.compare_digest(expected, signature_header):
+            return True
+    return False
+
+
+def _validate_timestamp(event_time: datetime) -> bool:
+    """Reject events outside the allowed time window to prevent
+    indefinite replay of captured payloads."""
+    if event_time.tzinfo is None:
+        # Require timezone-aware timestamps; reject naive datetimes
+        return False
+    now = datetime.now(timezone.utc)
+    delta = abs((now - event_time).total_seconds())
+    return delta <= WEBHOOK_TTL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Error handler (never leak internals)
+# ---------------------------------------------------------------------------
+async def _error_response(
+    request: Request,
+    status_code: int,
+    public_message: str,
+    log_message: str,
+) -> JSONResponse:
+    """Log the detailed error internally, return generic message to client."""
+    logger.warning(
+        "webhook_error method=%s path=%s status=%d detail=%s",
+        request.method, request.url.path, status_code, log_message,
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "error", "message": public_message},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Payment Webhook", docs_url=None, redoc_url=None)
+
+
+@app.post("/webhooks/payment", response_model=WebhookResponse)
+async def payment_webhook(request: Request, db: Session = Depends(get_db)):
+    """Process payment webhook with full security controls.
+    
+    Security order:
+    1. Enforce Content-Type (reject before reading body)
+    2. Read raw bytes (no parsing yet — unauthenticated)
+    3. Verify HMAC signature on raw bytes
+    4. Enforce body size limit
+    5. Parse JSON (now authenticated)
+    6. Validate timestamp freshness
+    7. Atomic idempotency insert (UNIQUE constraint)
+    8. Process event
+    """
+    
+    # --- 1. Content-Type enforcement ---
+    content_type = request.headers.get("content-type", "").split(";")[0].strip()
+    if content_type != ALLOWED_CONTENT_TYPE:
+        return await _error_response(
+            request, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            public_message="Unsupported media type",
+            log_message=f"invalid_content_type={content_type}",
+        )
+    
+    # --- 2. Read raw body (unauthenticated boundary) ---
+    raw_body = await request.body()
+    if len(raw_body) > MAX_BODY_BYTES:
+        return await _error_response(
+            request, status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            public_message="Payload too large",
+            log_message=f"body_size={len(raw_body)}",
+        )
+    
+    # --- 3. Signature verification (BEFORE parsing) ---
+    signature = request.headers.get("x-webhook-signature", "")
+    if not _verify_signature(raw_body, signature):
+        return await _error_response(
+            request, status.HTTP_401_UNAUTHORIZED,
+            public_message="Invalid signature",
+            log_message="signature_mismatch",
+        )
+    
+    # --- 4. Parse + validate JSON (now authenticated) ---
+    try:
+        payload = PaymentEvent.model_validate_json(raw_body)
+    except ValidationError as e:
+        return await _error_response(
+            request, status.HTTP_422_UNPROCESSABLE_ENTITY,
+            public_message="Invalid payload",
+            log_message=f="validation_error={e.error_count()}"
+        )
+    
+    # --- 5. Timestamp freshness ---
+    if not _validate_timestamp(payload.timestamp):
+        return await _error_response(
+            request, status.HTTP_400_BAD_REQUEST,
+            public_message="Event timestamp outside valid window",
+            log_message=f"stale_event_id={payload.event_id}",
+        )
+    
+    # --- 6. Atomic idempotency insert ---
+    # The UNIQUE constraint makes this an atomic check-and-set.
+    # Concurrent duplicates: one INSERT succeeds, the other gets IntegrityError.
+    try:
+        db.add(ProcessedEvent(
+            event_id=payload.event_id,
+            processed_at=datetime.now(timezone.utc),
+            success=False,  # optimistic; updated after processing
+        ))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            # Idempotent response — event already processed
+            logger.info("duplicate_suppressed event_id=%s", payload.event_id)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"status": "ok", "event_id": payload.event_id},
+            )
+        logger.error("db_error error=%s", str(e))
+        return await _error_response(
+            request, status.HTTP_500_INTERNAL_SERVER_ERROR,
+            public_message="Internal error",
+            log_message="database_error",
+        )
+    
+    # --- 7. Process event ---
+    try:
+        _process_payment_event(payload)
+        
+        # Mark as successfully processed
+        db.query(ProcessedEvent).filter_by(event_id=payload.event_id).update(
+            {"success": True}
+        )
+        db.commit()
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            "processing_error event_id=%s event_type=%s error=%s",
+            payload.event_id, payload.event_type, str(e),
+            exc_info=True,  # full traceback in server logs only
+        )
+        # Generic response — no internal details exposed
+        return await _error_response(
+            request, status.HTTP_500_INTERNAL_SERVER_ERROR,
+            public_message="Processing failed",
+            log_message=f"event_id={payload.event_id}",
+        )
+    
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "ok", "event_id": payload.event_id},
+    )
+
+
+def _process_payment_event(event: PaymentEvent) -> None:
+    """Route event to handler. Never raises — all errors are caught
+    by the endpoint and sanitized before reaching the client."""
+    handlers = {
+        "payment.success": _handle_payment_success,
+        "payment.failed": _handle_payment_failed,
+        "payment.refunded": _handle_payment_refunded,
+    }
+    handler = handlers.get(event.event_type)
+    if handler is None:
+        raise ValueError(f"Unknown event type: {event.event_type}")
+    handler(event)
+
+
+def _handle_payment_success(event: PaymentEvent) -> None:
+    logger.info("payment_success event_id=%s amount=%d currency=%s",
+                event.event_id, event.amount, event.currency)
+    # Business logic here
+
+
+def _handle_payment_failed(event: PaymentEvent) -> None:
+    logger.info("payment_failed event_id=%s amount=%d",
+                event.event_id, event.amount)
+    # Business logic here
+
+
+def _handle_payment_refunded(event: PaymentEvent) -> None:
+    logger.info("payment_refunded event_id=%s amount=%d",
+                event.event_id, event.amount)
+    # Business logic here
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'none'"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+```
+
+---
+
+### Key Security Controls Explained
+
+| Control | Implementation | Why It Matters |
+|---------|----------------|----------------|
+| **Raw-body signature verification** | `request.body()` before `model_validate_json()` | Prevents unauthenticated JSON parsing (DoS, parser exploits) |
+| **Constant-time comparison** | `hmac.compare_digest()` | Prevents timing side-channel that leaks expected signature |
+| **Atomic idempotency** | DB `UNIQUE` constraint on `event_id` | Eliminates check-then-act race; survives restarts/workers |
+| **Secret rotation** | `WEBHOOK_SECRETS` as comma-separated list | Multiple secrets valid during rotation window |
+| **Timestamp freshness** | `_validate_timestamp()` with configurable TTL | Bounds replay window; rejects stale captured payloads |
+| **Size limit** | `MAX_BODY_BYTES` check on raw body | Prevents memory exhaustion before parsing |
+| **Error sanitization** | `_error_response()` logs detail, returns generic | Internal paths/stack traces never reach client |
+| **Content-Type enforcement** | Explicit check before body read | Prevents parser confusion / deserialization attacks |
+| **Pydantic strict validation** | Regex patterns, length bounds, value ranges | Rejects malformed input at boundary |
+| **Security headers** | Middleware adds CSP, X-Frame-Options, etc. | Defense-in-depth against browser-based attacks |
+
+### Environment Configuration
+
+```bash
+# .env (NEVER commit — add to .gitignore)
+WEBHOOK_SECRETS=current_secret_here,previous_secret_during_rotation
+WEBHOOK_TTL_SECONDS=300
+MAX_BODY_BYTES=1048576
+DATABASE_URL=postgresql://user:pass@host/webhooks
+```
+
+### Database Migration (if using Alembic)
+
+```python
+"""create processed_events table
+
+Revision ID: 001
+"""
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade():
+    op.create_table(
+        "processed_events",
+        sa.Column("event_id", sa.String(64), primary_key=True),
+        sa.Column("processed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("success", sa.Boolean, nullable=False),
+    )
+    # UniqueConstraint already enforced by primary_key, but if using
+    # a surrogate key, add: op.create_unique_constraint(...)
+
+def downgrade():
+    op.drop_table("processed_events")
+```
+
+The original implementation had two critical flaws that would fail in any production deployment: signature-after-parse opens the door to unauthenticated parser exploitation, and the in-memory dict provides zero durability and zero cross-worker consistency. The corrected version addresses both with raw-body auth and an ACID-compliant database ledger, while also closing the timing side-channel, supporting secret rotation, and ensuring no internal details leak to callers.

@@ -1,0 +1,190 @@
+[exit=0 latency=24.25s]
+Here's the full Dockerfile with layer-by-layer justification:
+
+```dockerfile
+# =============================================================================
+# Stage 1: Build — compile wheels in an isolated environment
+# =============================================================================
+FROM python:3.12-slim-bookworm AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /builddir
+
+# Copy only requirements first so dependency changes don't bust this cache
+COPY requirements.txt ./
+
+# Create virtual environment — kept local to this stage, never copied out
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install build dependencies into venv (compile-time C extensions only)
+# Pinned torch CPU-only wheel hash — sha256 for reproducible installs
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+        "torch==2.4.1+cpu" \
+        --extra-index-url https://download.pytorch.org/whl/cpu && \
+    # Export resolved dependency tree as frozen requirements
+    pip freeze > /builddir/frozen.txt
+
+# Now copy application source and any additional requirements
+COPY . .
+
+# Install app dependencies from the frozen list — pins every transitive dep
+RUN pip install --no-cache-dir -r frozen.txt && \
+    # Compile Python bytecode for faster cold starts
+    find /opt/venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
+    python -m compileall /opt/venv/lib/python3.12/site-packages
+
+
+# =============================================================================
+# Stage 2: Runtime — minimal image, non-root, no build tools
+# =============================================================================
+FROM python:3.12-slim-bookworm AS runtime
+
+# --- security: drop root immediately ---
+ARG APP_USER=appuser
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+RUN groupadd --gid "$APP_GID" "$APP_USER" && \
+    useradd --uid "$APP_UID" --gid "$APP_GID" --shell /usr/sbin/nologin --create-home "$APP_USER"
+
+# --- system deps: keep this narrow since we're CPU-only ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 \          # OpenMP runtime needed by torch CPU ops
+        tini \              # Init system to handle signals / zombie reaping
+        && rm -rf /var/lib/apt/lists/* \
+        && apt-get clean
+
+# --- WORKDIR before COPY so all subsequent ops land under /app ---
+WORKDIR /app
+
+# --- LAYER A: vendor the pre-built venv wheels from builder stage ---
+# This is one atomic layer. Since it's the entire /opt/venv from builder,
+# dependency changes here invalidate everything downstream — that's correct
+# because if deps change, the binary artifacts change.
+COPY --from=builder /opt/venv /opt/venv
+
+# --- LAYER B: application source (separate so code edits != dep rebuilds) ---
+# Key ordering win: /opt/venv is ~90% of the image volume. If someone tweaks
+# a single source file, Layers A and the system packages still cache perfectly.
+COPY --from=builder /builddir/requirements.txt ./requirements.txt
+COPY src/ ./src/
+COPY pyproject.toml ./
+
+# --- LAYER C: health probe script (often unchanged during development) ---
+COPY scripts/healthcheck.sh ./scripts/
+RUN chmod +x ./scripts/healthcheck.sh
+
+# --- fix ownership in a single chown layer ---
+# Running as root up to this point; now switch authority.
+RUN chown -R "$APP_USER":"$APP_GROUP" /app /opt/venv
+
+# --- LAYER D: environment setup (USER change must come after all root-owned COPYs) ---
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH} \
+    TORCH_CUDA_ARCH_LIST="" \     # explicit: no GPU code compiled in
+    OMP_NUM_THREADS=1 \           # tune based on container CPU limits
+
+USER "$APP_USER:$APP_USER"
+
+# --- HEALTHCHECK: /healthz endpoint ---
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["/usr/bin/tini", "--", "/bin/sh", "./scripts/healthcheck.sh"]
+
+# --- entrypoint ---
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-u", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+### Layer-by-layer justification
+
+**Stage 1 (Builder):**
+
+| Decision | Why |
+|---|---|
+| `python:3.12-slim-bookworm` base | Smallest official Debian bookworm Python image (~150MB). No Alpine glibc mismatch issues with PyTorch. |
+| Separate `build-essential` + `curl` install | One combined `apt-get` layer, immediately cleaned (`rm -rf /var/lib/apt/lists*`). These tools vanish when the final stage uses a different FROM — zero blast radius. |
+| `requirements.txt` copied *before* source code | Dependency-only changes (pinning a package) only bust this one layer, not the whole build. Source edits below don't trigger recompilation. |
+| Virtual env at `/opt/venv` | Isolated from system Python. The entire venv directory becomes the copy target into runtime — atomic, no partial state. |
+| `pip freeze > frozen.txt` then `pip install -r frozen.txt` | Second-pass install from the exact resolved resolution prevents drift between what was compiled and what runs. Every transitive dependency gets pinned. |
+| Bytecode compilation stripped | `find ... __pycache__ ... rm -rf` removes caches so the final image doesn't carry redundant `.pyc` files — runtime generates them fresh, which is free and avoids stale-bytecode bugs across builds. |
+
+**Stage 2 (Runtime):**
+
+| Decision | Why |
+|---|---|
+| `ARG` for UID/GID | Default to 1000 but overridable via `--build-arg APP_UID=...`. Avoids hardcoded UIDs that collide with host users or orchestration labels. |
+| `tini` installed | PID 1 zombie reaping. Without init, child Python processes leak zombies under Kubernetes. |
+| Separate `COPY --from=builder /opt/venv` and `COPY src/` layers | **This is the biggest cache win.** The venv layer is typically 2–4GB and changes rarely (only when deps change). Source code changes (every commit) only bust the `src/` COPY layer. Without this split, every code edit forces reinstalling torch (~500MB) and all deps. |
+| `chown` in its own layer | The `USER` directive takes effect immediately. All prior COPY commands run as root; the chown layer flips ownership once, minimizing per-file permission overhead. |
+| `ENV USER "$APP_USER:$APP_USER"` comes *after* all COPYs | Docker applies USER directives from that line forward. If USER appeared earlier, all following COPYs would fail (non-writable root dirs). |
+| Single `HEALTHCHECK` hitting `/healthz` | `-t 5s` (short check), `--start-period=60s` (torch warmup time before model loads), `--retries=3` (graceful recovery), interval every 30s (reasonable detection cadence without overwhelming the endpoint). |
+| `tini -- python -u ...` entrypoint | `-u` forces unbuffered stdout so logs stream to container orchestrator in real-time instead of being batched. |
+
+**.dockerignore (companion):**
+
+```
+.git/
+.github/
+docs/
+paper/
+*.pdf
+*.internal.md
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+tests/
+*.egg-info/
+dist/
+build/
+artifacts/
+benchmark-results.json
+benchmarks/raw_outputs_ieee/
+output/
+.exports/
+skills.json
+.knowledge_graph.json
+.dockerignore
+Dockerfile
+.gitignore
+*.md
+README*
+LICENSE
+```
+
+**Key points:**
+
+1. **9GB → <2.5GB**: The original likely had a single-stage build bundling build tools, full CUDA toolkit, unnecessary packages, and cached apt data. Slim-bookworm base + no CUDA + no build artifacts in runtime + `--no-cache-dir` pip flags compresses the stack dramatically. PyTorch CPU-only is ~700MB; adding typical app deps + base reaches ~1.5–2.2GB comfortably under 2.5GB.
+
+2. **Root removal**: `USER $APP_USER:$APP_USER` ensures no process runs as root inside the container. Combined with `--no-privileged` in docker-compose/K8s manifests, this closes the container escape surface entirely.
+
+3. **No secrets baked in**: Zero `ENV` or `ARG` for passwords, API keys, tokens, or credentials. Secrets enter via runtime mechanisms: Kubernetes `Secret`s mounted as volumes, Docker secrets (`--secret`), or injected at container start via environment overrides that don't appear in `docker history`.
+
+4. **Cache topology**:
+   ```
+   Layer order (bottom → top):
+   ┌────────────────────────────┐
+   │  Base images (cached)      │  ✅ Immutable
+   ├────────────────────────────┤
+   │  apt-get system deps       │  ✅ Changes monthly
+   ├────────────────────────────┤
+   │  venv + wheels             │  ⚠️ Changes quarterly (dep updates)
+   ├────────────────────────────┤
+   │  src/ + config             │  🔁 Changes every commit
+   ├────────────────────────────┤
+   │  healthcheck               │  ✅ Rarely changes
+   └────────────────────────────┘
+   ```
+   Only the `src/` layer busts on routine code changes. Everything above it stays cached.

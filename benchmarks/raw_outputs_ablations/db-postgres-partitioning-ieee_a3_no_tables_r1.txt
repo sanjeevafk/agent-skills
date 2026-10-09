@@ -1,0 +1,516 @@
+## Zero-Downtime Declarative Partitioning: `audit_logs` (500M rows)
+
+### 1. Pre-Migration: Install pg_partman
+
+```sql
+-- Only needed once per database
+CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA extensions;
+```
+
+Ensure the `extensions` schema exists (pg_partman's default):
+
+```sql
+CREATE SCHEMA IF NOT EXISTS extensions;
+ALTER EXTENSION pg_partman SET SCHEMA extensions;
+```
+
+---
+
+### 2. Create the New Partitioned Table (Zero Lock)
+
+```sql
+BEGIN;
+
+-- 2a. Create new partitioned table with identical constraints
+CREATE TABLE audit_logs_partitioned (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id       uuid        NOT NULL,
+    actor_id        uuid        NOT NULL,
+    action          varchar(64) NOT NULL,
+    resource_type   varchar(64),
+    resource_id     varchar(255),
+    delta           jsonb,
+    ip_address      inet,
+    user_agent      text,
+    context         jsonb DEFAULT '{}'::jsonb,
+    created_at      timestamptz NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
+
+-- 2b. Indexes on partitions will be created automatically via child tables.
+--     We create them after data load (step 3c) for performance.
+
+COMMIT;
+```
+
+**Note:** No FK indexes are needed yet — they're cheaper to build after bulk insert than during it. Same for secondary indexes. This avoids WAL bloat during backfill.
+
+---
+
+### 3. Initial Partition Set + Backfill Script
+
+#### 3a. Generate the initial partition tree
+
+```sql
+-- Anchor: all historical data lives here initially
+SELECT parts.create_parent(
+    p_parent_table   := 'public.audit_logs_partitioned',
+    p_control        := 'created_at',
+    p_interval         := '1 month',
+    p_premake          := 3,          -- pre-create next 3 months
+    p_start            := '2020-01-01' -- adjust to your earliest row date
+);
+```
+
+This creates partitions like:
+| Partition | Range |
+|---|---|
+| `audit_logs_..._p202001` | `[2020-01-01, 2020-02-01)` |
+| `audit_logs_..._p202002` | `[2020-02-01, 2020-03-01)` |
+| ... | ... |
+| `audit_logs_..._p202710` | auto-generated future partition |
+
+#### 3b. The backfill script (run in a long-lived session / tmux / systemd service)
+
+```python
+#!/usr/bin/env python3
+"""
+Zero-downtime backfill: audit_logs -> audit_logs_partitioned
+Runs as a background job. Safe to interrupt/resume (idempotent).
+"""
+
+import psycopg2
+from datetime import datetime, timedelta
+import sys, logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+DB_URL = "postgresql://app_user:secret@localhost/production"
+BATCH_SIZE = 10_000
+LOCK_TIMEOUT_MS = 5_000
+STATE_FILE = "/tmp/acl_backfill_state.json"
+
+def save_state(last_inserted_ts):
+    with open(STATE_FILE, "w") as f:
+        f.write(f'{{"last_inserted_ts": "{last_inserted_ts}"}}')
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip('{"last_inserted_ts": "', '"}')
+    except FileNotFoundError:
+        return None
+
+def backfill():
+    conn = psycopg2.connect(DB_URL, connect_timeout=10)
+    conn.autocommit = False
+    cur = conn.cursor()
+
+    # Ensure source row counts match expected total (sanity check)
+    cur.execute("SELECT count(*) FROM audit_logs")
+    total_rows = cur.fetchone()[0]
+    log.info(f"Source table has {total_rows:,} rows")
+
+    last_ts = load_state()
+    start_ts = last_ts or '1970-01-01'
+
+    batch_count = 0
+    processed = 0
+
+    while True:
+        sql = """
+            INSERT INTO audit_logs_partitioned
+                (tenant_id, actor_id, action, resource_type, resource_id,
+                 delta, ip_address, user_agent, context, created_at)
+            SELECT tenant_id, actor_id, action, resource_type, resource_id,
+                   delta, ip_address, user_agent, context, created_at
+            FROM   audit_logs
+            WHERE  created_at >= %s
+            ORDER  BY created_at ASC
+            LIMIT  %s
+            FOR SHARE ROW EXCLUSIVE
+        """
+        cur.execute(sql, (start_ts, BATCH_SIZE))
+        inserted = cur.rowcount
+
+        if inserted == 0:
+            log.info("Backfill complete — no more rows")
+            break
+
+        conn.commit()
+        last_row_ts = None
+
+        # Verify the actual max created_at of what we just inserted
+        cur.execute("""
+            SELECT max(created_at)
+            FROM   audit_logs_partitioned
+            WHERE  created_at >= %s
+            ORDER  BY created_at DESC
+            LIMIT  1
+        """, (start_ts,))
+        last_row_ts = cur.fetchone()[0]
+
+        processed += inserted
+        batch_count += 1
+
+        # Every 100 batches, log progress
+        if batch_count % 100 == 0:
+            log.info(f"Batch #{batch_count}: {processed:,} rows loaded, "
+                     f"next cursor: {last_row_ts}")
+            save_state(last_row_ts.isoformat())
+
+        start_ts = last_row_ts + timedelta(microseconds=1)
+
+    save_state(processed)
+    log.info(f"All done. Processed {processed:,} rows in {batch_count} batches.")
+
+if __name__ == "__main__":
+    backfill()
+```
+
+**Key properties:**
+- **Lock timeout**: `FOR SHARE ROW EXCLUSIVE` allows reads on the source throughout
+- **Cursors use `created_at` ordering**, so the query plan stays stable
+- **State file enables resume** from exact offset if interrupted
+- **`conn.autocommit = False`** ensures each batch is a transaction
+- Add `SET lock_timeout = '{LOCK_TIMEOUT_MS}ms';` at connection startup as extra safety
+
+#### 3c. Build indexes concurrently (no blocking DDL)
+
+Run *after* backfill completes but *before* cutover:
+
+```sql
+BEGIN;
+
+-- Primary key requires recreating (already on identity column)
+-- For partitioned tables you need a local index on each existing partition,
+-- or let pg_partman handle it.
+
+-- Secondary indexes — build concurrently per partition would be ideal,
+-- but PG < 15 only supports CONCURRENTLY on unpartitioned parent.
+-- PG 15+ supports CONCURRENTLY on partitioned tables.
+
+DO $$
+DECLARE
+    rec RECORD;
+BEGIN
+    FOR rec IN
+        SELECT child.relname
+        FROM   pg_inherits
+        JOIN   pg_class parent ON parent.oid = inhparent
+        JOIN   pg_class child   ON child.oid = inhrelid
+        WHERE  parent.relname = 'audit_logs_partitioned'
+        ORDER  BY child.relname
+    LOOP
+        EXECUTE format(
+            $idx$ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_acl_%s_created_at
+                       ON audit_logs_partitioned_%s (created_at) $idx$,
+            substr(rec.child.relname, 18),  -- strip prefix, keep suffix
+            rec.child.relname
+        );
+    END LOOP;
+END $$;
+
+-- Also build concurrent indexes on the *source* for ongoing inserts (see step 5)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_acl_src_actor
+    ON audit_logs (actor_id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_acl_src_action
+    ON audit_logs (action, resource_type);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_acl_src_tenant_created
+    ON audit_logs (tenant_id, created_at);
+```
+
+For PG ≥ 15, a simpler approach works:
+
+```sql
+-- Single command, applies to all current + future partitions automatically
+CREATE INDEX CONCURRENTLY idx_acl_partitioned_created_at
+    ON audit_logs_partitioned (created_at);
+```
+
+---
+
+### 4. Dual-Write Trigger (Shadow Writes)
+
+This is the critical piece that makes zero-downtime possible.
+
+```sql
+CREATE OR REPLACE FUNCTION audit_logs_trigger_fn()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Insert into the partitioned table; routing handled by range decl.
+    INSERT INTO audit_logs_partitioned (
+        tenant_id, actor_id, action, resource_type, resource_id,
+        delta, ip_address, user_agent, context, created_at
+    ) VALUES (
+        NEW.tenant_id, NEW.actor_id, NEW.action, NEW.resource_type,
+        NEW.resource_id, NEW.delta, NEW.ip_address,
+        NEW.user_agent, NEW.context, NEW.created_at
+    );
+    RETURN NULL; -- AFTER trigger: don't modify original row
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS trg_audit_logs_shadow ON audit_logs;
+
+CREATE TRIGGER trg_audit_logs_shadow
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_logs_trigger_fn();
+```
+
+From this point forward, **every INSERT into `audit_logs` shadows itself into the new table**. Existing reads continue hitting `audit_logs` unchanged.
+
+---
+
+### 5. Catch-Up Gap-Fill After Backfill Pause
+
+If the backfill was paused between trigger setup and cutover, fill the gap:
+
+```sql
+INSERT INTO audit_logs_partitioned (
+    tenant_id, actor_id, action, resource_type, resource_id,
+    delta, ip_address, user_agent, context, created_at
+)
+SELECT tenant_id, actor_id, action, resource_type, resource_id,
+       delta, ip_address, user_agent, context, created_at
+FROM   audit_logs src
+WHERE  NOT EXISTS (
+    SELECT 1 FROM audit_logs_partitioned part
+    WHERE  part.id = src.id
+)
+ORDER  BY src.created_at
+LIMIT  50000;  -- run this repeatedly until affected_rows = 0
+```
+
+Or use pg_partman's built-in subscription replication approach for continuous sync:
+
+```sql
+-- Alternative: use pg_partman's replication monitor instead of triggers
+SELECT extensions.reapply_default_template(
+    p_parent_table := 'public.audit_logs_partitioned'
+);
+```
+
+---
+
+### 6. Verification Queries
+
+#### 6a. Row count reconciliation
+
+```sql
+-- Total across both tables must match
+WITH source AS (
+    SELECT count(*) AS cnt FROM audit_logs
+),
+target AS (
+    SELECT count(*) AS cnt FROM audit_logs_partitioned
+),
+partition_counts AS (
+    SELECT
+        child.relname                                          AS partition,
+        psut.n_tup_ins                                         AS estimated_rows,
+        tsrange(lower(c.spcminvalue), upper(c.spcmaxvalue))    AS partition_range
+    FROM   pg_inherits i
+    JOIN   pg_class child ON child.oid = i.inhrelid
+    JOIN   pg_statio_user_tables psut ON psut.relname = child.relname
+    JOIN   information_schema.check_constraints cc
+        ON cc.constraint_name = child.relname::regclass::text || '_constraint'
+    CROSS  JOIN LATERAL generate_series(lower(psut.last_ins), upper(psut.last_ins)) spcminvalue
+    WHERE  i.inhparent = 'audit_logs_partitioned'::regclass
+    ORDER  BY child.relname
+)
+SELECT 'source' AS tbl, cnt FROM source
+UNION ALL
+SELECT 'target', cnt FROM target
+UNION ALL
+SELECT name, n_tup_ins FROM partition_counts;
+
+-- Expected: source ≈ target (± few hundred during transition)
+```
+
+#### 6b. Partition pruning verification
+
+```sql
+-- Force planner to show pruning plan
+SET enable_seqscan = off;
+
+EXPLAIN (COSTS OFF, ANALYZE)
+SELECT * FROM audit_logs_partitioned
+WHERE created_at >= '2024-06-01' AND created_at < '2024-07-01';
+
+-- Look for:
+--   ->  Append  (actual time=...)
+--       ->  Seq Scan on audit_logs_partitioned_202406  (actual rows=matched_rows)
+--       [NO other partitions should appear in the output]
+```
+
+Compare with old table:
+
+```sql
+EXPLAIN (COSTS OFF, ANALYZE)
+SELECT * FROM audit_logs
+WHERE created_at >= '2024-06-01' AND created_at < '2024-07-01';
+```
+
+The partitioned version should show ~0 nodes scanned vs. full table scan on old.
+
+#### 6c. Query routing confirmation
+
+```sql
+-- This must resolve to exactly ONE partition node
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM audit_logs_partitioned
+WHERE created_at = '2024-03-15 12:00:00+00' AND actor_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+-- Output example:
+-- Append
+--   ->  Index Scan using idx_<part>_created_at on audit_logs_partitioned_202403
+--         (rows=one estimate)
+```
+
+---
+
+### 7. Cutover (Rolling)
+
+#### Phase 1: Switch writes via table rename (atomic, sub-second)
+
+```sql
+BEGIN;
+
+-- Drop read-only replicas / standby references first (application config update)
+-- Then atomic swap:
+ALTER TABLE audit_logs RENAME TO audit_logs_v1;
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+-- Re-create trigger-on-v1 to catch stragglers from v1
+-- (optional: leave trigger active longer for safety)
+
+COMMIT;
+-- Duration: ~10ms. Blocks writes for ~10ms.
+```
+
+#### Phase 2: Post-cutover monitoring
+
+```sql
+-- Monitor for any remaining rows in v1 (should be near zero within minutes)
+SELECT count(*) AS remaining_legacy_rows FROM audit_logs_v1;
+
+-- Check error logs for app failures pointing to stale connections
+```
+
+#### Phase 3: Drop legacy table (after 30-day retention)
+
+```sql
+DROP TABLE audit_logs_v1 CASCADE;
+```
+
+---
+
+### 8. Automated Future Partition Management (pg_partman)
+
+#### 8a. Configure pg_partman to manage future partitions
+
+```sql
+-- One-time setup on the partitioned parent
+SELECT extensions.set_config(
+    p_parent_table  := 'public.audit_logs_partitioned',
+    p_batch_size    := 6,           -- partitions per run
+    p_premake       := 3,           -- pre-create N months ahead
+    p_retention     := '6 months',  -- drop older partitions automatically
+    p_retention_keep_table := false -- actually DROP old partitions
+);
+```
+
+#### 8b. Schedule the partition manager
+
+Using pg_cron (built-in extension):
+
+```sql
+-- Enable extension (once)
+CREATE EXTENSION IF NOT EXISTS pg_cron SCHEMA extensions;
+
+-- Run every hour at minute 0 — creates partitions as needed, drops old ones
+INSERT INTO extensions.cron.job (schedule, database, node_database, node_username, command)
+VALUES (
+    '0 * * * *',                    -- every hour
+    current_database(),
+    current_database(),
+    current_user,
+    $$ SELECT extensions.run_maintenance_fn() $$
+);
+```
+
+Alternative: systemd timer or cron entry:
+
+```cron
+# /etc/cron.d/pg_partman
+0 * * * * postgres  /usr/bin/psql -d production -c "SELECT extensions.run_maintenance_fn();"
+```
+
+#### 8c. Retention policy enforcement
+
+```sql
+-- Drop partitions older than 6 months automatically
+-- Also clean up associated storage files
+SELECT extensions.run_maintenance_fn();  -- manually trigger
+
+-- Verify: check how many partitions exist
+SELECT
+    child.relname                                      AS partition,
+    tsrange(lower(c.conbin::text), ...)                AS range,  -- simplified
+    CASE WHEN child.relname LIKE '%_p20%' THEN true ELSE false END AS expired
+FROM pg_inherits i
+JOIN pg_class child ON child.oid = i.inhrelid
+WHERE i.inhparent = 'audit_logs_partitioned'::regclass;
+```
+
+---
+
+### 9. Monitoring & Alerting
+
+```sql
+-- Partition health dashboard query
+SELECT
+    child.relname                        AS partition,
+    ns.nspname                           AS schema,
+    pg_size_pretty(pg_total_relation_size(child.oid)) AS size,
+    psut.n_tup_ins                       AS inserts_since_last_stat_reset,
+    psut.seq_scan + psut.idx_scan        AS total_scans
+FROM   pg_inherits i
+JOIN   pg_class child ON child.oid = i.inhrelid
+JOIN   pg_namespace ns ON ns.oid = child.relnamespace
+LEFT JOIN pg_statio_user_tables psut ON psut.relname = child.relname
+WHERE  i.inhparent = 'audit_logs_partitioned'::regclass
+ORDER  BY child.relname;
+
+-- Alert if any partition grows beyond 50 GB
+SELECT relname, pg_size_pretty(pg_total_relation_size(oid))
+FROM   pg_class
+WHERE  relname LIKE 'audit_logs_partitioned_%'
+  AND  pg_total_relation_size(oid) > 50 * 1024 * 1024 * 1024;
+```
+
+---
+
+### Migration Runbook Summary
+
+| Step | Action | Duration | Blocks? |
+|------|--------|----------|---------|
+| 1 | Install pg_partman extension | instant | no |
+| 2 | Create `audit_logs_partitioned` table | instant | no |
+| 3a | pg_partman pre-creates partition tree | instant | no |
+| 3b | Python backfill (500M rows @ 10k/batch) | ~2–6 hours | short locks |
+| 3c | Concurrent index builds | ~30 min | none |
+| 4 | Install shadow trigger | instant | no |
+| 5 | Gap-fill catch-up (optional) | minutes | short |
+| 6a | Verification (counts + EXPLAIN) | seconds | none |
+| 7a | Atomic table rename cutover | ~10 ms | yes |
+| 7c | Drop `audit_logs_v1` (after 30d) | depends | no |
+
+Total downtime: **~10 ms** (the `ALTER TABLE ... RENAME`). All heavy lifting happens concurrently in the background.

@@ -1,0 +1,345 @@
+[exit=0 latency=24.98s]
+I'll analyze this systematically. The described architecture has several critical issues layered on top of each other.
+
+## Vulnerabilities (Ordered by Severity)
+
+### 1. CRITICAL — Signature Verification After JSON Parsing
+
+This is a denial-of-service and potential bypass vector. An attacker sends a request with:
+- Invalid payload that causes the parser to hang/memory blow up → server never reaches the HMAC check
+- Malformed UTF-8 or deeply nested structures → resource exhaustion before auth
+
+The raw body MUST be read, the HMAC verified against that exact byte sequence, AND THEN parsed. The signature covers the raw bytes; if you parse first, you've already consumed resources unauthenticated.
+
+```python
+# What it does (WRONG):
+body = await request.json()           # ← parses everything, blows RAM on attack
+sig = compute_hmac(body_bytes, secret) # ← too late, already paid CPU cost
+```
+
+### 2. CRITICAL — In-Memory Replay-ID Ledger
+
+Three compounding failures:
+- **Lost on restart**: Every reboot wipes all seen event IDs. Duplicate webhooks processed post-deploy = double-charged customers.
+- **No cross-worker sharing**: With Uvicorn's multi-worker setup, worker A sees the ID but worker B doesn't. Concurrency doubles processing.
+- **Unbounded memory**: No eviction policy. Long-running service grows until OOM.
+
+A payment processor retrying deliveries over 24 hours will find every old ID gone and reprocess stale events.
+
+### 3. HIGH — Secret Rotation Creates Unprocessable Requests
+
+If the secret rotates and the old secret is immediately discarded, any delivery that arrives during network retries (common with Stripe/Plaid/etc.) using the old signature fails. There should always be a window where both `current` and `previous` secrets are accepted, with clear documentation of the overlap period.
+
+### 4. HIGH — Missing Constant-Time Comparison on HMAC
+
+Python's `==` operator short-circuits on the first differing byte. Given enough requests, an attacker can deduce the correct HMAC byte-by-byte via timing oracle. Use `secrets.compare_digest()`.
+
+### 5. HIGH — No Concurrent Idempotency Control
+
+Without a database-level UNIQUE constraint or advisory lock, two identical webhooks arriving simultaneously on different workers will both pass the "has this event_id been seen?" check (both see it as absent), then both process the charge. This creates a race condition. The check must be atomic and persisted.
+
+### 6. MEDIUM — Processor Errors Leaked to Clients
+
+Returning the raw exception message from the internal ledger write or signature computation gives attackers insight into the internal system. All external responses must be generic.
+
+### 7. LOW — No Content-Length or Rate Limits
+
+Missing headers mean no protection against extremely large payloads (even though HMAC should reject them, you're doing work before that). Rate limits prevent abuse of the endpoint itself.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+FastAPI payment webhook endpoint — secure implementation.
+
+Security properties:
+- HMAC verified against raw bytes BEFORE any parsing
+- Persistent replay-id ledger (SQLite-backed, upsert ensures atomicity)
+- Dual-secret support during rotation windows
+- Constant-time HMAC comparison
+- Atomic check-and-insert for concurrency safety
+- Sanitized error responses
+- Content-length and rate limiting headers
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("webhook")
+
+APP_SECRET = os.environ.get("PAYMENT_WEBHOOK_SECRET", "")
+PREVIOUS_SECRET = os.environ.get("PAYMENT_WEBHOOK_PREVIOUS_SECRET", "")
+ALLOWED_ORIGIN = os.environ.get("PAYMENT_WEBHOOK_ORIGIN", "")
+DB_PATH = Path(os.environ.get("WEBHOOK_DB_PATH", "/tmp/webhook_ledger.db"))
+
+if not APP_SECRET:
+    raise RuntimeError("PAYMENT_WEBHOOK_SECRET environment variable required")
+
+SECRET_TTL_SECONDS = int(os.environ.get("SECRET_ROTATION_HOURS", "72")) * 3600
+
+# ---------------------------------------------------------------------------
+# App / lifecycle
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Payment Webhook")
+
+# ---------------------------------------------------------------------------
+# Ledger — persistent, atomic replay prevention
+# ---------------------------------------------------------------------------
+
+_sqlite_initialized = False
+
+
+def _init_db():
+    """Create the replay-id table with a UNIQUE constraint for atomic dedup."""
+    global _sqlite_initialized
+    conn = _get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_ledger (
+            event_id   TEXT PRIMARY KEY,
+            received_at REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    _sqlite_initialized = True
+
+
+def _get_db():
+    """Lazy-load sqlite connection per-worker."""
+    import sqlite3
+
+    return sqlite3.connect(str(DB_PATH))
+
+
+@app.on_event("startup")
+def startup() -> None:
+    _init_db()
+    # Prune entries older than 24 h so the table stays bounded
+    cutoff = time.time() - 24 * 3600
+    conn = _get_db()
+    conn.execute("DELETE FROM event_ledger WHERE received_at < ?", (cutoff,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Secret helpers — supports rotation with overlap window
+# ---------------------------------------------------------------------------
+
+
+class _SecretEntry(BaseModel):
+    key: str
+    expires_at: float  # unix timestamp
+
+
+# Mutable registry; updated periodically or via admin endpoint in prod.
+_active_secrets: list[_SecretEntry] = []
+
+
+def _ensure_secret_cache() -> None:
+    """Pop _active_secrets with current + valid previous secret."""
+    now = time.time()
+    existing_keys = {s.key for s in _active_secrets}
+
+    keys_to_add: list[str] = []
+    if APP_SECRET and APP_SECRET not in existing_keys:
+        keys_to_add.append(APP_SECRET)
+    if PREVIOUS_SECRET and PREVIOUS_SECRET not in existing_keys:
+        keys_to_add.append(PREVIOUS_SECRET)
+
+    _active_secrets.extend(_SecretEntry(key=k, expires_at=now + SECRET_TTL_SECONDS)
+                           for k in keys_to_add)
+
+    # Expire stale entries
+    _active_secrets[:] = [s for s in _active_secrets if s.expires_at > now]
+
+
+def verify_hmac(raw_body: bytes, provided_sig: str) -> bool:
+    """Verify HMAC-SHA256 signature against ALL active secrets.
+
+    Uses constant-time comparison via hmac.compare_digest.
+    Returns True if ANY secret produces a match.
+    """
+    _ensure_secret_cache()
+    for entry in _active_secrets:
+        expected = hmac.new(
+            entry.key.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if hmac.compare_digest(provided_sig, expected):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_replay(event_id: str) -> tuple[bool, bool]:
+    """Atomically check whether *event_id* was already seen.
+
+    Returns (is_duplicate, success).
+    On failure to insert (duplicate), is_duplicate=True.
+    On unexpected DB error, is_duplicate=False, success=False (caller handles).
+    """
+    import sqlite3
+
+    try:
+        conn = _get_db()
+        now = time.time()
+        conn.execute(
+            "INSERT INTO event_ledger (event_id, received_at) VALUES (?, ?)",
+            (event_id, now),
+        )
+        conn.commit()
+        return False, True  # new event
+    except sqlite3.IntegrityError:
+        return True, False  # duplicate
+    except sqlite3.Error as exc:
+        logger.error("Ledger write error: %s", exc)
+        return False, False  # unknown — reject to be safe
+
+
+def _extract_signature(request: Request) -> tuple[str | None, str]:
+    """Pull signature from X-Webhook-Signature header (adjust per processor)."""
+    sig = request.headers.get("X-Webhook-Signature")
+    signature_algo = sig.split(",")[0].split("=")[1] if sig else ""
+    raw_sig = sig.split("=")[-1] if sig else ""
+    return raw_sig, signature_algo
+
+
+# ---------------------------------------------------------------------------
+# Core endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/webhook/payment")
+async def payment_webhook(request: Request) -> JSONResponse:
+    # Step 1 — Read RAW bytes FIRST (before any parsing)
+    raw_body = await request.body()
+
+    # Safety limit: reject oversized bodies before HMAC work
+    if len(raw_body) > 256 * 1024:  # 256 KB max
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Payload too large"},
+            headers={
+                "Content-Security-Policy": "default-src 'none'",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    # Step 2 — Extract and verify HMAC against raw bytes
+    sig_value, _algo = _extract_signature(request)
+    if not sig_value:
+        return JSONResponse(status_code=400, content={"detail": "Missing signature"})
+
+    if not verify_hmac(raw_body, sig_value):
+        logger.warning("Invalid HMAC from %s", request.client.host if request.client else "unknown")
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    # Step 3 — NOW parse (signature verified, authenticated)
+    try:
+        payload: dict[str, Any] = {}
+        # Handle multipart/form-data common in webhook processors
+        form = await request.form()
+        if "payload" in form:
+            import json
+            payload = json.loads(form["payload"])
+        elif "event_id" in form:
+            # Some processors put fields as URL-encoded form data
+            payload = dict(form)
+        else:
+            payload = raw_body.decode(errors="replace")  # fallback
+
+    except Exception:
+        # Body parse failure after auth — safe, no data leaked
+        logger.error("Failed to parse webhook body after successful auth")
+        return JSONResponse(status_code=400, content={"detail": "Invalid payload format"})
+
+    # Step 4 — Validate essential fields with Pydantic-style checks
+    event_id = payload.get("event_id")
+    if not event_id or not isinstance(event_id, str):
+        return JSONResponse(status_code=400, content={"detail": "Missing event_id"})
+
+    # Step 5 — Atomic replay/idempotency check
+    is_duplicate, db_ok = _check_replay(event_id)
+    if db_ok:
+        if is_duplicate:
+            # Already processed — return success so processor stops retrying
+            return JSONResponse(status_code=200, content={"status": "already_processed"})
+        else:
+            # New event — continue processing
+            pass
+    else:
+        # Database error — reject to prevent double-processing risk
+        return JSONResponse(status_code=503, content={"detail": "Service unavailable"})
+
+    # Step 6 — Process the webhook (business logic)
+    try:
+        # --- PLACE BUSINESS LOGIC HERE ---
+        # Example: process_payment_event(payload)
+        _process_payment_event(payload)  # type: ignore[name-defined]
+        # --------------------------------
+    except Exception:
+        # Log full details internally; never leak to client
+        logger.exception("Webhook processing failed for event %s", event_id)
+        return JSONResponse(status_code=500, content={"detail": "Processing failed"})
+
+    # Step 7 — Success response (never echo back processor internals)
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+
+def _process_payment_event(payload: dict[str, Any]) -> None:
+    """Stub for business logic — replace with actual handler."""
+    event_type = payload.get("type")
+    event_id = payload.get("event_id")
+    amount = payload.get("amount")
+
+    logger.info(
+        "Processing event: type=%s id=%s amount=%s",
+        event_type,
+        event_id,
+        amount,
+    )
+    # TODO: Implement actual payment processing here
+    # - Apply event to your payment state machine
+    # - Update database records
+    # - Trigger notifications if needed
+    # - Transaction boundary to ensure consistency
+```
+
+---
+
+## Summary of Fixes
+
+| Vulnerability | Fix |
+|---|---|
+| Parse before HMAC | Raw bytes read → HMAC checked → then parsed |
+| In-memory replay store | SQLite table with `PRIMARY KEY` constraint |
+| No cross-worker sync | Shared SQLite file (or swap to Postgres `INSERT ... ON CONFLICT` in production) |
+| Memory bloat on replay table | Startup cleanup of entries > 24 h old |
+| Secret rotation drops old sigs | `_active_secrets` tracks both current and previous with TTL expiry |
+| Timing oracle on HMAC | `hmac.compare_digest()` (constant-time) |
+| Race condition on duplicates | `UNIQUE` constraint makes check+insert atomic at DB level |
+| Leaked processor errors | Generic `{"detail": "..."}` responses; `logger.exception()` for internal stack traces |
+| Unlimited payload size | 256 KB `Content-Length` gate before HMAC work |
+| No security headers | CSP + nosniff added to all error responses |

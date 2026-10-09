@@ -1,0 +1,284 @@
+[exit=0 latency=33.43s]
+Here are the three manifests plus explanations for probe arithmetic and termination-drain sequence.
+
+---
+
+## Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api
+  namespace: prod
+  labels:
+    app: my-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0          # Never drop below desired count — zero-draft drain
+  template:
+    metadata:
+      labels:
+        app: my-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      terminationGracePeriodSeconds: 30
+
+      serviceAccountName: my-api-sa
+      automountServiceAccountToken: false
+
+      containers:
+        - name: my-api
+          image: ghcr.io/org/my-api:v1.2.3       # Immutable tag, never :latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: "250m"          # Low enough to schedule densely; HPA target is 70% of this = ~175m
+              memory: "256Mi"
+            limits:
+              cpu: "750m"          # 3× request — headroom for p99 bursts without hard throttling
+              memory: "512Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # --- Startup Probe: covers the 20s cold-cache warmup ---
+          # failureThreshold * periodSeconds = 10 * 2 = 20 seconds minimum.
+          # The container must pass /health within 20s or it's killed.
+          # Once startupProbe succeeds, liveness/readiness take over exclusively.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 10
+            periodSeconds: 2
+
+          # --- Liveness Probe: detects deadlock/hung process ---
+          # Only starts after startupProbe has succeeded.
+          # 2 failures * 15s = 30s before kubelet kills and restarts the container.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 0     # No delay needed — startupProbe was watching first
+            periodSeconds: 15
+            failureThreshold: 2
+
+          # --- Readiness Probe: gate traffic — checks DB connectivity AND cache warmed ---
+          # Returns 200 only when cache warm-up loop reports healthy.
+          # 1 failure * 5s = pod removed from Service endpoints in ≤5s.
+          readinessProbe:
+            httpGet:
+              path: /ready             # App-specific: returns 200 only after cache is warmed
+              port: 8080
+            initialDelaySeconds: 3     # Short grace for post-start transitions
+            periodSeconds: 5
+            failureThreshold: 1
+
+          # --- Secrets from CSI Secret Store driver (mounted as files, NOT env vars) ---
+          volumeMounts:
+            - name: secret-store-csi
+              mountPath: /etc/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: secret-store-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: my-api-secrets   # Reference your SPC resource
+        - name: tmp
+          emptyDir: {}
+```
+
+### RBAC — SA with token disabled (app does NOT call K8s API)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-api-sa
+  namespace: prod
+automountServiceAccountToken: false
+```
+
+---
+
+## HPA — CPU + custom metric (queue depth)
+
+Requires Prometheus adapter, kube-state-metrics, or a custom metrics API server exposing `go_queue_depth` to the K8s Metrics API.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-api-hpa
+  namespace: prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-api
+  minReplicas: 3           # Always keep 3 for HA across AZs
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70      # Scale up when avg pod CPU > 70% of 250m request
+
+    - type: External             # Custom: application-level queue-depth metric
+      external:
+        metric:
+          name: go_queue_depth   # Exposed by Prometheus adapter from app's gauge
+        target:
+          type: AverageValue
+          averageValue: "50"     # Target ≤50 items per pod in the queue
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # Don't panic-scale — wait 60s trend
+      policies:
+        - type: Percent
+          value: 100                      # Max 100% increase per policy period (doubling)
+          periodSeconds: 60
+        - type: Pods
+          value: 2                        # Or max 2 pods added per window
+          periodSeconds: 60
+      selectPolicy: Max                   # Use whichever allows more scaling
+    scaleDown:
+      stabilizationWindowSeconds: 300     # Stabilize 5min before scaling down (avoids flapping)
+      policies:
+        - type: Percent
+          value: 25                       # Remove max 25% of current pods per window
+          periodSeconds: 60
+```
+
+---
+
+## PDB — protect during node drains and rolling updates
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-api-pdb
+  namespace: prod
+spec:
+  minAvailable: 2                    # At least 2 pods must remain running
+  selector:
+    matchLabels:
+      app: my-api
+```
+
+---
+
+## Probe Threshold Arithmetic
+
+```
+startupProbe:
+  failureThreshold: 10 × periodSeconds: 2 = 20 seconds total budget
+  → Container MUST be passing /health within 20s.
+  → This covers the 20s cold-cache warmup exactly. Anything slower = container killed.
+  → Once one check passes, startupProbe is "successful" and DISABLED forever.
+
+livenessProbe (only active AFTER startupProbe succeeds):
+  failureThreshold: 2 × periodSeconds: 15 = 30 seconds before restart
+  → If the app deadlocks at t=300s, the liveness probe won't kill it for another 30s.
+  → initialDelaySeconds: 0 is safe because startupProbe was already guarding the start.
+  → This is NOT a race condition: Kubernetes does NOT run both probes simultaneously.
+
+readinessProbe (active from start, independent of startup):
+  failureThreshold: 1 × periodSeconds: 5 = 5 seconds removal latency
+  → Returns 200 ONLY when /ready confirms the cache warm-up loop completed.
+  → Before warmup finishes, readiness fails → pod removed from Service endpoints →
+    zero in-flight requests routed to an unready pod.
+  → During drain, /ready starts returning 503 → rapid endpoint removal → zero drops.
+```
+
+Key distinction: `startupProbe` prevents premature liveness kills during warmup. `readinessProbe` controls whether the pod receives traffic (endpoint membership). They serve entirely different purposes — startup is about *container lifecycle*, readiness is about *traffic gating*.
+
+---
+
+## Termination-Drain Sequence (zero dropped requests)
+
+This works end-to-end through coordinated probe timing and deployment strategy:
+
+```
+t=0: kubectl rollout restart or image update triggers RollingUpdate
+
+┌───────────────────────────────────────────────────────────────┐
+│ ROLLING UPDATE PHASE                                           │
+│                                                               │
+│ 1. maxUnavailable=0 means old pods stay RUNNING until         │
+│    the replacement pod passes BOTH startup + readiness probes │
+│                                                               │
+│ 2. Replacement pod: startupProbe runs (≤20s for warmup)       │
+│    → readinessProbe FAILS during warmup (cache not ready)     │
+│    → replacement NOT added to Service endpoints               │
+│    → ALL traffic continues to old pods                        │
+│                                                               │
+│ 3. After warmup completes, readinessProbe passes (200)        │
+│    → replacement enters endpoints                             │
+│    → OLD pod is then terminated                               │
+│                                                               │
+│ Result: Zero dropped requests throughout deploy                │
+└───────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────┐
+│ SHUTDOWN DRAIN SEQUENCE                                        │
+│                                                               │
+│ t=0ms:   Kubelet sends SIGTERM to main process                 │
+│           ↕                                                    │
+│ t=0ms:   Kubelet removes pod from all Service endpoints        │
+│          (immediate — readiness no longer matters for routing) │
+│           ↕                                                    │
+│ t=0ms:   App receives SIGTERM → stop accepting NEW requests    │
+│          → return 503 on /ready                                │
+│           ↕                                                    │
+│ t=0..20s: Continue processing EXISTING in-flight requests      │
+│           → log completion, close idle connections              │
+│           ↕                                                    │
+│ t=30s:    terminationGracePeriodSeconds timer expires          │
+│           → Kubelet sends SIGKILL (force kill)                  │
+│           ↕                                                    │
+│           → Maximum 20s to drain in-flight work                  │
+│           → Any remaining requests fail client-side with 502/  │
+│             connection reset — but ingress retries succeed     │
+│             on the next available pod                          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Critical design decisions:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `maxUnavailable` | `0` | Old pod stays alive serving traffic while new pod warms up. The tradeoff is slightly longer deploys, but zero dropped requests. |
+| `terminationGracePeriodSeconds` | `30` | Enough time to flush in-flight requests at normal throughput. If your p99 latency is <5s, 30s gives you ~6× headroom per pod. |
+| `/ready` endpoint | Checks cache warm status AND signal channel | Draining is signaled through the same path as warmup — a closed stop-channel causes immediate readiness failure, triggering endpoint removal. |
+| PDB `minAvailable: 2` | Blocks voluntary disruptions if <2 pods survive | Node drain operations pause until pods are rescheduled, preventing cascading capacity loss. Involuntary disruptions (node crash) still happen. |
+| HPA `scaleUp.stabilizationWindowSeconds: 60` | Prevents scale thrash | Queue depth spikes fluctuate rapidly; a 60s stabilization window ensures you're responding to sustained load, not transient bursts. |
+| HPA `scaleDown.stabilizationWindowSeconds: 300` | 5-minute cooldown | Scaling back costs money less than over-provisioning, but 300s prevents flapping that wastes scheduler cycles and causes brief capacity dips. |

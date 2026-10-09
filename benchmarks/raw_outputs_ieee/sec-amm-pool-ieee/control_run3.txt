@@ -1,0 +1,462 @@
+[exit=0 latency=32.80s]
+I'll analyze this AMM architecture and enumerate every attack path, then deliver a hardened swap implementation.
+
+## Vulnerability Inventory
+
+The described pool has **five distinct vulnerability classes**:
+
+1. **Front-run / No Slippage Bounds** — The front-end quotes at mid-price with zero slippage tolerance. Any trade can be MEV-sniped by bots sandwiching legitimate orders.
+2. **Reentrancy on Pre-Settled Balances** — Updating user balances before reserves violates the check-effects-interactions pattern; a malicious receiver contract can reenter during `transfer`.
+3. **Oracle Spot-Price Manipulation** — Since `spot = reserveTokenA / reserveTokenB` reads from `token.balanceOf(address(this))`, an attacker with modest capital can inflate/deflate reserves in the same transaction (or prior) to distort prices for flash-loan-enabled dependent contracts.
+4. **First-Depositor Inflation (Sybil Mint)** — If minted LP tokens are proportional to initial deposit but there's no minimum liquidity provision or the formula is flawed, the first depositor can extract more LP value than their contributed share warrants, inflating their claim on future pools.
+5. **Unbounded Donation Drift** — Arbitrary token donations that aren't accounted in `reserveA`/`reserveB` create off-chain balance drift. The invariant still operates on stale reserves while the contract actually holds more tokens.
+
+---
+
+## Attack Path Enumeration (Ranked by Exploitability)
+
+### Rank 1: Sandwich Attack via No Slippage Bounds (Trivially Exploitable)
+
+```
+User wants: Swap 100 A → B, quotes at mid-price X
+Bot sees pending tx, frontruns with 1000 A → pumps price
+User swaps at degraded rate (large slippage)
+Bot backruns, sells B at inflated price
+Profit ≈ 3-8% per sandwich on thin pools
+```
+
+**Why trivial:** Zero slippage protection means the DEX itself offers the arbitrage opportunity. Anyone with RPC access to mempool can execute.
+
+### Rank 2: Oracle Price Manipulation via Balance Reading (Easily Exploitable)
+
+```
+Attack setup: Attacker takes flash loan of tokenA worth 100 ETH
+Attacker deposits 90 ETH of borrowed tokenA into pool
+Spot price read now shows massive skew (pool heavily weighted toward A)
+Downstream oracle-dependent contract (lending protocol) reads spot price
+Attacker borrows against manipulated price
+Repays flash loan, keeps profit
+```
+
+**Why easy:** `balanceOf(address(this))` returns total pool holdings including any temporary inflation. One large deposit + immediate read = manipulated oracle. Cost: flash loan fee (typically ~0.05%).
+
+### Rank 3: First-Depositor Sybil Inflation (Exploitable if Initialization Is Flawed)
+
+Two sub-paths depending on exact initialization:
+
+**Sub-path 3a — Mispriced Initial Liquidity:**
+```
+If LP tokens minted as: mint(amount) = sqrt(reserveA * reserveB) without
+ensuring equivalent initial deposits (e.g., one-sided deposit allowed),
+the first depositor mints excessive LP tokens for a single-sided deposit.
+Later, they can burn LP for 50% of both reserves despite only contributing one asset.
+```
+
+**Sub-path 3b — Sybil Multi-Account Seeding:**
+```
+Deployer creates N wallets, each seeds 1/N of initial liquidity.
+Pool initializes with "fair" pricing, but deployer controls N% of LP supply.
+When governance or special events activate, deployer's accumulated votes/stake
+exceeds intended thresholds due to fragmented seeding being consolidated.
+```
+
+### Rank 4: Donation-Induced Accounting Drift (Moderately Exploitable)
+
+```
+Contract accepts donations: fallback() { received += msg.value; }
+Or acceptToken functions that don't update reserve state.
+Reserves diverge from actual balances by donation_amount.
+Arbitrageurs notice discrepancy: they swap against stale reserve prices,
+extracting underpriced tokens since pool thinks it has fewer reserves.
+Over time, all donated tokens drain through mispriced swaps.
+```
+
+**Impact:** Gradual drain rather than instant exploit. Requires sustained arbitrage activity.
+
+### Rank 5: Front-Running Between Deposit and Liquidity Activation (Theoretical)
+
+If there's a gap between providing liquidity and when trades become active, someone could front-run the block that enables trading. Low practical impact.
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
+
+/**
+ * @title HardenedAMM
+ * @notice Constant-product AMM (x*y=k) with proper check-effects-interactions,
+ *         slippage bounds, authenticated reserve accounting, and anti-manipulation measures.
+ */
+contract HardenedAMM is Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // ─── State ──────────────────────────────────────────────────────
+
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    /// @dev Internal tracked reserves (must match on-chain balance after every op)
+    uint256 internal _reserveA;
+    uint256 internal _reserveB;
+
+    /// @dev Total LP tokens minted; burns reduce this; mint increases
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    // Configuration
+    uint256 public constant FEE_BPS = 30; // 0.30%
+    uint256 public constant MINIMUM_LIQUIDITY = 1_000; // Locked forever, prevents zero-liquidity attacks
+    uint256 public constant MAX_SLIPPAGE_BPS = 500;   // 5% maximum per-swap (enforced by caller)
+
+    bool public tradingEnabled;
+
+    // Events
+    event Swap(
+        address indexed sender,
+        address indexed recipient,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 amountInAfterFee,
+        uint256 reserveInBefore,
+        uint256 reserveOutBefore
+    );
+    event LiquidityAdded(
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 lpMinted
+    );
+    event LiquidityRemoved(
+        address indexed provider,
+        uint256 lpBurned,
+        uint256 amountAReturned,
+        uint256 amountBReturned
+    );
+    event TradingEnabled(bool enabled);
+    event FeesAccrued(address indexed to, uint256 amountA, uint256 amountB);
+
+    error InvalidInput();
+    error InsufficientOutputAmount(uint256 requested, uint256 maxAllowed);
+    error InsufficientLiquidity();
+    error InsufficientBalance();
+    error UnauthorizedRecipient();
+    error TradingNotEnabled();
+    error TransferFailed();
+
+    modifier whenTradingActive() {
+        if (!tradingEnabled) revert TradingNotEnabled();
+        _;
+    }
+
+    // ─── Constructor ────────────────────────────────────────────────
+
+    constructor(address _tokenA, address _tokenB) {
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
+    }
+
+    // ─── Core Swap ─────────────────────────────────────────────────
+
+    /**
+     * @notice Swaps tokens with explicit slippage protection.
+     * @param amountIn       Amount of token sent to the pool
+     * @param minAmountOut   Minimum acceptable output (slippage bound set by caller)
+     * @param recipient      Address receiving swapped tokens
+     * @return amountOut     Actual amount received
+     *
+     * INVARIANT: Checks → Effects → Interactions (CEI pattern)
+     * Price is calculated from ON-CHAIN reserves (not balanceOf).
+     */
+    function swap(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient
+    )
+        external
+        nonReentrant
+        whenTradingActive
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0 || recipient == address(0)) revert InvalidInput();
+
+        // ── Step 1: CHECKS ──────────────────────────────────────────
+
+        bool aToB = (tokenIn == address(tokenA));
+        uint256 reserveIn = aToB ? _reserveA : _reserveB;
+        uint256 reserveOut = aToB ? _reserveB : _reserveA;
+
+        if (reserveIn == 0 || reserveOut == 0) revert InsufficientLiquidity();
+
+        // Fee calculation: input amount after fees goes into the pool
+        uint256 fee = (amountIn * FEE_BPS) / 10_000;
+        uint256 amountInAfterFee = amountIn - fee;
+
+        // Constant product formula: amountOut = (amountInAfterFee * reserveOut) / (reserveIn + amountInAfterFee)
+        uint256 rawAmountOut = (amountInAfterFee * reserveOut) / (reserveIn + amountInAfterFee);
+
+        // Validate slippage bound
+        if (rawAmountOut < minAmountOut) {
+            revert InsufficientOutputAmount(rawAmountOut, minAmountOut);
+        }
+
+        amountOut = rawAmountOut;
+
+        // ── Step 2: EFFECTS (update state BEFORE transfers) ─────────
+
+        // Update internal reserves
+        if (aToB) {
+            _reserveA += amountIn;
+            _reserveB -= amountOut;
+        } else {
+            _reserveB += amountIn;
+            _reserveA -= amountOut;
+        }
+
+        // Emit event (after state mutation)
+        emit Swap(msg.sender, recipient, amountIn, amountOut, amountInAfterFee, reserveIn, reserveOut);
+
+        // ── Step 3: INTERACTIONS (external calls LAST) ──────────────
+
+        // Pull tokenIn from sender
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+
+        // Push tokenOut to recipient (recipient must not be a contract that can reenter)
+        if (aToB) {
+            tokenB.safeTransfer(recipient, amountOut);
+        } else {
+            tokenA.safeTransfer(recipient, amountOut);
+        }
+    }
+
+    // ─── Liquidity Provision ───────────────────────────────────────
+
+    /**
+     * @notice Adds liquidity. Proportional minting enforces fair valuation.
+     * @param amountA  Amount of tokenA to deposit
+     * @param amountB  Amount of tokenB to deposit
+     * @return lpMinted LP tokens received
+     *
+     * Pricing logic:
+     *   - If pool is uninitialized: LP = min(amountA, amountB) normalized
+     *   - If pool exists: LP = proportional share of totalSupply
+     *   - Must deposit BOTH tokens in correct ratio, OR pay the spread penalty
+     */
+    function addLiquidity(
+        uint256 amountA,
+        uint256 amountB
+    )
+        external
+        nonReentrant
+        returns (uint256 lpMinted)
+    {
+        if (amountA == 0 || amountB == 0) revert InvalidInput();
+
+        uint256 reserveA = _reserveA;
+        uint256 reserveB = _reserveB;
+
+        if (reserveA == 0 && reserveB == 0) {
+            // Initial liquidity: LP = min(initial_a, initial_b), first deposit sets peg
+            // Lock MINIMUM_LIQUIDITY forever to prevent precision edge-cases
+            lpMinted = _minimum(amountA, amountB) - MINIMUM_LIQUIDITY;
+            if (lpMinted == 0) revert InsufficientLiquidity();
+
+            balanceOf[MINIMUM_LIQUIDITY] = MINIMUM_LIQUIDITY; // Burnd/locked sink
+            totalSupply = lpMinted;
+
+            // No ratio constraint on init — first depositor sets the price
+        } else {
+            // Proportional minting: new shares = (new_asset / old_reserve) * totalSupply
+            // Use the smaller implied ratio to prevent dilution manipulation
+            uint256 lpForA = (amountA * totalSupply) / reserveA;
+            uint256 lpForB = (amountB * totalSupply) / reserveB;
+            lpMinted = _minimum(lpForA, lpForB);
+
+            if (lpMinted == 0) revert InsufficientLiquidity();
+        }
+
+        balanceOf[msg.sender] += lpMinted;
+        totalSupply += lpMinted;
+
+        // ── Transfers AFTER state update (CEI) ──────────────────────
+        tokenA.safeTransferFrom(msg.sender, address(this), amountA);
+        tokenB.safeTransferFrom(msg.sender, address(this), amountB);
+
+        _reserveA += amountA;
+        _reserveB += amountB;
+
+        emit LiquidityAdded(msg.sender, amountA, amountB, lpMinted);
+    }
+
+    /**
+     * @notice Removes liquidity. User receives proportional token amounts.
+     */
+    function removeLiquidity(
+        uint256 lpAmount
+    )
+        external
+        nonReentrant
+        returns (uint256 amountA, uint256 amountB)
+    {
+        if (lpAmount == 0) revert InvalidInput();
+        if (balanceOf[msg.sender] < lpAmount) revert InsufficientBalance();
+
+        uint256 reserveA = _reserveA;
+        uint256 reserveB = _reserveB;
+
+        // Proportional withdrawal
+        amountA = (lpAmount * reserveA) / totalSupply;
+        amountB = (lpAmount * reserveB) / totalSupply;
+
+        if (amountA == 0 || amountB == 0) revert InsufficientLiquidity();
+
+        // ── Effects ─────────────────────────────────────────────────
+        balanceOf[msg.sender] -= lpAmount;
+        totalSupply -= lpAmount;
+        _reserveA -= amountA;
+        _reserveB -= amountB;
+
+        // Lock minimum liquidity stays intact
+        if (totalSupply < MINIMUM_LIQUIDITY) {
+            totalSupply = MINIMUM_LIQUIDITY;
+        }
+
+        // ── Interactions ────────────────────────────────────────────
+        tokenA.safeTransfer(msg.sender, amountA);
+        tokenB.safeTransfer(msg.sender, amountB);
+
+        emit LiquidityRemoved(msg.sender, lpAmount, amountA, amountB);
+    }
+
+    // ─── Oracle Price Feed (Safe) ──────────────────────────────────
+
+    /**
+     * @notice Returns current spot price in terms of tokenB per tokenA.
+     * @dev  Reads from internal reserves (not balanceOf), protected against
+     *       transient state changes within the same transaction.
+     */
+    function getSpotPriceA() external view returns (uint256 numerator, uint256 denominator) {
+        return (_reserveB, _reserveA); // price of A in terms of B
+    }
+
+    function getSpotPriceB() external view returns (uint256 numerator, uint256 denominator) {
+        return (_reserveA, _reserveB); // price of B in terms of A
+    }
+
+    // ─── Admin / Maintenance ───────────────────────────────────────
+
+    /**
+     * @notice Accepts ERC20 donations WITHOUT updating reserves.
+     *         Donated tokens remain in contract but do NOT affect pricing.
+     *         This is INTENTIONAL: donations accumulate as a treasury buffer
+     *         separate from the trading pool.
+     */
+    function donate(IERC20 token, uint256 amount) external onlyOwner {
+        require(address(token) == address(tokenA) || address(token) == address(tokenB), InvalidInput());
+        require(amount > 0, InvalidInput());
+
+        // IMPORTANT: Do NOT add to _reserveA/_reserveB — these tokens are excluded
+        // from the constant-product invariant. They act as a one-way safety net.
+        token.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Could emit a Donated event here if desired
+    }
+
+    /**
+     * @notice Withdraw mistakenly sent tokens (emergency recovery only).
+     */
+    function recoverToken(IERC20 token, uint256 amount) external onlyOwner {
+        require(address(token) != address(tokenA) && address(token) != address(tokenB), InvalidInput());
+        token.safeTransfer(owner(), amount);
+    }
+
+    function enableTrading() external onlyOwner {
+        tradingEnabled = true;
+        emit TradingEnabled(true);
+    }
+
+    // ─── Internal Helpers ──────────────────────────────────────────
+
+    function _minimum(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    // Allow native token deposit (if needed for wrap/unwrap pairs)
+    receive() external payable {
+        // Accept ETH only if owner explicitly handles wrapping
+        // Default: reject to prevent accidental lockups
+        revert("No native token support in base contract");
+    }
+}
+
+/**
+ * @title SlippageProtectedFrontend
+ * @notice Off-chain frontend adapter that enforces client-side slippage bounds.
+ *         Never quote trades without applying a configurable tolerance.
+ */
+library SlippageProtectedFrontend {
+    /**
+     * @notice Computes acceptable output range given an input and slippage tolerance.
+     * @param expectedOutput     Mid-price quoted output
+     * @param slippageBps        Max acceptable slippage in basis points (e.g., 100 = 1%)
+     * @return minAcceptable     Minimum output the user will accept
+     */
+    function computeSlippageBounds(
+        uint256 expectedOutput,
+        uint256 slippageBps
+    )
+        external
+        pure
+        returns (uint256 minAcceptable, uint256 /* maxSlippage */ )
+    {
+        // Enforce reasonable bounds
+        require(slippageBps <= 500, "Slippage too high"); // max 5%
+
+        minAcceptable = (expectedOutput * (10_000 - slippageBps)) / 10_000;
+        // No upper bound needed — over-fulfillment benefits the user
+    }
+
+    /**
+     * @notice Validates a swap call includes adequate slippage protection.
+     * @param expectedOutput     Mid-price estimate
+     * @param minAmountOut       Caller-provided minimum
+     * @param slippageTolerance  Tolerance the caller set (for UI display)
+     */
+    function validateSlippageProtection(
+        uint256 expectedOutput,
+        uint256 minAmountOut,
+        uint256 slippageTolerance
+    )
+        external
+        pure
+    {
+        require(minAmountOut > 0, "Min output required");
+        require(minAmountOut <= expectedOutput, "minAmountOut exceeds quote");
+    }
+}
+```
+
+---
+
+## Key Fixes Summary
+
+| Vulnerability | Fix Applied |
+|---|---|
+| **Reentrancy / Pre-settled balances** | Strict CEI pattern: `_reserveA += amountIn; _reserveB -= amountOut;` THEN `transferFrom` THEN `safeTransfer`. State mutated before any external call. |
+| **No slippage bounds** | `swap()` takes `minAmountOut` parameter; reverts if output falls below threshold. Frontend library computes bounds based on user-configurable tolerance. |
+| **Oracle manipulation via `balanceOf`** | `getSpotPriceA/B()` reads internal `_reserveA`/`_reserveB` which are updated atomically with every trade. Not derived from volatile `balanceOf`. |
+| **First-depositor inflation** | `addLiquidity()` uses proportional minting (`lp = (deposit * totalSupply) / reserve`) for subsequent deposits. Minimum liquidity (`MINIMUM_LIQUIDITY = 1000`) locked forever in a sink address prevents precision exploits and zero-liquidity sandboxes. |
+| **Donation drift** | `donate()` explicitly does NOT update reserves. Donated tokens form a separate treasury that doesn't participate in the `x*y=k` invariant. Emergency `recoverToken()` only works for non-pool tokens. |
+
+The single biggest risk remaining is **off-chain MEV**: bots will always see pending transactions. The fix isn't in-chain (no private order flow built-in) but operational — the frontend must ALWAYS attach a slippage bound and users should expect 0.3-1% adverse movement on large trades vs small ones. For full MEV protection you'd need a commitment scheme (commit-reveal) or integration with a private relay like Flashbots.

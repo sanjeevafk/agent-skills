@@ -1,0 +1,385 @@
+Updated 1.41.0 → 1.47.0
+Here's my security review of the described FastAPI payment webhook endpoint.
+
+---
+
+## Security Review: Payment Webhook Endpoint
+
+### Vulnerabilities by Severity
+
+**1. CRITICAL — Signature verification occurs after body parsing (DoS / Slowloris)**
+
+Reading and deserializing the full JSON body before verifying the HMAC signature lets an attacker stream arbitrarily large payloads to exhaust memory and CPU. The signature must be verified against the raw request bytes *before* any parsing happens.
+
+**2. CRITICAL — Replay detection via in-memory dict has no persistence or lifecycle management**
+
+An in-memory dict dies on every deployment/restart, so all prior event IDs are forgotten and replays succeed post-deploy. It also leaks memory with no TTL, and is completely transparent across horizontally scaled instances — three worker processes have three disjoint sets of seen IDs.
+
+**3. CRITICAL — Race condition on concurrent duplicate webhooks (check-then-act)**
+
+When two identical webhooks arrive simultaneously, both processes read "not seen" from the dict, both proceed, and both process the payment. The idempotency check and insertion are not atomic.
+
+**4. HIGH — No secret rotation window**
+
+If secrets rotate ungracefully, webhooks signed with the previous key during the transition period get rejected, causing lost payments and noisy alerts. There must be a coexistence window supporting at least the current and prior keys.
+
+**5. HIGH — Missing constant-time HMAC comparison**
+
+Python's `==` on strings/bytes is short-circuiting. An attacker who controls the network position relative to the service can measure response time differences per-byte to recover the HMAC key byte-by-byte. Must use `hmac.compare_digest()`.
+
+**6. MEDIUM — No rate limiting on the webhook endpoint**
+
+Any public endpoint accepting POSTs without rate limits is an amplification vector. Even authenticated ones benefit from rate caps on the processing cost path.
+
+**7. MEDIUM — Content-type not validated**
+
+Accepting non-JSON bodies into a handler expecting structured payloads can produce parser errors or unexpected branches. Whitelist `application/json`.
+
+**8. MEDIUM — Processor errors leaked to the client**
+
+Raw exceptions (stack traces, internal connection details) surface in the HTTP 5xx response. Clients should only see opaque messages; diagnostics stay server-side.
+
+**9. LOW — No timestamp or max-age enforcement**
+
+Without validating `X-Webhook-Timestamp`, stale retries from days ago (or replayed captures from packet logs) process silently. A clock-drift window (e.g., ±5 min) catches genuine delays while bounding replay exposure.
+
+---
+
+### Corrected Implementation
+
+```python
+"""
+payment_webhook.py — Secure payment processor webhook handler.
+
+Run with: uvicorn payment_webhook:app
+"""
+
+import hashlib
+import hmac
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+# ---------------------------------------------------------------------------
+# Configuration (all from env — never hardcoded)
+# ---------------------------------------------------------------------------
+
+WEBHOOK_HMAC_SECRET_ENV = "PAYMENT_WEBHOOK_HMAC_KEY"
+PREVIOUS_HMAC_SECRET_ENV = "PAYMENT_WEBHOOK_PREVIOUS_HMAC_KEY"  # optional
+ALLOWED_CLOCK_DRIFT_SECONDS = 300  # 5 minutes
+
+MAX_BODY_BYTES = 65_536  # 64 KB — cap before we even touch it
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Minimal Pydantic models for incoming webhook payload
+# ---------------------------------------------------------------------------
+
+class PaymentEvent(BaseModel):
+    """Structure of the parsed payment event — validated early."""
+    event_id: str = Field(..., min_length=1, max_length=255)
+    event_type: str
+    created_at: datetime
+    amount_cents: int = Field(..., ge=0)
+    currency: str = Field(..., min_length=3, max_length=3)
+    customer_id: str = Field(..., min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# Ledger abstraction — swap in real DB implementation in production
+# ---------------------------------------------------------------------------
+
+class EventLedger:
+    """
+    Tracks processed event IDs with database-backed deduplication.
+
+    In production, replace this in-memory stub with PostgreSQL backed schema:
+
+        CREATE TABLE webhook_events (
+            event_id       VARCHAR(255) PRIMARY KEY,
+            received_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at     TIMESTAMPTZ NOT NULL
+                           DEFAULT now() + INTERVAL '90 days'
+        );
+        CREATE INDEX idx_webhook_events_expires
+            ON webhook_events(expires_at) WHERE expires_at < now();
+
+    Use SELECT ... FOR UPDATE SKIP LOCKED for concurrent-safe idempotency.
+    """
+
+    def __init__(self, ttl: timedelta = timedelta(days=90)) -> None:
+        self._seen: dict[str, datetime] = {}
+        self._ttl = ttl
+
+    def is_duplicate(self, event_id: str) -> bool:
+        """Return True if *event_id* was already processed within TTL."""
+        expiry = self._seen.get(event_id)
+        if expiry is None:
+            return False
+        if datetime.now(timezone.utc) >= expiry:
+            del self._seen[event_id]  # lazy cleanup
+            return False
+        return True
+
+    def register(self, event_id: str) -> bool:
+        """
+        Atomically register *event_id*. Returns True if registration
+        succeeded (first caller wins); False if already registered.
+
+        IN-MEMORY NOTE: this method is NOT thread-safe. Replace with a
+        database UNIQUE constraint or SELECT ... FOR UPDATE in production.
+        """
+        now = datetime.now(timezone.utc)
+        if event_id in self._seen:
+            return False
+        self._seen[event_id] = now + self._ttl
+        return True
+
+
+# Global ledger instance — inject properly in your DI setup
+_ledger = EventLedger()
+
+
+# ---------------------------------------------------------------------------
+# Secret management
+# ---------------------------------------------------------------------------
+
+def _get_active_secrets() -> list[bytes]:
+    """
+    Return all HMAC keys eligible for verification.
+
+    Always includes the current secret and (if configured) the prior secret
+    for a graceful rotation window. Keys come from environment variables.
+    """
+    keys: list[bytes] = []
+    current = __import__("os").environ.get(WEBHOOK_HMAC_SECRET_ENV)
+    if current:
+        keys.append(current.encode("utf-8"))
+    previous = __import__("os").environ.get(PREVIOUS_HMAC_SECRET_ENV)
+    if previous:
+        keys.append(previous.encode("utf-8"))
+    return keys
+
+
+def verify_hmac(raw_body: bytes, provided_sig: str) -> bool:
+    """
+    Verify HMAC-SHA256 signature against all known secrets.
+
+    Uses hmac.compare_digest() for constant-time comparison — immune to
+    byte-by-byte timing side-channels.
+    """
+    expected_prefixes = ("sha256=", "SHA256=")
+    if not provided_sig.startswith(expected_prefixes):
+        return False
+
+    algo, _, digest_hex = provided_sig.partition("=")
+    algo = algo.upper()
+    if algo != "SHA256":
+        return False
+
+    for secret in _get_active_secrets():
+        computed = hmac.new(
+            secret, raw_body, hashlib.sha256
+        ).hexdigest()
+        if hmac.compare_digest(computed, digest_hex):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# App factory & lifespan
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Payment webhook service starting")
+    yield
+    logger.info("Payment webhook service shutting down")
+
+
+app = FastAPI(title="Payment Webhooks", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Core webhook endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/webhooks/payment")
+async def handle_payment_webhook(request: Request) -> JSONResponse:
+    """
+    Receive payment processor webhooks with:
+      - HMAC-SHA256 signature verification BEFORE body parsing
+      - Replay protection via event-ID ledger
+      - Idempotent processing under concurrency
+      - No internal error leakage
+    """
+
+    # --- 1. Content-type whitelist ---------------------------------------
+    content_type = request.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return JSONResponse(
+            status_code=415,
+            content={"error": "Unsupported Media Type"},
+        )
+
+    # --- 2. Raw-body size cap (hard limit to prevent OOM) ----------------
+    body_size_limit = MAX_BODY_BYTES
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > body_size_limit:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "Payload too large"},
+            )
+        chunks.append(chunk)
+    raw_body = b"".join(chunks)
+
+    # --- 3. Signature verification BEFORE parsing -------------------------
+    sig_header = request.headers.get("x-webhook-signature")
+    if not sig_header:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Missing signature"},
+        )
+
+    if not verify_hmac(raw_body, sig_header):
+        logger.warning("HMAC verification failed from %s",
+                       request.client.host if request.client else "unknown")
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Invalid signature"},
+        )
+
+    # --- 4. Parse & validate payload -------------------------------------
+    try:
+        payload = await request.json()
+    except Exception:
+        # json() raises ValueError; catch-all is safe here because parsing
+        # happened AFTER signature verification, so DoS risk is bounded.
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid JSON"},
+        )
+
+    try:
+        event = PaymentEvent(**payload)
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid event format"},
+        )
+
+    # --- 5. Timestamp enforcement (anti-stale-replay) --------------------
+    delivered_timestamp_str = request.headers.get("x-webhook-timestamp")
+    if delivered_timestamp_str:
+        try:
+            delivered_ts = datetime.fromisoformat(
+                delivered_timestamp_str.replace("Z", "+00:00")
+            )
+            drift = abs(
+                (datetime.now(timezone.utc) - delivered_ts).total_seconds()
+            )
+            if drift > ALLOWED_CLOCK_DRIFT_SECONDS:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Stale webhook"},
+                )
+        except (ValueError, TypeError):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid timestamp header"},
+            )
+
+    # --- 6. Replay detection & idempotent registration -------------------
+    if _ledger.is_duplicate(event.event_id):
+        # Already processed — return success (processor expects 2xx).
+        # We do NOT re-process; we simply acknowledge.
+        return JSONResponse(
+            status_code=200,
+            content={"status": "duplicate", "event_id": event.event_id},
+        )
+
+    # Register MUST happen before business logic so that a concurrent
+    # duplicate arriving mid-processing hits the duplicate path.
+    if not _ledger.register(event.event_id):
+        return JSONResponse(
+            status_code=200,
+            content={"status": "duplicate", "event_id": event.event_id},
+        )
+
+    # --- 7. Process payment (business logic) -----------------------------
+    # Wrap everything in a try/except so internal failures never leak.
+    try:
+        await _process_payment_event(event)
+    except Exception as exc:
+        # Log the real error server-side; expose nothing to the client.
+        logger.exception(
+            "Failed to process payment event %s", event.event_id
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Processing failed"},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ok", "event_id": event.event_id},
+    )
+
+
+async def _process_payment_event(event: PaymentEvent) -> None:
+    """
+    Execute domain-specific payment handling (store charge, update ledger,
+    emit events, etc.). Raise on failure so the outer handler emits a
+    generic 500.
+    """
+    # TODO: Replace with actual DB work. Example sketch:
+    #   async with db.transaction():
+    #       await db.execute(
+    #           "INSERT INTO payments (event_id, ...) VALUES ($1, ...) "
+    #           "ON CONFLICT (event_id) DO NOTHING",
+    #           [event.event_id],
+    #       )
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+---
+
+### Summary of what changed and why
+
+| Problem | Fix |
+|---|---|
+| Signature verified *after* body parse → DoS via large payloads | Read raw bytes with explicit size cap, verify HMAC on raw bytes **before** calling `request.json()` |
+| In-memory replay dict dies on deploy, leaks memory, isn't shared | Documented PostgreSQL-backed replacement with UNIQUE constraint on `event_id`, TTL expiration index, and `SELECT ... FOR UPDATE SKIP LOCKED` for true atomicity across workers |
+| Check-then-act race on concurrent duplicates | `_ledger.register()` returns boolean; duplicate rejection happens *before* business logic executes |
+| No secret rotation | `_get_active_secrets()` returns current + previous key from env vars; HMAC verifier iterates them all |
+| `==` string comparison on HMAC | `hmac.compare_digest()` throughout — constant-time, timing-safe |
+| Generic 500 leaks stack traces | Every internal exception caught by outer handler; `logger.exception()` records details, client gets opaque `"Processing failed"` |
+| No content-type guard | Explicit whitelist check for `application/json` returning 415 |
+| No payload size limit | Streamed reader with hard `MAX_BODY_BYTES` cap, returning 413 |
+| No timestamp enforcement | `x-webhook-timestamp` header checked against clock drift window; stale webhooks rejected |
+
+### Production migration notes
+
+1. **Replace `EventLedger`** with the PostgreSQL schema shown in the class docstring. The UNIQUE constraint on `event_id` makes the idempotency check and registration genuinely atomic — no application-level lock needed.
+2. **Add rate limiting** at the reverse-proxy layer (nginx `limit_req`, cloud load balancer, or `slowapi` on FastAPI) targeting `/webhooks/payment`. Start with 10 req/s/IP, stricter (1 req/s) on endpoints that trigger external calls.
+3. **Rotate secrets** by setting `PAYMENT_WEBHOOK_PREVIOUS_HMAC_KEY`, letting traffic drain over the overlap window, then dropping the old env var. Never delete the current key while any outstanding webhook could still arrive.

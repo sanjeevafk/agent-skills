@@ -1,0 +1,397 @@
+[exit=0 latency=28.74s]
+Here's the complete diagnosis and solution.
+
+---
+
+## 1. Node-by-Node EXPLAIN ANALYZE Breakdown
+
+Assume this is the original query pattern (highly likely based on your description):
+
+```sql
+-- SLOW QUERY (original form — do not run)
+SELECT u.id, u.email, r.rank
+FROM users u
+JOIN (
+    SELECT e.user_id,
+           ROW_NUMBER() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rank
+    FROM events e
+    WHERE e.tenant_id = $1
+      AND e.event_type = $2
+      AND e.created_at >= $3 AND e.created_at < $4
+) r ON r.user_id = u.id
+WHERE r.rank <= 10;
+```
+
+**Expected EXPLAIN ANALYZE output:**
+
+| Node | What it does | Why it's slow |
+|------|--------------|---------------|
+| **Seq Scan on events** | Scans all 800M rows, filters by tenant_id/event_type/date range | No index exists for `(tenant_id, event_type, created_at)` |
+| **HashAggregate / HashJoin** | Builds hash from filtered events | 800M rows scanned even if only thousands match |
+| **Sort** | `ROW_NUMBER() OVER (...)` sorts matching rows | Without index, must sort in memory → spills to disk because work_mem < sort size |
+| **Nested Loop / Merge Join → users** | Joins ranked subset back to users (2M rows) | The planner expects ~100 rows but gets 2M → wastes memory |
+| **Materialize / CTE** | Materializes subquery before applying outer `rank <= 10` filter | In Postgres 12+, CTEs are optimization fences — can't push down the limit |
+
+Three distinct problems, each independently worth seconds. Together they compound to 40s.
+
+---
+
+## 2. Diagnosing the Stale Estimate Problem
+
+The planner thinks 100 rows will match, reality is 2M. This is a classic **stale statistics** issue. Causes:
+
+1. **Autovacuum hasn't analyzed since bulk load** — the stats collector has `n_live_tup` out of sync with reality.
+2. **High correlation / data skew** between `tenant_id` and `event_type` that column statistics don't capture (correlation coefficient near 0).
+3. **Missing multivariate stats** — PostgreSQL 15+ has `CREATE STATISTICS` for correlated columns but this wasn't set up.
+
+### Fix: Immediate + Structural
+
+```sql
+-- IMMEDIATE FIX: refresh stats right after bulk loads or nightly
+ANALYZE events;
+ANALYZE users;
+
+-- STRUCTURAL FIX: track correlation between tenant_id and event_type
+CREATE STATISTICS events租户_event_type_dep (dependencies)
+    ON tenant_id, event_type
+    FROM events;
+REFRESH TABLE events;  -- forces re-analyze to pick up new stat object
+ANALYZE events;
+
+-- If you need better selectivity on date ranges too:
+CREATE STATISTICS events_date_tenant_dep (dependencies)
+    ON created_at, tenant_id
+    FROM events;
+```
+
+This gives the planner a joint distribution estimate instead of multiplying independent cardinalities (`selectivity_tenant * selectivity_event_type * selectivity_date`), which wildly underestimates skewed joins.
+
+You can verify improvement with:
+
+```sql
+SELECT schemaname, relname, last_analyze, n_distinct, most_common_vals[1:5]
+FROM pg_stats
+WHERE relname = 'events'
+  AND attname IN ('tenant_id', 'event_type');
+```
+
+After fixing stats, the "expected rows" in EXPLAIN should be close to actual.
+
+---
+
+## 3. Index Strategy — Choosing the Right One
+
+### The Decision Tree
+
+```
+Filter columns:  tenant_id (equality), event_type (equality), created_at (range)
+Window function: ROW_NUMBER() PARTITION BY tenant_id ORDER BY created_at DESC
+Join key: user_id
+```
+
+**Step 1: Composite B-tree (the foundation)**
+
+Column order matters because of how B-tree scans work:
+
+- Equality columns first (`tenant_id`, then `event_type`) — these narrow to a contiguous range
+- Range column last (`created_at`) — the index scan reads forward through the range
+- Order columns match the window function ORDER BY — eliminates the sort step entirely
+
+```sql
+-- PRIMARY RECOMMENDED INDEX
+CREATE INDEX CONCURRENTLY idx_events_lookup
+    ON events (tenant_id, event_type, created_at DESC)
+    INCLUDE (user_id);
+```
+
+**Why this exact order?**
+
+| Position | Column | Reason |
+|----------|--------|--------|
+| 1 | `tenant_id` | Highest selectivity equality filter — first multi-column lookup |
+| 2 | `event_type` | Second equality filter — narrows further within tenant partition |
+| 3 | `created_at DESC` | Range filter + matches PARTITION BY / ORDER BY in window function |
+| INCLUDE | `user_id` | Covering column — index-only scan returns user_id without heap access |
+
+**Step 2: Do we need a partial index?**
+
+A partial index (`WHERE ...`) is justified only when the filter picks a small fraction (< 5%) of rows consistently. For multi-tenant systems where one tenant might legitimately have 90% of traffic, a partial index wastes space. Skip partial indexes here unless you're running an analytics workload over historical cold tenants.
+
+**Step 3: Is a covering index (INCLUDE) necessary?**
+
+Without `INCLUDE (user_id)`, the plan would be:
+1. Index scan on `(tenant_id, event_type, created_at DESC)` → gets `created_at` values
+2. Heap fetch per row to get `user_id` → random I/O, terrible at scale
+
+With `INCLUDE (user_id)`:
+1. Index-only scan → no heap access needed
+2. The sort for `ROW_NUMBER()` happens inline via index traversal order → zero disk spill
+
+For an 800M-row table, avoiding heap lookups saves ~60-70% of I/O. Worth the extra ~3GB of index bloat.
+
+### Alternative: Two-index strategy (if INCLUDE is too large)
+
+If disk is tight and `users` table already has an efficient lookup pattern:
+
+```sql
+-- WITHOUT include — falls back to Bitmap Heap Scan
+CREATE INDEX CONCURRENTLY idx_events_lookup_narrow
+    ON events (tenant_id, event_type, created_at DESC);
+```
+
+Tradeoff: smaller index (~5GB vs ~8GB) but 2x slower due to heap fetches. Only use if you're storage-constrained.
+
+---
+
+## 4. Partitioning — Is It Justified?
+
+### When partitioning helps
+
+- Queries always include the partition key in WHERE
+- Old data is deleted/archived regularly
+- Parallel append scans provide meaningful speedup (8+ cores)
+
+### When it doesn't help (your case)
+
+Your query filters on `tenant_id` and `event_type` — not time. If every tenant generates events across all months, monthly partitioning gives **zero filtering benefit**. The planner still visits all partitions.
+
+### Verdict: Do NOT partition by month unless...
+
+Both of these are true:
+1. You routinely query single-tenant historical data (e.g., "show tenant X's activity for January")
+2. You delete or archive entire months of old data
+
+Otherwise, you add complexity (schema migrations, cross-partition queries) for no gain.
+
+### When you DO partition: use range on `created_at`
+
+```sql
+-- ONLY if the above conditions are met
+CREATE TABLE events (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    tenant_id uuid NOT NULL,
+    event_type varchar(64) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    user_id uuid NOT NULL,
+    payload jsonb
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_08 PARTITION OF events
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE events_2026_09 PARTITION OF events
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+-- ... and so on
+
+-- Per-partition index (same structure, faster creation)
+CREATE INDEX ON events_2026_08 (tenant_id, event_type, created_at DESC) INCLUDE (user_id);
+```
+
+Per-partition indexes are smaller (month-level instead of total), making them fit in RAM faster. But again: only worth it if your workload benefits.
+
+---
+
+## 5. Rewritten Query
+
+### Version A: Best case (index covers everything, good stats)
+
+```sql
+WITH ranked_events AS MATERIALIZED (
+    SELECT
+        e.user_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.tenant_id
+            ORDER BY e.created_at DESC
+        ) AS rn
+    FROM events e
+    WHERE e.tenant_id = 'a1b2c3d4-...'::uuid
+      AND e.event_type = 'purchase'
+      AND e.created_at >= '2026-01-01'::timestamptz
+      AND e.created_at < '2026-08-01'::timestamptz
+)
+SELECT
+    u.id,
+    u.email,
+    r.rn AS rank
+FROM ranked_events r
+JOIN users u ON u.id = r.user_id
+WHERE r.rn <= 10;
+```
+
+### Key changes explained:
+
+| Change | Why | Impact |
+|--------|-----|--------|
+| `AS MATERIALIZED` on CTE | Forces early materialization of the window function result | Prevents the planner from inlining and potentially doing a full sort; the `rn <= 10` can now prune the outer join to exactly 10 rows |
+| `ROW_NUMBER()` instead of `RANK()` | Deterministic ordering; RANK produces ties that break pagination | Clean boundary for `<= 10` |
+| Filter pushed into CTE | Keeps outer query simple; optimizer can apply the limit efficiently after the join | 10 rows flow from CTE → join → output, not millions |
+
+### Version B: Aggressive optimization (when even the indexed version is >1s)
+
+```sql
+-- Step 1: Pre-filter user_ids in a fast index-only scan
+WITH candidate_user_ids AS (
+    SELECT DISTINCT e.user_id
+    FROM events e WITH (idx_events_lookup)   -- hint-like planning hint
+    WHERE e.tenant_id = 'a1b2c3d4-...'::uuid
+      AND e.event_type = 'purchase'
+      AND e.created_at >= '2026-01-01'::timestamptz
+      AND e.created_at < '2026-08-01'::timestamptz
+),
+top_ranked AS MATERIALIZED (
+    SELECT
+        e.user_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.tenant_id
+            ORDER BY e.created_at DESC
+        ) AS rn
+    FROM events e
+    INNER JOIN candidate_user_ids c ON c.user_id = e.user_id
+    WHERE e.tenant_id = 'a1b2c3d4-...'::uuid
+      AND e.event_type = 'purchase'
+      AND e.created_at >= '2026-01-01'::timestamptz
+      AND e.created_at < '2026-08-01'::timestamptz
+)
+SELECT u.id, u.email, tr.rn AS rank
+FROM top_ranked tr
+JOIN users u ON u.id = tr.user_id
+WHERE tr.rn <= 10;
+```
+
+Version B is rarely needed. The CTE approach plus proper indexing handles this comfortably.
+
+---
+
+## 6. Complete Deployment Script
+
+```sql
+-- ============================================================
+-- STEP 1: Analyze current state
+-- ============================================================
+
+-- Check existing indexes
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'events';
+
+-- Check if stats are stale
+SELECT
+    relname,
+    last_analyze,
+    n_live_tup,
+    n_mod_since_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'events';
+
+-- Check work_mem (sort spill threshold)
+SHOW work_mem;          -- Default is 4MB — way too low for 2M-row sorts
+
+-- ============================================================
+-- STEP 2: Fix statistics immediately
+-- ============================================================
+
+ANALYZE events;
+ANALYZE users;
+
+-- Create dependency statistics for correlated columns
+CREATE STATISTICS IF NOT EXISTS events_tenant_eventtype_deps (dependencies)
+    ON tenant_id, event_type
+    FROM events;
+
+CREATE STATISTICS IF NOT EXISTS events_date_tenant_deps (dependencies)
+    ON created_at, tenant_id
+    FROM events;
+
+-- Force planner to recalculate with new stats
+ANALYZE events;
+ANALYZE users;
+
+-- ============================================================
+-- STEP 3: Adjust runtime parameters (session-level or postgresql.conf)
+-- ============================================================
+
+-- Increase work_mem so sorts stay in memory instead of spilling to disk
+SET work_mem = '256MB';
+
+-- Ensure parallel workers are available
+SHOW max_parallel_workers_per_gather;  -- Should be 2 or more
+SET max_parallel_workers_per_gather = 2;
+
+-- Enable bitmap scans for moderate selectivity
+SET enable_bitmapscan = on;
+
+-- ============================================================
+-- STEP 4: Create the optimized index (non-blocking)
+-- ============================================================
+
+-- Drop old useless indexes first (identify with pg_indexes above)
+-- DROP INDEX idx_events_some_old_index;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_lookup
+    ON events (tenant_id, event_type, created_at DESC)
+    INCLUDE (user_id);
+
+-- Verify index was built successfully
+SELECT
+    indexrelid::regclass AS index_name,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE indexrelid::regclass::text = 'idx_events_lookup';
+
+-- ============================================================
+-- STEP 5: Configure autovacuum for this heavily-updated table
+-- ============================================================
+
+ALTER TABLE events SET (
+    autovacuum_analyze_threshold = 1000,
+    autovacuum_analyze_scale_factor = 0.001,
+    autovacuum_vacuum_scale_factor = 0.01
+);
+
+-- ============================================================
+-- STEP 6: Verify the fix
+-- ============================================================
+
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+WITH ranked_events AS MATERIALIZED (
+    SELECT
+        e.user_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.tenant_id
+            ORDER BY e.created_at DESC
+        ) AS rn
+    FROM events e
+    WHERE e.tenant_id = 'a1b2c3d4-...'::uuid
+      AND e.event_type = 'purchase'
+      AND e.created_at >= '2026-01-01'::timestamptz
+      AND e.created_at < '2026-08-01'::timestamptz
+)
+SELECT
+    u.id,
+    u.email,
+    r.rn AS rank
+FROM ranked_events r
+JOIN users u ON u.id = r.user_id
+WHERE r.rn <= 10;
+```
+
+---
+
+## 7. Expected Results After All Fixes
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Seq Scan | 800M rows | Eliminated (Index Only Scan) |
+| Disk sort | Yes (spills) | No (in-memory via index order) |
+| Planner estimate error | 100 vs 2M (20,000x off) | Within ~5% |
+| Join cost | Millions of rows × 2M users | 10 rows × 2M users (outer filter prunes) |
+| Total query time | 40s | <500ms |
+
+The biggest wins come in this order:
+1. **Composite covering index** (eliminates Seq Scan + sort spill) — largest impact
+2. **Statistics fix** (corrects planner estimates) — prevents wrong plan choices
+3. **MATERIALIZED CTE** (limits outer join to 10 rows) — clean execution plan
+4. **work_mem increase** — ensures sort stays in memory as a safety net

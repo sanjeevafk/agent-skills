@@ -1,0 +1,552 @@
+I'll design the complete migration strategy applying those standards throughout. Here's the production-grade implementation:
+
+---
+
+## Zero-Downtime Declarative Partitioning Migration — `audit_logs` (500M rows)
+
+### Assumed Source Schema
+
+```sql
+CREATE TABLE audit_logs (
+    id        bigserial PRIMARY KEY,       -- bigint per standard
+    created_at timestamptz NOT NULL DEFAULT now(),
+    event_type text NOT NULL,               -- text per standard
+    log_level text NOT NULL DEFAULT 'info', -- enum stored as text
+    actor_id  bigint,                      -- bigint FK standard
+    actor_ip  inet,
+    details   jsonb,                       -- structured payload
+    client_id bigint NOT NULL              -- tenant isolation
+);
+```
+
+---
+
+### Phase 1: Pre-Flight & Configuration
+
+```sql
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_partman;  -- part of shared_preload_libraries in some configs
+
+-- Conservative lock timeout defaults
+ALTER DATABASE postgres SET lock_timeout = '5s';
+ALTER DATABASE postgres SET idle_in_transaction_session_timeout = '30s';
+ALTER DATABASE postgres SET statement_timeout = '30s';
+
+-- Verify we're not hitting connection limits before bulk work
+SELECT count(*) AS active_conns FROM pg_stat_activity WHERE state = 'active';
+```
+
+---
+
+### Phase 2: Partitioned Table DDL
+
+```sql
+-- ============================================================
+-- CREATE THE PARTITIONED PARENT (empty, no data yet)
+-- ============================================================
+BEGIN;
+
+CREATE TABLE audit_logs_partitioned (
+    id        bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    event_type text NOT NULL,
+    log_level text NOT NULL DEFAULT 'info',
+    actor_id  bigint,
+    actor_ip  inet,
+    details   jsonb,
+    client_id bigint NOT NULL,
+    CONSTRAINT pk_audit_logs
+        PRIMARY KEY (id, created_at)            -- PK must include partition key
+) PARTITION BY RANGE (created_at);
+
+COMMIT;
+
+-- ============================================================
+-- CREATE MONTHLY PARTITIONS (covers existing + future)
+-- Strategy: create all known historical partitions up front
+--           plus 24 months of auto-future partitions handled by pg_partman.
+-- ============================================================
+
+-- Historical: Jan 2020 – Aug 2024 (~500M rows distributed across ~56 months)
+-- Use batch DDL to avoid exceeding transaction limits; one transaction per partition
+-- keeps index rebuilds compact.
+
+DO $$
+DECLARE
+    start_month date := '2020-01-01'::date;
+    end_month   date := '2026-12-01'::date;  -- covers far enough into the future
+    part_start  date;
+    part_end    date;
+BEGIN
+    WHILE start_month < end_month LOOP
+        part_start := start_month;
+        part_end   := (start_month + interval '1 month')::date;
+
+        EXECUTE format(
+            'CREATE TABLE audit_logs_%s PARTITION OF audit_logs_partitioned
+             FOR VALUES FROM (%L) TO (%L)',
+            to_char(part_start, 'YYYY_MM'),
+            part_start,
+            part_end
+        );
+
+        start_month := part_end;
+    END LOOP;
+END $$;
+```
+
+**Partition naming convention:** `audit_logs_YYYY_MM` — easily scriptable and sortable.
+
+---
+
+### Phase 3: Index Strategy (Applied Standard Patterns)
+
+```sql
+-- ============================================================
+-- INDEXES ON THE PARTITIONED PARENT — they propagate to children
+-- ============================================================
+
+-- 1. Client + time series — most common query pattern
+-- Pattern: equality col first, then range col
+CREATE INDEX idx_al_client_created
+    ON audit_logs_partitioned (client_id, created_at);
+
+-- 2. Event-type lookup
+CREATE INDEX idx_al_event_type
+    ON audit_logs_partitioned (event_type)
+    INCLUDE (client_id, actor_id);         -- covering index avoids heap fetch
+
+-- 3. Log-level + client composite (equality = equality)
+CREATE INDEX idx_al_level_client
+    ON audit_logs_partitioned (log_level, client_id);
+
+-- 4. GIN index on JSONB payload (standard pattern: @> search)
+CREATE INDEX idx_al_details_gin
+    ON audit_logs_partitioned USING gin (details);
+
+-- 5. Actor IP range / CIDR queries (GIN with inet_ops available via pg_trgm)
+CREATE INDEX idx_al_actor_ip
+    ON audit_logs_partitioned (actor_ip);
+
+-- 6. BRIN for time-series range scans (per standard: BRIN for time-series ranges)
+--    fillfactor=5 means very compact pages; negligible update churn expected
+CREATE INDEX idx_al_created_brin
+    ON audit_logs_partitioned USING brin (created_at)
+    WITH (pages_per_range = 8, autosummarize = on);
+
+-- 7. Partial index: only recent unprocessed/flagged rows (per standard: partial index)
+CREATE INDEX idx_al_unprocessed_recent
+    ON audit_logs_partitioned (client_id, created_at DESC)
+    WHERE log_level = 'error';
+```
+
+**Concurrency note:** All `CREATE INDEX` above are non-concurrent by default. For zero-downtime you can use `CREATE INDEX CONCURRENTLY`, but it **cannot run inside a transaction block**. In practice, for 500M rows, run them sequentially and monitor `pg_stat_progress_create_index`:
+
+```sql
+-- Monitor concurrent index creation progress
+SELECT phase, blocks_total, blocks_done, tuples_done
+FROM pg_stat_progress_create_index;
+```
+
+If your workload cannot tolerate even short shared locks, replace each `CREATE INDEX` with `CREATE INDEX CONCURRENTLY`.
+
+---
+
+### Phase 4: Concurrent Backfill in Manageable Batches
+
+```sql
+-- ============================================================
+-- BACKFILL SCRIPT — runs nightly as a cron job or in a script loop
+-- Each invocation copies one month (one partition) at a time.
+-- Uses DELETE FROM ... RETURNING on source to avoid storing a copy.
+-- ============================================================
+
+-- This function migrates ONE month at a time. Call it repeatedly
+-- until all historical data is migrated.
+
+-- Usage (in application loop):
+--   SELECT audit_migrate_month('2020_01');  -- returns rows copied
+--   SELECT audit_migrate_month('2020_02');
+--   ...
+
+CREATE OR REPLACE FUNCTION audit_migrate_month(target_month text)
+RETURNS bigint AS $$
+DECLARE
+    v_source_table text := 'audit_logs';
+    v_target_table text := format('audit_logs_%I', target_month);
+    v_start_date   date;
+    v_end_date     date;
+    v_count        bigint := 0;
+    v_batch_size   int := 10000;
+    v_last_id      bigint;
+BEGIN
+    -- Calculate date range from partition name
+    v_start_date := to_date(target_month, 'YYYY_MM');
+    v_end_date   := (v_start_date + interval '1 month')::date;
+
+    -- If partition doesn't exist, skip silently
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = v_target_table AND n.nspname = current_schema
+    ) THEN
+        RAISE NOTICE 'Partition % does not exist, skipping.', v_target_table;
+        RETURN 0;
+    END IF;
+
+    -- Reset last_id tracker
+    v_last_id := NULL;
+
+    <<batch_loop>>
+    LOOP
+        -- Cursor-style batch: uses last copied id as anchor (O(1) pagination)
+        INSERT INTO audit_logs_partitioned (id, created_at, event_type, log_level,
+                                            actor_id, actor_ip, details, client_id)
+        SELECT id, created_at, event_type, log_level,
+               actor_id, actor_ip, details, client_id
+        FROM audit_logs
+        WHERE (target_month = '*')                     -- wildcard used in loop control
+          AND created_at >= v_start_date
+          AND created_at <  v_end_date
+          AND (v_last_id IS NULL OR id > v_last_id)
+        ORDER BY id
+        LIMIT v_batch_size;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT batch_loop WHEN v_count = 0;
+
+        -- Track highest ID for next batch (cursor pagination pattern)
+        SELECT MAX(id) INTO v_last_id
+        FROM audit_logs_partitioned
+        WHERE created_at >= v_start_date
+          AND created_at <  v_end_date;
+
+        -- Commit every batch to release lock held on source table
+        COMMIT;
+
+        -- Brief pause to reduce IO pressure on the primary
+        PERFORM pg_sleep(0.1);
+
+        -- Start fresh transaction with lock timeout
+        PERFORM set_config('lock_timeout', '3000', false);  -- 3-second lock timeout per batch
+
+        RAISE NOTICE 'Migrated % rows from % batch (last_id=%).',
+                     v_count, target_month, COALESCE(v_last_id, 0);
+    END LOOP batch_loop;
+
+    -- Final delete from source (the "move" operation)
+    DELETE FROM audit_logs
+    WHERE created_at >= v_start_date
+      AND created_at <  v_end_date;
+
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**Wrapper script (shell-side) — call repeatedly until all months done:**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generate list of months between earliest and latest audit_log entries
+months=$(psql -t -A -c "
+    SELECT to_char(created_at, 'YYYY_MM')
+    FROM audit_logs
+    GROUP BY 1
+    ORDER BY 1;
+")
+
+for m in $months; do
+    echo "[$(date -Iseconds)] Migrating month: $m"
+    psql -c "SELECT audit_migrate_month('$m');"
+
+    # Verify row counts match before deletion happened
+    src_count=$(psql -t -A -c "
+        SELECT count(*) FROM audit_logs
+        WHERE created_at >= '$m-01'::date
+          AND created_at < ('$m-01'::date + interval '1 month');
+    ")
+    dst_count=$(psql -t -A -c "
+        SELECT count(*) FROM audit_logs_partitioned
+        WHERE created_at >= '$m-01'::date
+          AND created_at < ('$m-01'::date + interval '1 month');
+    ")
+
+    if [ "$src_count" != "0" ]; then
+        echo "WARNING: $src_count rows remain in source for $m"
+    fi
+
+    echo "Source: $src_count | Destination: $dst_count"
+    sleep 2  # let replication/slots catch up
+done
+```
+
+---
+
+### Phase 5: Capture Remaining Writes (Dual-Write During Transition)
+
+```sql
+-- ============================================================
+-- TRIGGER: Propagate new/written rows from OLD table → NEW
+-- This captures writes happening WHILE backfill is in progress.
+-- ============================================================
+
+-- Add trigger functions BEFORE any application changeover
+CREATE OR REPLACE FUNCTION fn_sync_audit_logs_to_partitioned()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- NEW (INSERT) — forward everything
+    INSERT INTO audit_logs_partitioned (id, created_at, event_type, log_level,
+                                        actor_id, actor_ip, details, client_id)
+    VALUES (NEW.id, NEW.created_at, NEW.event_type, NEW.log_level,
+            NEW.actor_id, NEW.actor_ip, NEW.details, NEW.client_id)
+    ON CONFLICT (id, created_at) DO NOTHING;  -- already migrated
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply to source table: ALL write paths propagate to partitioned copy
+CREATE TRIGGER tg_sync_insert
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION fn_sync_audit_logs_to_partitioned();
+
+CREATE TRIGGER tg_sync_update
+    AFTER UPDATE ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION fn_sync_audit_logs_to_partitioned();
+
+CREATE TRIGGER tg_sync_delete
+    AFTER DELETE ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION fn_sync_audit_logs_to_partitioned();
+```
+
+---
+
+### Phase 6: Cutover (Near-Zero Downtime)
+
+```sql
+-- Step A: Point application reads to partitioned table (app config change)
+--         This is an app restart — usually sub-second per instance.
+
+-- Step B: After confirming reads succeed, redirect writes
+--         Update app config again to point INSERT/UPDATE/DELETE at audit_logs_partitioned
+
+-- Step C: Verify nothing is left in the old table
+SELECT count(*) AS leftover_rows FROM audit_logs;
+-- Should be 0 (or within acceptable delta from trigger latency)
+
+-- Step D: Drop triggers, then drop old table
+DROP TRIGGER IF EXISTS tg_sync_insert ON audit_logs;
+DROP TRIGGER IF EXISTS tg_sync_update ON audit_logs;
+DROP TRIGGER IF EXISTS tg_sync_delete ON audit_logs;
+DROP FUNCTION IF EXISTS fn_sync_audit_logs_to_partitioned();
+
+-- Optional: rename for archival (don't DROP immediately in production)
+ALTER TABLE audit_logs RENAME TO audit_logs_archive;
+-- Can be dropped after N weeks of confidence.
+
+-- Step E: Rename partitioned table to expected name (zero-cost rename)
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+```
+
+After cutover, the partitioned table retains its original name (`audit_logs`) — no downstream app changes needed beyond the cutover window.
+
+---
+
+### Phase 7: Partition Pruning Verification
+
+```sql
+-- ============================================================
+-- PRUNING VERIFICATION QUERIES
+-- ============================================================
+
+-- 1. Verify pruning is ACTIVE (explain shows specific partitions)
+EXPLAIN (COSTS OFF, ANALYZE)
+SELECT * FROM audit_logs
+WHERE created_at >= '2024-06-01'::timestamptz
+  AND created_at <  '2024-07-01'::timestamptz
+  AND client_id = 42;
+
+-- Expected output includes:
+--   ->  Append  (actual rows from audit_logs_2024_06 only)
+
+-- 2. Show pruning is working by checking excluded partitions
+SET enable_seqscan = off;  -- force index scan to see partition tree
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM audit_logs
+WHERE created_at >= '2023-01-01'::timestamptz
+  AND created_at <  '2023-02-01'::timestamptz;
+RESET enable_seqscan;
+
+-- 3. List ALL partitions with their row counts
+SELECT
+    child.relname                          AS partition_name,
+    pg_get_expr(child.relpartbound, child.oid, true) AS partition_range,
+    pg_relation_size(child.oid)            AS size_bytes,
+    pg_size_pretty(pg_relation_size(child.oid)) AS size_pretty,
+    (SELECT count(*) FROM audit_logs_partitioned p
+     WHERE p.tableoid = child.oid)          AS row_estimate  -- approximate
+FROM pg_inherits
+JOIN pg_class parent ON parent.oid = pg_inherits.inhparent
+JOIN pg_class child  ON child.oid  = pg_inherits.inhrelid
+WHERE parent.relname = 'audit_logs'
+ORDER BY child.relname;
+
+-- 4. Detect partitions that are empty (could be archived)
+SELECT child.relname, pg_relation_size(child.oid) AS bytes
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'audit_logs'::regclass
+  AND pg_relation_size(c.oid) = 0;
+
+-- 5. Verify index usage per partition
+SELECT schemaname, relname, indexname, idx_scan, idx_tup_read
+FROM pg_stat_user_indexes
+WHERE relname LIKE 'audit_logs%'
+ORDER BY idx_scan DESC;
+```
+
+---
+
+### Phase 8: pg_partman Automated Future Partition Management
+
+```sql
+-- ============================================================
+-- INSTALL & CONFIGURE PG_PARTMAN
+-- Handles: auto-creation, maintenance, retirement of partitions
+-- ============================================================
+
+-- Create partman schema (single ownership)
+CREATE SCHEMA IF NOT EXISTS partman;
+GRANT USAGE ON SCHEMA partman TO postgres;
+
+-- Register the partitioned table with pg_partman
+SELECT partman.create_parent(
+    p_parent_table   => 'public.audit_logs',
+    p_control        => 'created_at',
+    p_interval       => '1 month',
+    p_template_table => 'public.audit_logs_2026_12',  -- template created in Phase 2
+    p_start_partition => '2026-12-01'::date
+);
+
+-- Configure retention: archive/remove partitions older than 3 years
+SELECT partmanretention.create_job(
+    p_parent_table   => 'public.audit_logs',
+    p_interval       => '1 month',
+    p_retention      => '3 years',
+    p_retention_keep_table => false,       -- set true for soft-delete mode
+    p_retention_keep_index => true          -- preserve indexes when dropping
+);
+
+-- Configure auto-maintenance schedule (runs every hour via pg_cron or pgPartman's own scheduler)
+SELECT partman.reconfigure_parent(
+    p_parent_table => 'public.audit_logs',
+    p_premake      => 6                    -- always pre-create 6 months ahead
+);
+
+-- Manual maintenance check (can be scheduled as cron job):
+-- SELECT partman.run_maintenance('public.audit_logs');
+
+-- View current partition status
+SELECT * FROM partman.part_config WHERE parent = 'public.audit_logs';
+
+-- Check upcoming partitions
+SELECT * FROM partman.check_partition('public.audit_logs');
+```
+
+**pg_cron integration (if available):**
+
+```sql
+-- Auto-maintain daily at 2 AM
+SELECT cron.schedule('partman-audit-logs',
+    '0 2 * * *',
+    $$SELECT partman.run_maintenance('public.audit_logs')$$
+);
+
+-- Vacuum partitioned table weekly
+SELECT cron.schedule('vacuum-audit-logs',
+    '0 4 * * 0',
+    $$VACUUM (ANALYZE, VERBOSE) public.audit_logs$$
+);
+```
+
+---
+
+### Phase 9: Post-Migration Monitoring & Anti-Pattern Checks
+
+```sql
+-- ============================================================
+-- MONITORING: Verify health post-migration
+-- ============================================================
+
+-- 1. Find unindexed foreign keys (anti-pattern detection from standard)
+SELECT conrelid::regclass AS table_name, a.attname AS column_name
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+WHERE c.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid AND a.attnum = ANY(i.indkey)
+  );
+
+-- 2. Dead tuple detection per partition
+SELECT child.relname,
+       s.n_dead_tup,
+       CASE WHEN s.n_live_tup > 0
+            THEN round(s.n_dead_tup::numeric / s.n_live_tup * 100, 2)
+            ELSE 0 END AS dead_pct
+FROM pg_stat_user_tables s
+JOIN pg_inherits i ON i.inhrelid = s.relid
+JOIN pg_class c ON c.oid = i.inhparent
+WHERE c.relname = 'audit_logs'
+ORDER BY s.n_dead_tup DESC;
+
+-- 3. Query performance tracking (pg_stat_statements)
+SELECT query,
+       calls,
+       mean_exec_time AS avg_ms,
+       total_exec_time / 1000 AS total_seconds,
+       max_exec_time AS max_ms
+FROM pg_stat_statements
+WHERE query LIKE '%audit_logs%'
+  AND mean_exec_time > 100
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+
+-- 4. Lock contention monitoring
+SELECT pid, usename, wait_event_type, wait_event, query,
+       age(clock_timestamp(), query_start) AS query_age
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND query NOT ILIKE '%pg_stat%'
+ORDER BY query_age DESC;
+
+-- 5. Verify RLS policies (if enabled) — wrap auth check in SELECT per standard
+-- Example policy template:
+/*
+CREATE POLICY audit_isolation_policy ON audit_logs
+    USING ((SELECT current_setting('app.current_client_id', true))::bigint = client_id);
+*/
+```
+
+---
+
+### Rollout Timeline Summary
+
+| Step | Action | Downtime |
+|------|--------|----------|
+| 1 | Create partitioned table + indexes | None (online) |
+| 2 | Create historical partitions + pg_partman setup | None |
+| 3 | Backfill in monthly batches | None (short lock_timeout per batch) |
+| 4 | Install sync triggers on OLD table | None |
+| 5 | Brief period: old → new via triggers (catches drift) | None |
+| 6 | App config cutover (read → partitioned, write → partitioned) | Seconds (rolling restart) |
+| 7 | Drop old table | None |
+
+The entire migration takes zero downtime except for the app config cutover step, which is a rolling restart across instances.

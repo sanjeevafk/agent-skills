@@ -1,0 +1,446 @@
+[exit=0 latency=27.40s]
+# Performance Investigation: FastAPI p99 Regression
+
+## Problem Statement
+
+p50 stable at ~80-85ms while p99 jumped from 210ms to 1900ms (~9x). CPU and memory flat. DB connection count and queries-per-request both spiked. This is a textbook **tail-latency explosion** caused by something that only blocks under specific conditions — not a systemic resource exhaustion.
+
+---
+
+## Root Cause Hypotheses (Ranked)
+
+### H1: N+1 Query Pattern Introduced (Most Likely)
+
+The queries-per-request spike directly points here. A new join was removed, a subquery wasn't batched, or list endpoints started fetching related records one-at-a-time inside loops.
+
+**Why it explains the data:**
+- p50 unaffected: most requests hit simple paths or cache hits
+- p99 explodes: once you trigger the N+1 path (e.g., paginated list + eager load missing), each extra query adds ~10-50ms in round-trip time
+- Connection count spikes: more concurrent in-flight queries = more pooled connections
+- CPU flat: waiting on the database, not doing computation
+
+### H2: Connection Pool Saturation Under Burst
+
+Pool size may be undersized relative to new query volume. When all connections are occupied waiting on slow queries, new requests queue behind pool checkout.
+
+**Why it partially fits:**
+- Explains p99 spike and connection count increase
+- But wouldn't explain queries-per-request spike unless combined with H1
+
+### H3: Lock Contention / Advisory Locks
+
+Some write path introduced table-level locks or `SELECT FOR UPDATE` that serializes reads.
+
+**Less likely:** would show as increased wait events, usually also bumps CPU context-switch overhead.
+
+### H4: Slow Query Becoming Common
+
+A previously rare edge case now runs frequently due to changed data distribution or index loss.
+
+---
+
+## Profiling Instruments to Attach
+
+### 1. Database Query Tracing (Immediate, Zero Overhead)
+
+Attach SQLAlchemy event listeners or use middleware to log every query with timing:
+
+```python
+import time
+import logging
+from collections import defaultdict
+from flask import Flask  # or fastapi equivalent
+
+logger = logging.getLogger("query_trace")
+
+class QueryProfiler:
+    def __init__(self):
+        self.request_queries = defaultdict(list)
+        self._in_flight = {}
+
+    def on_request_start(self, request_id):
+        self._in_flight[request_id] = []
+
+    def on_query_executed(self, request_id, sql, duration_ms, params_count=1):
+        entry = {
+            "sql": sql[:200],  # truncate long queries
+            "duration_ms": round(duration_ms, 1),
+            "params": params_count,
+        }
+        self._in_flight[request_id].append(entry)
+
+    def on_request_end(self, request_id):
+        queries = self._in_flight.pop(request_id, [])
+        if not queries:
+            return
+
+        total_db_ms = sum(q["duration_ms"] for q in queries)
+        query_count = len(queries)
+
+        # Log structural info
+        logger.warning(
+            "REQ|%s|QPS=%d|DB_MS=%.1f|PCT=%.0f%%",
+            request_id,
+            query_count,
+            total_db_ms,
+            (total_db_ms / max(1, total_request_ms)) * 100,
+        )
+
+        # Detect N+1: multiple similar queries with different params
+        self._detect_n_plus_1(queries, request_id)
+
+    def _detect_n_plus_1(self, queries, request_id):
+        """Group queries by canonical SQL (strip params) and find loops."""
+        canonical = defaultdict(list)
+        for q in queries:
+            # Remove WHERE params to get template
+            template = q["sql"].split("WHERE")[0].rstrip() if "WHERE" in q["sql"] else q["sql"].rstrip()
+            canonical[template].append(q)
+
+        for sql_template, occurrences in canonical.items():
+            if len(occurrences) >= 3:
+                logger.warning(
+                    "N+1_DETECTED|%s|%s|REPEATS=%d|TOTAL_DB_MS=%.1f",
+                    request_id,
+                    sql_template[:120],
+                    len(occurrences),
+                    sum(o["duration_ms"] for o in occurrences),
+                )
+```
+
+**Key signals to look for:**
+- Same canonical SQL repeated 3+ times with varying parameters within a single request
+- `total_db_ms > request_total_ms` (impossible without parallelism → sequential loop)
+- Queries per request median vs p95 distribution shift
+
+### 2. Continuous Profiler (py-spy / sysprobe)
+
+Run py-spy in record mode during traffic:
+
+```bash
+# Sample every 1ms for 30 seconds capturing ALL processes
+py-spy record -o profile_before.svg \
+  --pid $(pgrep -f uvicorn) \
+  --subprocesses \
+  --interval 1 \
+  -d 30
+
+# Or attach live to see what threads are blocked
+py-spy top --pid $(pgrep -f uvicorn) --subprocesses
+```
+
+**What to look for in the flame graph:**
+- Thick branches inside `psycopg2` or `asyncpg` calls → waiting on DB
+- Significant time in `queue.Queue.get()` or `ThreadPoolExecutor` → pool checkout blocking
+- Any function showing >10% of samples outside hot business logic → profiling target
+
+**Distinguishing signal:**
+```
+Flame graph interpretation guide:
+
+┌─ If thick at psycopg2.connect/execute ──→ N+1 sequential queries
+│   Time accumulates in driver layer       │
+│                                           
+├─ If thick at asyncio.Lock.acquire ──────→ Lock contention
+│   Multiple coroutines waiting            │
+│                                           
+├─ If thick at Queue.get / Semaphore      ─→ Connection pool exhaustion
+│   Tasks queued behind pool release       │
+│                                           
+└─ If thick in business logic ────────────→ Algorithmic issue
+    Rare paths dominate tail               │
+```
+
+### 3. Connection Pool Metrics
+
+Instrument the pool itself. For `SQLAlchemy + psycopg2`:
+
+```python
+from sqlalchemy.pool import Pool
+import threading
+
+class MonitoredPool:
+    """Drop-in pool wrapper that tracks utilization in real-time."""
+    
+    def __init__(self, pool: Pool):
+        self._pool = pool
+        self._lock = threading.Lock()
+        self._checkouts = 0
+        self._checkins = 0
+        self._checkout_times = []  # (timestamp, duration_ms)
+        self._peak_size = pool.size()
+
+    def checkout(self, *args, **kwargs):
+        start = time.perf_counter()
+        try:
+            delegate = self._pool.checkout(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            with self._lock:
+                self._checkouts += 1
+                self._checkout_times.append(elapsed_ms)
+                # Keep last 10000
+                if len(self._checkout_times) > 10000:
+                    self._checkout_times = self._checkout_times[-5000:]
+            return delegate
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            with self._lock:
+                self._checkout_times.append(elapsed_ms)
+            raise
+
+    def checkin(self, *args, **kwargs):
+        with self._lock:
+            self._checkins += 1
+        return self._pool.checkin(*args, **kwargs)
+
+    @property
+    def stats(self):
+        with self._lock:
+            times = sorted(self._checkout_times[-5000:])
+            return {
+                "checkouts": self._checkouts,
+                "checkins": self._checkins,
+                "checkout_p50": times[len(times)//2] if times else 0,
+                "checkout_p99": times[int(len(times)*0.99)] if times else 0,
+                "overflow_rate": (self._checkouts - self._checkins) / max(1, self._checkins),
+            }
+```
+
+**Reading pool stats:**
+- `checkout_p99 > 50ms` → pool saturated, connections busy
+- `overflow_rate > 0.1` → sustained demand exceeds pool capacity
+- If `checkout_p99` correlates with p99 request time → confirmed pool bottleneck
+
+### 4. Distributed Request Tracing (OpenTelemetry / ddtrace)
+
+Add span-level timestamps to separate DB wait from application work:
+
+```python
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+
+tracer = trace.get_tracer(__name__)
+
+async def db_session_wrapper(request_id, operation, *args, **kwargs):
+    """Wrap every DB call with a span."""
+    with tracer.start_as_current_span(f"db.{operation}") as span:
+        start = time.perf_counter_ns()
+        try:
+            result = await kwargs.pop("coroutine") if "coroutine" in kwargs else None
+            if result:
+                retval = await result
+            elapsed_us = (time.perf_counter_ns() - start) / 1000
+            span.set_attribute("db.operation", operation)
+            span.set_attribute("db.elapsed_us", elapsed_us)
+            return retval
+        except Exception as e:
+            span.record_exception(e)
+            raise
+        finally:
+            elapsed_us = (time.perf_counter_ns() - start) / 1000
+            span.set_attribute("db.elapsed_us", elapsed_us)
+```
+
+**Correlation test:** Plot `sum(db_spans)` vs `http.response_time` across p50-p99 quantiles. If DB time tracks perfectly, it's the bottleneck. If there's a gap, application-side work dominates.
+
+---
+
+## Distinguishing Between Causes
+
+| Signal | N+1 Queries | Pool Saturation | Lock Contention |
+|--------|-------------|-----------------|-----------------|
+| p50 flat ✓ | ✓ | ✗ (usually bumps p50) | ✗ |
+| p99 >> p50 gap widening | ✓ | ✓ | ✓ |
+| Same SQL repeated in trace | ✓ | Sometimes | No |
+| Py-spy thick in driver wait | ✓ | ✓ | Depends |
+| Checkout p99 high | Indirectly | **Directly** | Occasionally |
+| DB CPU low, wait high | **Classic** | Possible | Possible |
+
+**The key diagnostic query on PostgreSQL:**
+
+```sql
+-- Check for sequential scans on hot tables (index loss)
+SELECT schemaname, tablename, indexname, 
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+ORDER BY idx_scan ASC
+LIMIT 20;
+
+-- Check for long-running queries holding connections
+SELECT pid, usename, datname, state, 
+       query_start, NOW() - query_start AS duration,
+       LEFT(query, 100) AS query_preview
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY duration DESC
+LIMIT 20;
+
+-- Connection usage over time
+SELECT time, state, count(*)
+FROM pg_stat_activity
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+GROUP BY time(state, '5 min'), state
+ORDER BY time;
+```
+
+---
+
+## Proposed Fixes (Ranked by Expected p99 Impact)
+
+### Fix 1: Eliminate N+1 Queries (Highest Impact, Lowest Risk)
+
+**Action:** Identify the looping query via trace, replace with bulk IN or JOIN.
+
+```python
+# BEFORE (N+1 pattern):
+orders = session.query(Order).filter_by(user_id=user_id).all()
+for order in orders:
+    order.items = session.query(OrderItem).filter_by(order_id=order.id).all()
+# If 50 orders, that's 1 + 50 = 51 queries
+
+# AFTER (batched):
+order_ids = [o.id for o in orders]
+items_map = {
+    item.order_id: item
+    for item in session.query(OrderItem).filter(
+        OrderItem.order_id.in_(order_ids)
+    ).all()
+}
+for order in orders:
+    order.items = items_map.get(order.id, [])
+# Total: 2 queries regardless of order count
+```
+
+For SQLAlchemy ORM with relationship loading:
+```python
+# Use joinedload or selectinload
+orders = session.query(Order).options(
+    selectinload(Order.items)
+).filter_by(user_id=user_id).all()
+```
+
+**Expected p99 impact:** Reduces queries-per-request from ~50-200 back to 3-10. P99 drops proportionally to eliminated round-trips (assuming ~10ms RTT each = 350-1700ms recovered).
+
+### Fix 2: Add Missing Indexes (High Impact, Requires Migration)
+
+**Action:** Run `EXPLAIN ANALYZE` on the hottest queries revealed by tracing. Look for:
+- Sequential scans on large tables
+- Sort operations spilling to disk
+- Nested loops with large row estimates
+
+```sql
+-- Generate recommended indexes from pg_stat_statements
+SELECT query, calls, mean_exec_time, rows,
+       shared_blks_hit, shared_blks_read,
+       1.0 - (shared_blks_hit::float / GREATEST(shared_blks_read + shared_blks_hit, 1)) AS miss_ratio
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+```
+
+Create indexes based on WHERE/FILTER/JOIN clauses:
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
+CREATE INDEX CONCURRENTLY idx_order_items_order_id ON order_items(order_id);
+```
+
+**Expected p99 impact:** Can reduce individual query time from 100ms+ to <5ms. Combined with Fix 1, eliminates the worst outliers entirely.
+
+### Fix 3: Tune Connection Pool Size (Medium Impact, Quick Win)
+
+**Action:** Right-size the pool. Current default (SQLAlchemy) is often 5, which is too small for modern workloads.
+
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,           # Concurrent persistent connections
+    max_overflow=30,        # Extra connections during bursts
+    pool_timeout=30,        # Seconds to wait before giving up
+    pool_recycle=1800,      # Recycle connections every 30min
+    pool_pre_ping=True,     # Validate connections before use
+)
+```
+
+**Capacity math:**
+- With p50 request = 80ms and DB time ~20ms: each connection handles ~50 req/s
+- At pool_size=5, max throughput = 250 req/s before queuing
+- At pool_size=20 + overflow=30: max = 1500 req/s
+
+**Rule of thumb:** `pool_size ≈ (max_rps * avg_db_latency_s) / concurrency_factor`. For 200 rps × 20ms = 4 concurrent needs. Set `pool_size=10-20` to handle bursts and tail latency.
+
+**Expected p99 impact:** Eliminates the 500-1500ms queuing when pools exhaust. Often recovers 60-80% of tail regression.
+
+### Fix 4: Add Async Support for Independent DB Calls (Medium-High Impact, Higher Effort)
+
+If using `asyncpg` or `SQLAlchemy 2.0 async`, parallelize independent queries:
+
+```python
+async def fetch_user_data(user_id: int):
+    # These run in parallel instead of sequentially
+    user, orders, permissions = await asyncio.gather(
+        session.execute(select(User).where(User.id == user_id)),
+        session.execute(select(Order).where(Order.user_id == user_id)),
+        session.execute(select(Permission).where(Permission.user_id == user_id)),
+    )
+    return UserResult(user=user, orders=orders, permissions=permissions)
+```
+
+**Expected p99 impact:** Converts O(n) sequential queries to O(1) wall-clock time for parallelizable paths. High impact if many independent reads exist.
+
+### Fix 5: Add Response Caching for Hot Paths (Conditional Impact)
+
+Only fix if tracing shows the same queries repeating identically:
+
+```python
+from functools import lru_cache
+from cachetools import TTLCache
+
+cache = TTLCache(maxsize=1000, ttl=60)  # 60-second TTL
+
+@cache_api(cache)
+def get_profile(user_id: int):
+    ...
+
+# Invalidation on writes
+def update_user(user_id, data):
+    cache.pop(user_id, None)
+    ...
+```
+
+---
+
+## Investigation Execution Plan
+
+```
+Phase 1 (30 min) — Instrument & Capture:
+  ├─ Deploy QueryProfiler middleware
+  ├─ Enable py-spy continuous recording
+  └─ Verify pool metrics endpoint is live
+
+Phase 2 (30 min) — Analyze:
+  ├─ Parse traces: count N+1 detections vs non-N+1 high-latency requests
+  ├─ Check py-spy flame graph: dominant wait location
+  ├─ Cross-reference: do N+1 requests correlate with high checkout times?
+  └─ PostgreSQL: EXPLAIN ANALYZE top 5 slowest queries from logs
+
+Phase 3 (Decision point):
+  ├─ IF N+1 detected AND pool checkout normal → Apply Fix 1 first
+  ├─ IF pool checkout p99 > 100ms → Apply Fix 3 immediately (safe rollback)
+  ├─ IF sequential scans found → Apply Fix 2 (CONCURRENTLY, zero downtime)
+  └─ THEN re-deploy and measure p50/p99 delta
+
+Phase 4 (Validation):
+  ├─ Compare p50/p99 before deploy vs after each fix
+  ├─ Verify queries-per-request returns to baseline
+  └─ Confirm pool utilization drops below 70% peak
+```
+
+---
+
+## Why This Approach Works
+
+The p50-p99 divergence with flat CPU/memory is the strongest signal that **something blocks occasionally rather than always**. N+1 queries produce exactly this pattern: most requests go through clean paths, but any request hitting a list-with-relations endpoint suffers exponentially. The pool connection spike is a downstream effect — more simultaneous queries from N+1 consume more pool slots, creating a secondary amplification loop.
+
+Fixing N+1 addresses the root cause. Tuning the pool mitigates the symptom. Adding indexes prevents regression. Together they should recover the full p99 regression and add resilience against future query-count growth.

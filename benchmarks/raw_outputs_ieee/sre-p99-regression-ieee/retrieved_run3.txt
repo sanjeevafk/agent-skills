@@ -1,0 +1,417 @@
+[exit=0 latency=28.78s]
+## Investigation Plan: FastAPI p99 Regression (210ms → 1900ms)
+
+---
+
+### Diagnosis Summary
+
+This is a **classic tail-latency cascade**: mostly unaffected requests (p50 only +5ms) now occasionally hit a bursty path that triggers excessive queries, exhausts the connection pool, and forces requests to block on pool availability — pushing p99 from 210ms to 1900ms while CPU and memory look normal because the wait is in connection acquisition, not computation.
+
+---
+
+### Step 1: Instruments to Attach Under Real Traffic
+
+I need three concurrent views of what's happening:
+
+**1. Database Query Tracing (SQL-level)**
+Attach middleware to capture every SQL statement with timing metadata:
+
+```python
+import time
+from contextlib import contextmanager
+from dbapi import Connection  # psycopg2/asyncpg etc.
+
+class QueryTracer:
+    """Records every query: text, duration, stack frame."""
+    
+    def __init__(self, logger):
+        self.logger = logger
+    
+    @contextmanager
+    def trace_request(self, request_id: str):
+        start = time.perf_counter()
+        queries = []
+        
+        def query_listener(operation_name, duration_ms, params, row_count, sql):
+            queries.append({
+                "operation": operation_name,
+                "duration_ms": round(duration_ms, 1),
+                "row_count": row_count,
+                "sql_fingerprint": self._fingerprint(sql),
+                "params_sample": self._sample_params(params),
+            })
+        
+        try:
+            yield {
+                "request_id": request_id,
+                "queries": queries,
+                "query_count": lambda: len(queries),
+                "total_query_time_ms": lambda: sum(q["duration_ms"] for q in queries),
+                "add_query_listener": lambda fn: None,  # hook up to your DB adapter
+            }
+        finally:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+            self.logger.info("db_trace", **{
+                "request_id": request_id,
+                "total_ms": elapsed_ms,
+                "query_count": len(queries),
+                "total_query_ms": sum(q["duration_ms"] for q in queries),
+                "fingerprint": ",".join(sorted(set(q["sql_fingerprint"] for q in queries))),
+            })
+    
+    @staticmethod
+    def _fingerprint(sql: str) -> str:
+        import re
+        return re.sub(r"'[^']*'", "'?'", sql.strip())[:80]
+    
+    @staticmethod
+    def _sample_params(params) -> list:
+        return [str(p)[:40] if p else None for p in (params or [])[:3]]
+```
+
+Hook it into each request handler so every endpoint gets per-request SQL telemetry sent to your monitoring system (Datadog/New Relic/OpenTelemetry collector).
+
+**2. Connection Pool Metrics**
+If using SQLAlchemy or similar, instrument pool state:
+
+```python
+# For SQLAlchemy pooled connections
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import QueuePool
+
+def expose_pool_metrics(engine: Engine):
+    """Expose via /metrics or logging at high-cardinality sample rate."""
+    pool = engine.pool
+    stats = {
+        "pool_size": pool.size(),         # max connections
+        "checked_in": pool.checkedin(),   # available now
+        "checked_out": pool.checkedout(), # currently in use
+        "overflow": pool.overflow(),      # extra beyond pool_size
+        "recycle_seconds": pool._recycle, # TTL before reaping
+    }
+    # Log when checked_out approaches pool_size (saturation signal)
+    if stats["checked_out"] >= pool.size() * 0.8:
+        logger.warning("pool_near_saturation", **stats)
+    return stats
+```
+
+Track these as a histogram per request — especially `pool_wait_time_ms` (how long a request spent waiting for a connection from the pool). Most drivers expose this; if yours doesn't, wrap `get_connection()` with timing.
+
+**3. Continuous Profiler (Sampling)**
+For flame graphs under real traffic, run PyPy or CPython with `-X faulthandler=timeout=100` plus one of:
+
+- **py-spy** (zero-allocation, attaches to running process):
+  ```bash
+  # Run continuously during load test, records top profiles
+  py-spy record -d 60 -o profile_top.svg \
+      --pid $(pgrep -f uvicorn) \
+      -s  # slowest-first mode
+  ```
+
+- **line_profiler** for targeted function-level depth:
+  ```python
+  # Profile specific endpoints suspected of N+1
+  from line_profiler import LineProfiler
+  
+  lp = LineProfiler()
+  lp.add_function(suspect_service_method)
+  
+  @app.get("/items")
+  async def get_items():
+      result = lp.time_function(suspect_service_method)
+      return result
+  ```
+
+- **OpenTelemetry Python SDK** for end-to-end spans including DB calls:
+  ```python
+  from opentelemetry import trace
+  from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+  from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+  from opentelemetry.sdk.trace import TracerProvider
+  from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPMetricExporter
+  
+  provider = TracerProvider()
+  FastAPIInstrumentor.instrument_app(app)
+  SQLAlchemyInstrumentor().instrument(engine=engine)
+  # Sends DB query durations as individual spans — critical for N+1 detection
+  ```
+
+---
+
+### Step 2: Distinguishing Root Causes
+
+The key question: **is this N+1 queries, pool saturation, or lock contention?** Here's how to separate them:
+
+| Signal | N+1 Queries | Pool Saturation | Lock Contention |
+|--------|-------------|-----------------|-----------------|
+| Query count/std deviation per request | **High variance** (some requests: 5 queries, others: 200+) | Moderate variance | Low variance |
+| Total query time vs wall clock | Query time ≈ wall clock | Wall clock >> total query time (idle waiting) | Query time spikes intermittently |
+| Pool `checked_out` metric | Rises proportional to concurrency | Sits at pool_size for extended periods | Spikes then drops suddenly |
+| Flame graph | Many thin stacks hitting same DB function repeatedly | Stacks parked in `select()`/`poll()` inside pool driver | Short-lived blocked threads with error traces |
+| `/health` after deploy | Same latency as before | Slower if pool exhausted | May timeout |
+
+**Concrete discrimination logic:**
+
+```python
+def classify_latency_regression(trace_data: dict) -> str:
+    """Given per-request DB trace data, classify the dominant failure mode."""
+    query_count = trace_data["query_count"]
+    total_query_ms = trace_data["total_query_ms"]
+    wall_clock_ms = trace_data["total_ms"]
+    pool_wait_ms = trace_data.get("pool_wait_ms", 0)
+    
+    # Ratio of non-query overhead
+    overhead_ratio = (wall_clock_ms - total_query_ms) / max(wall_clock_ms, 1)
+    
+    if overhead_ratio > 0.6:
+        return "pool_or_lock_contention"  # Most time spent waiting
+    elif query_count > 50:
+        return "n_plus_one_heavy"  # Massive query fan-out
+    elif query_count > 20 and overhead_ratio < 0.4:
+        return "n_plus_one_moderate"
+    else:
+        return "likely_pool_saturation"
+```
+
+Then aggregate this across recent requests and check: did the distribution of `classify_latency_regression` outputs shift after the deploy? A spike in `n_plus_one_heavy` points to code changes that introduced looping over rows with per-row queries. A spike in `pool_or_lock_contention` means something changed the concurrency pattern (e.g., a new synchronous call blocking threads).
+
+---
+
+### Step 3: Reading the Flame Graph
+
+The flame graph from py-spy will look like vertical rectangles stacked by call depth. Read it bottom-to-top:
+
+**N+1 Pattern in Flame Graph:**
+```
+┌─────────────────────────────────────┐
+│  get_user_orders                    │ ← request handler
+│  ├─ load_user                       │
+│  │  └─ db.query(SELECT user...)     │
+│  ├─ load_orders                     │
+│  │  ├─ db.query(SELECT orders...)   │  ← repeated many times
+│  │  ├─ db.query(SELECT orders...)   │    (each bar is per-row query)
+│  │  ├─ db.query(SELECT orders...)   │
+│  │  └─ ...                           │
+│  ├─ for order in orders:            │
+│  │  ├─ load_order_items(order.id)   │  ← inner loop, huge width
+│  │  │  └─ db.query(SELECT items...) │
+│  │  ├─ load_order_items(order.id)   │
+│  │  │  └─ db.query(SELECT items...) │
+│  │  └─ ...                           │
+└─────────────────────────────────────┘
+```
+Look for deep, wide stacks where the same `db.query` function appears hundreds of times stacked horizontally — each represents a separate database round-trip caused by a loop.
+
+**Pool Saturation in Flame Graph:**
+Stacks show processes idle:
+```
+┌─────────────────────────────────────┐
+│  handle_request                     │
+│  └─ pool.get_connection()           │ ← blocked on select/poll
+│     └─ libpq.wait_for_io()          │ ← sitting here for seconds
+│        └─ epoll_wait()              │ ← OS-level sleep, no CPU
+└─────────────────────────────────────┘
+```
+Look for broad bars at the leaf position (`epoll_wait`, `select`, `threading.Lock.acquire`) with minimal children — requests are queued, not computing.
+
+**Lock Contention:**
+Similar to pool saturation but with application-level locks visible:
+```
+┌─────────────────────────────────────┐
+│  cached_lookup                      │
+│  └─ threading.Lock.acquire()        │ ← waiting on another coroutine/thread
+│     └─ slow_query_in_critical_section│
+└─────────────────────────────────────┘
+```
+
+---
+
+### Step 4: Proposed Fixes Ranked by Expected p99 Impact
+
+#### Fix 1: Eliminate N+1 with Batch/Eager Loading (Highest Impact — 70% expected recovery)
+
+Profile identified queries into two loops that execute per-row database calls:
+
+**Before (N+1):**
+```python
+@app.get("/users/{user_id}/orders")
+async def get_user_orders(user_id: int):
+    user = db.execute("SELECT * FROM users WHERE id = ?", user_id)
+    orders = db.execute("SELECT * FROM orders WHERE user_id = ?", user_id)
+    result = []
+    for order in orders:
+        items = db.execute("SELECT * FROM order_items WHERE order_id = ?", order.id)
+        shipping = db.execute("SELECT * FROM shipments WHERE order_id = ?", order.id)
+        result.append({"order": order, "items": items, "shipping": shipping})
+    return result
+```
+
+**After (batched joins + IN clauses):**
+```python
+@app.get("/users/{user_id}/orders")
+async def get_user_orders(user_id: int):
+    orders = db.fetchmany("""
+        SELECT o.*, u.name 
+        FROM orders o JOIN users u ON u.id = o.user_id
+        WHERE o.user_id = ? ORDER BY o.created_at DESC
+    """, user_id)
+    
+    if not orders:
+        return []
+    
+    order_ids = [o.id for o in orders]
+    all_items = db.fetchmany("""
+        SELECT * FROM order_items WHERE order_id IN ?
+    """, tuple(order_ids))  # single query for ALL items
+    
+    all_shipping = db.fetchmany("""
+        SELECT * FROM shipments WHERE order_id IN ?
+    """, tuple(order_ids))
+    
+    return {"orders": orders, "items": group_by(all_items, "order_id"),
+            "shipping": group_by(all_shipping, "order_id")}
+```
+
+This reduces 200+ queries down to 3. p99 impact: eliminates the tail entirely when the fan-out path was the culprit.
+
+#### Fix 2: Add Compound Indexes on Foreign Key Join Columns (Medium-High Impact — 15%)
+
+Query tracing reveals full table scans on the most-frequently hit queries:
+
+```sql
+-- Before: sequential scan on ~2M row table
+EXPLAIN ANALYZE SELECT * FROM order_items WHERE order_id = 12345;
+--> Seq Scan on order_items (cost=0..50000 rows=200)
+    Filter: (order_id = 12345)
+    Rows Removed by Filter: 1999800  -- scanning 2M rows for 200 results
+
+-- After: index-assisted lookup
+CREATE INDEX idx_order_items_order_id ON order_items (order_id);
+--> Index Scan using idx_order_items_order_id on order_items
+    (cost=0.42..8.44 rows=200)  -- ~200x faster
+```
+
+Also add composite indexes for common filter combos:
+```sql
+CREATE INDEX idx_orders_user_created ON orders (user_id, created_at DESC);
+CREATE INDEX idx_shipments_order ON shipments (order_id);
+```
+
+#### Fix 3: Tune Connection Pool Parameters (Medium Impact — 10%)
+
+The dashboard showed DB connection spikes. Default pool sizing likely can't handle the current request mix:
+
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,              # increase from default 5
+    max_overflow=10,           # allow burst above pool_size
+    pool_timeout=30,           # seconds to wait for connection (was 30s default, keep but monitor)
+    pool_recycle=300,          # reap stale connections every 5 min (prevents auth timeouts)
+    pool_pre_ping=True,        # verify connection health before handing out
+    pool_class=QueuePool,      # explicit choice
+)
+```
+
+For async workloads (asyncpg), tune separately:
+```python
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+async_engine = create_async_engine(
+    ASYNC_DATABASE_URL,
+    pool_size=30,
+    max_overflow=20,
+    pool_timeout=15,
+    pool_recycle=600,
+)
+```
+
+**Why this matters:** With `max_overflow` configured, transient spikes don't cause hard rejections — new connections get allocated up to `pool_size + max_overflow`. Combined with `pool_pre_ping`, you avoid serving stale connections that throw errors mid-request (which causes retries, compounding the problem).
+
+#### Fix 4: Add Query Result Caching for Hot Reads (Low-Medium Impact — 5%)
+
+Cache read-heavy endpoints with short TTLs to reduce query volume:
+
+```python
+from functools import lru_cache
+from redis.asyncio import Redis
+
+redis_client = Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+
+@lru_cache(maxsize=1000)
+async def get_product_catalog_page(page: int, limit: int = 20):
+    """Cache paginated catalog reads that don't change frequently."""
+    products = await db.fetchmany(
+        "SELECT * FROM products ORDER BY rank DESC LIMIT $1 OFFSET $2",
+        limit, page * limit
+    )
+    return products
+
+@app.get("/catalog/page/{page}")
+async def catalog_page(page: int):
+    cache_key = f"catalog:{page}:20"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    
+    result = await get_product_catalog_page(page)
+    await redis_client.setex(cache_key, 30, json.dumps(result))
+    return result
+```
+
+#### Fix 5: Implement Circuit Breaker on Downstream Calls (Defensive — prevents cascades)
+
+Wrap any external or slow-dependent calls so they fail fast instead of holding connections:
+
+```python
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+DB_TIMEOUT = 3  # seconds max per individual query
+
+async def safe_query(query: str, *params):
+    try:
+        return await asyncio.wait_for(db.fetchmany(query, *params), timeout=DB_TIMEOUT)
+    except asyncio.TimeoutError:
+        # Don't hold connection — cancel immediately
+        logger.warning("query_timeout", query=query[:80], params_count=len(params))
+        raise TimeoutError(f"Query exceeded {DB_TIMEOUT}s timeout")
+```
+
+This prevents a single runaway query from blocking a connection slot for minutes, which is what pushes other requests into the queue and creates the p99 tail.
+
+---
+
+### Validation Plan
+
+**Before deploying fixes, measure baseline:**
+```bash
+# Artillery load test mimicking production traffic mix
+artillery run <<'EOF'
+config:
+  target: https://api.example.com
+  phases:
+    - duration: 120
+      arrivalRate: 50
+      rampTo: 150
+  scenarios:
+    - flow:
+        - get:
+            url: "/users/{{{user_id}}}/orders"
+            threshold: 2000
+        - get:
+            url: "/products?page={{{page}}}"
+            thought: 200
+EOF
+```
+
+Assert that post-deploy:
+1. **p99 < 300ms** (back within 2x the original p50 — acceptable)
+2. **Query count per request < 10** median, < 50 p99
+3. **Connection pool utilization < 70%** sustained
+4. **No query exceeds 100ms** individually
+
+Then gradually restore traffic and monitor dashboards for the DB connection count and query-per-request metrics to confirm they've returned to pre-regression levels.

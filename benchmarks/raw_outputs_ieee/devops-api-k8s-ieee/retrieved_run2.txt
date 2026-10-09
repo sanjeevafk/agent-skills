@@ -1,0 +1,351 @@
+[exit=0 latency=27.59s]
+# Production Go API — Kubernetes Manifests
+
+## Complete YAML
+
+### 1. Namespace & ServiceAccount
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api-production
+  labels:
+    environment: production
+---
+# No K8s API access needed for a stateless Go API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: go-api-sa
+  namespace: api-production
+automountServiceAccountToken: false
+```
+
+### 2. Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: api-production
+  labels:
+    app: go-api
+spec:
+  # Base replicas — HPA will scale between min/max
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: go-api
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # Bring up 1 new pod before draining old
+      maxUnavailable: 0    # Never go below desired count during update
+
+  template:
+    metadata:
+      labels:
+        app: go-api
+    spec:
+      serviceAccountName: go-api-sa
+      automountServiceAccountToken: false
+
+      # --- Graceful shutdown budget ---
+      terminationGracePeriodSeconds: 35
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: go-api
+          image: registry.internal/go-api:v1.4.2@sha256:abc123...
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # Resources: request = typical load ceiling, limit = p99 peak with margin
+          resources:
+            requests:
+              cpu: "250m"       # 0.25 core — sufficient for average request throughput
+              memory: "256Mi"   # Hot cache working set
+            limits:
+              cpu: "1000m"      # 1 core — won't throttle at p99; ~4x headroom above request
+              memory: "512Mi"   # 2× request allows burst without OOMKill
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          # =============================================
+          # PROBE ARITHMETIC (see explanation below)
+          # =============================================
+
+          # Phase 1: App starts → cache warms (20s cold start)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 40
+            periodSeconds: 1
+            # Total allowance: 40 × 1s = 40 seconds
+            # Covers: process init (~2s) + TLS listener (~0.5s) + DB dial (~1s) + cache warmup (~20s) + safety buffer (~16.5s)
+
+          # Phase 2: Cache warmed → normal operation
+          # Takes effect immediately after startupProbe succeeds (or at any point if you want deadlock detection earlier).
+          # With a slow-starting app, it's safer to let startupProbe fully cover initial warmup.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 45     # Start checking only after worst-case warmup window
+            periodSeconds: 10           # Check every 10s
+            failureThreshold: 3         # 3 consecutive failures → kill + restart
+            timeoutSeconds: 2           # Fail fast if a single probe hangs
+            # Time to detect deadlock: 45s initial + 3 × 10s = 75s max before restart
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3      # Begin probing once (but won't route traffic until /ready returns 200)
+            periodSeconds: 5
+            failureThreshold: 2         # 2 consecutive misses → remove from endpoints
+            timeoutSeconds: 2
+            # Time to detect unavailability: 2 × 5s = 10s
+
+          # PreStop hook: drains the connection table so LoadBalancer doesn't send new requests
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c",
+                          "sleep 15"]              # See termination-drain sequence below
+
+          # Writable tmp for file uploads / temp files
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            # Secrets mounted as FILES, not env vars
+            - name: secrets
+              mountPath: /etc/secrets
+              readOnly: true
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: secrets
+          secret:
+            secretName: go-api-secrets
+            defaultMode: 0400  # Read-only, owner-only permissions
+
+---
+# Minimal Service — ClusterIP (internal only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-api
+  namespace: api-production
+spec:
+  selector:
+    app: go-api
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+  type: ClusterIP
+```
+
+### 3. HorizontalPodAutoscaler (CPU + Custom Queue Depth)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api-hpa
+  namespace: api-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    # ----- Scale on average CPU utilization -----
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # Scale when >60% of total requested CPU is used
+
+    # ----- Scale on queue depth (prometheus-adapter exposes this) -----
+    - type: Pods
+      pods:
+        metric:
+          name: queue_depth_per_pod    # Prometheus metric: queue_depth / pod_count
+        target:
+          type: AverageValue
+          averageValue: "5"           # Scale when avg queue/pod exceeds 5
+```
+
+> **Prerequisite:** `prometheus-adapter` must be installed with a rule mapping your queue-depth metric. In `metrics-config.yaml`:
+> ```yaml
+> rules:
+>   - seriesQuery: 'go_api_queue_depth{namespace="api-production"}'
+>     resources:
+>       overrides:
+>         namespace: {resource: "namespace"}
+>         pod:   {resource: "pod"}
+>     name:
+>       matches: "go_api_queue_depth"
+>       as: "queue_depth_per_pod"
+>     metricsProvider:
+>       selector:
+>         matches: "queue_depth"
+>         mode: "RatePerSecond"
+>         labelSelector: null
+> ```
+
+### 4. PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: api-production
+spec:
+  minAvailable: 2          # During voluntary disruptions (node drain, cluster upgrade), keep ≥2 pods live
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+With 3 base replicas this means at most 1 pod can be voluntarily disrupted at a time. With 10 replicas it still allows the same number of concurrent disruptions, which is fine because the fleet is large enough that availability isn't impacted.
+
+If you prefer relative phrasing:
+
+```yaml
+# Alternative: cap disruption fraction instead
+spec:
+  maxUnavailable: 1
+```
+
+---
+
+## Probe Threshold Arithmetic Explained
+
+Three phases, each with its own probe:
+
+| Phase | Probe | Max Duration | What It Guards |
+|-------|-------|-------------|----------------|
+| Cold start (0–40s) | **startupProbe** | `40 × 1s = 40s` | Container dies if it hasn't passed `/health` within 40s |
+| Deadlock detection (post-warmup) | **livenessProbe** | `3 × 10s = 30s` per check window | Container killed after 3 consecutive missed checks |
+| Endpoint routing | **readinessProbe** | `2 × 5s = 10s` per check window | Pod removed from Service endpoints |
+
+**Timeline for cold start:**
+
+```
+t=0      Process starts, opens listeners
+t=2      Startup probe first attempt
+t=2–22   Cache warms in background (POST /cache/warm or lazy-loading)
+t=22     /health returns 200 (cache warmup done)
+t=22–40  Startup probe succeeds → livenessProbe becomes active at t=45
+t=45     Liveness probe begins (initialDelaySeconds ensures we're past worst-case warmup)
+t=55     Readiness probe begins (slightly earlier to confirm traffic routing)
+t=55+    Normal operations: /healthy every 10s, /ready every 5s
+```
+
+Key insight: **Do not use `initialDelaySeconds` on livenessProbe alone.** Without a startupProbe, a pod that takes 30s to warm would get killed by liveness after `initialDelaySeconds` expires mid-warmup. The startupProbe gives deterministic bound (`failureThreshold × periodSeconds`), and livenessProbe starts *after* that window closes (`initialDelaySeconds > startup total`).
+
+---
+
+## Termination-Drain Sequence (Zero Dropped Requests)
+
+When a rolling update or node drain triggers pod removal:
+
+```
+─────────────────────────────── time ───────────────────────────────▶
+
+t=0    kubelet sends SIGTERM to PID 1 (your Go main goroutine)
+       ├─ signal handler calls ctx.Cancel()  → StopAcceptingRequests()
+       │
+t=0    preStop hook runs: `sleep 15`
+       │  ┌─────────────────────────────────────────┐
+       │  │ LoadBalancer health-check                 │
+       │  │ removes endpoint from rotation             │
+       │  │ (kube-proxy updates iptables/IPVS ~2–5s)   │
+       │  └─────────────────────────────────────────┘
+       │
+t≈5    New traffic stops flowing to this pod
+       │
+t=5–15 Graceful drain:
+       ├─ CloseHTTPServer(10s) waits for in-flight requests
+       │  to finish (ctx.WithTimeout wrapper per request)
+       ├─ CloseDBPool(maxConns→0 with graceful wait)
+       └─ Shutdown telemetry flusher
+       │
+t=15   preStop sleep ends
+       │
+t=15–35 Remaining in-flight requests continue completing
+       (still within terminationGracePeriodSeconds=35)
+       │
+t=35   Hard stop: SIGKILL sent to all remaining processes
+       (only reached if requests exceed 35s total)
+```
+
+**Why `terminationGracePeriodSeconds: 35` and `preStop: sleep 15`:**
+
+- `preStop` sleep length = time for **kubernetes network layer** to propagate endpoint removal. kube-proxy updates iptables/IPVS rules in ~2–5s under normal conditions, but 15s provides generous margin for high-latency networks.
+- `terminationGracePeriodSeconds` = preStop duration + your server's `Shutdown(timeout)` deadline + headroom for slowest in-flight request. The difference `35 – 15 = 20s` is what Go's `server.Shutdown(ctx)` gets to wait for in-flight requests.
+
+**Go code pattern:**
+
+```go
+// Main
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+
+srv := &http.Server{Addr: ":8080", Handler: mux}
+
+go func() {
+    <-quit
+    fmt.Println("SIGTERM received, draining...")
+
+    // Context deadline = terminationGracePeriodSeconds – preStop_sleep
+    ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Printf("server forced shutdown: %v", err)
+    }
+}()
+```
+
+---
+
+## Summary Checklist
+
+| Requirement | How It's Met |
+|------------|--------------|
+| 3–10 replicas, CPU + queue-depth | HPA `minReplicas: 3`, `maxReplicas: 10`, dual metrics (CPU @60%, queue/pod @5) |
+| Zero-dropped drain | `maxUnavailable: 0`, `preStop: 15s` grace, `termGrace: 35s`, Go graceful Shutdown |
+| 20s cold cache warmup | startupProbe: `40 × 1s = 40s`, livenessProbe `initialDelaySeconds: 45` |
+| No p99 CPU throttling | Request `250m`, limit `1000m` (4× headroom), HPA scales before throttling hits |
+| PDB during node upgrades | `minAvailable: 2` or `maxUnavailable: 1` |
+| Secrets as files | `secret` volume with `defaultMode: 0400`, mounted at `/etc/secrets` |

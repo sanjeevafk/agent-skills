@@ -1,0 +1,767 @@
+[exit=0 latency=51.96s]
+# OrderService Refactoring Campaign
+
+## Current State & Problem Profile
+
+A single `OrderService` class doing too much: input validation, pricing computation, tax calculation, database persistence, email dispatch, and audit logging across **34 fields** and **~1,400 lines** with direct SQL embedded inside business methods. No test suite exists.
+
+---
+
+## Phase 0 — Discovery & Baseline
+
+### Scope Analysis (grep-driven)
+
+Before touching any code, establish what you're dealing with:
+
+```bash
+# All methods and their approximate line counts
+grep -n 'def \|class ' src/order_service.py | grep -E '(    def |_def )'
+
+# Every raw SQL string literal — these are boundary markers
+grep -n '".*FROM\|".*INSERT\|".*UPDATE\|".*DELETE\|'.*\*.select(' src/order_service.py
+
+# Every external dependency hidden inside methods
+grep -n 'email\.send\|smtp\.\|Connection(\|cursor(\|execute(' src/order_service.py
+
+# Public API surface — nothing in here can change until Phase 4
+grep -n 'def [a-z]' src/order_service.py | head -34
+```
+
+**Deliverable**: A one-page map listing each public method, its side effects (SQL writes, emails sent), and its dependencies. This becomes the source of truth for golden-master assertions.
+
+---
+
+## Phase 1 — Golden-Master / Characterization Tests
+
+The goal: prove behavioral equivalence after every single refactor commit. These tests don't assert what the code *should* do — they assert what it *actually* does right now. That's the distinction between characterization tests (safety net) and unit tests (design intent).
+
+### Strategy Overview
+
+| Side Effect | How to Snapshot | Verification |
+|---|---|---|
+| **Database writes** | Intercept at cursor level: record `(query, params)` tuples executed during the call | Post-call replay against an in-memory DB; compare row counts |
+| **Email dispatch** | Mock/stub the email sender; capture subject, body, recipients, attachments | Assert exact strings + metadata from captured calls |
+| **Return values** | Call every public method with fixed fixtures; serialize return dicts to JSON snapshots | Diff against committed fixture files |
+| **Exceptions** | Feed invalid inputs; record exception type + message | Re-assert same exception class with same message text |
+
+### Infrastructure: Test Harness Classes
+
+```python
+"""Tests/fixtures/order_characterization.py
+
+All tests here use REAL collaborators behind lightweight stubs that record
+what happened rather than returning fake data. This preserves side-effect
+behavior while making the execution deterministic.
+"""
+
+import json
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+from src.order_service import OrderService
+from src.infrastructure.database import Connection
+from src.notifications.email import EmailSender
+
+
+# ── Stubs that record side effects ────────────────────────────────────────
+
+class SqlRecorder:
+    """Intercepts DB calls and logs (sql, params) tuples instead of hitting
+    a live database. After the service call we verify by replaying into an
+    ephemeral SQLite instance."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        self.calls.append((sql, params))
+
+    def fetchone(self, sql: str, params: tuple = ()) -> tuple | None:
+        # Return a small canned result set for lookups
+        return {"id": "ORD-001", "status": "pending"}
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return [("line1", "item-a", 10, 2)]
+
+    def lastrowid(self) -> int:
+        return 42
+
+
+class EmailCapture:
+    """Collects send_*() invocations without actually contacting SMTP."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def send_order_confirmation(self, order_id: str, to: str, items: list, total: float) -> None:
+        self.sent.append({
+            "method": "send_order_confirmation",
+            "order_id": order_id,
+            "to": to,
+            "items": items,
+            "total": total,
+        })
+
+    def send_tax_receipt(self, order_id: str, to: str, tax_amount: float) -> None:
+        self.sent.append({
+            "method": "send_tax_receipt",
+            "order_id": order_id,
+            "to": to,
+            "tax_amount": tax_amount,
+        })
+
+
+class AuditLoggerStub:
+    """Records audit entries in memory."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+
+    def log(self, action: str, entity_type: str, entity_id: str, details: dict) -> None:
+        self.entries.append({
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "details": details,
+        })
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────
+
+FIXTURE_PATH = Path(__file__).parent / "snapshots"
+
+def _load_snapshot(method_name: str) -> dict:
+    path = FIXTURE_PATH / f"{method_name}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def _save_snapshot(method_name: str, data: dict) -> None:
+    FIXTURE_PATH.mkdir(parents=True, exist_ok=True)
+    path = FIXTURE_PATH / f"{method_name}.json"
+    path.write_text(json.dumps(data, indent=2, default=str))
+
+
+# ── Base class so every characterization test gets the infrastructure ────
+
+class OrderServiceCharacterizationTest(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.sql_recorder = SqlRecorder()
+        self.email_capture = EmailCapture()
+        self.audit_logger = AuditLoggerStub()
+
+    # Helper factories that mirror how production wires the real collaborators
+    def _make_sut(self) -> OrderService:
+        return OrderService(
+            db=self.sql_recorder,          # will be replaced with Connection(...) later
+            email=self.email_capture,      # will be replaced with EmailSender(...) later
+            audit=self.audit_logger,
+        )
+
+
+# ── Concrete characterization tests ──────────────────────────────────────
+
+class CreateOrderGoldenMaster(OrderServiceCharacterizationTest):
+    """Behavior snapshot for OrderService.create_order(...).
+
+    Records: SQL executed, emails fired, return value shape,
+             audit trail, and exceptions on bad input.
+    """
+
+    def _capture_full_result(self) -> dict:
+        """Serialize everything that happened during the most recent test
+        call so we can diff it against the committed snapshot on re-runs."""
+        return {
+            "return_value": getattr(self, "_last_return_value", None),
+            "sql_calls": self.sql_recorder.calls,
+            "emails_sent": self.email_capture.sent,
+            "audit_entries": self.audit_logger.entries,
+            "exception": getattr(self, "_last_exception", None),
+        }
+
+    def _run_and_snapshot(self, method_name: str, *args, **kwargs):
+        """Execute the target method, catch any exception, then save or
+        compare the serialized outcome against the committed snapshot."""
+        try:
+            result = self._last_method(*args, **kwargs)
+            self._last_return_value = result
+            self._last_exception = None
+        except Exception as exc:
+            self._last_return_value = None
+            self._last_exception = {"type": type(exc).__name__, "message": str(exc)}
+
+        outcome = self._capture_full_result()
+
+        # On FIRST run: generate the golden snapshot file.
+        # On subsequent runs: assert behavior matches snapshot.
+        snapshot = _load_snapshot(method_name)
+        if not snapshot:
+            _save_snapshot(method_name, outcome)
+            self.skipTest(f"Generated new golden snapshot for {method_name}")
+
+        self.assertEqual(outcome["sql_calls"], snapshot["sql_calls"])
+        self.assertEqual(outcome["emails_sent"], snapshot["emails_sent"])
+        self.assertEqual(outcome["audit_entries"], snapshot["audit_entries"])
+        self.assertEqual(type(outcome["exception"]).__name__ if outcome["exception"] else None,
+                         type(snapshot["exception"]).__name__ if snapshot.get("exception") else None)
+        if outcome.get("return_value") and snapshot.get("return_value"):
+            self.assertEqual(outcome["return_value"]["order_id"],
+                             snapshot["return_value"]["order_id"])
+
+
+class UpdateOrderStatusGoldenMaster(OrderServiceCharacterizationTest):
+    pass  # identical structure — parametrized would work but clarity > cleverness here
+
+
+class CancelOrderGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+class CalculatePricingGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+class ProcessRefundGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+# ── Fixture generation runner ────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    """Run with --generate flag to produce fresh golden snapshots when
+    comparing against production, not the old snapshots."""
+    generate = "--generate" in sys.argv
+    unittest.main()
+```
+
+### How to Prove Behavior Preservation at Every Commit
+
+Each commit must satisfy **three gates**:
+
+| Gate | Check | Tool |
+|---|---|---|
+| **Gate 1 — Golden master** | `python -m pytest tests/fixtures/order_characterization.py -v` — ALL existing snapshots pass | CI block |
+| **Gate 2 — No dead SQL** | `grep -c "INSERT\|UPDATE\|DELETE\|SELECT" src/old_order_service.py` should equal the baseline count — confirms you haven't accidentally dropped a statement | Pre-commit hook |
+| **Gate 3 — API surface frozen** | Public method signatures in `src/order_service.py` unchanged until Phase 4 | `inspect.signature()` regression check in CI |
+
+> If Gate 2 fails, you either added SQL (missing from golden master) or removed some (regression). Investigate immediately — do **not** suppress the failure.
+
+---
+
+## Phase 2 — Extract Interfaces (Seam Planning)
+
+With characterization tests passing (Phase 1 green), introduce seams. Each seam turns a concrete dependency into an abstracted protocol/interface behind which implementations can swap freely.
+
+### Seam Extraction Order & Rationale
+
+Extract from **highest coupling → lowest coupling**, because each step makes the next easier. The bottleneck collaborator constrains how cleanly you can isolate the rest.
+
+#### Step 2a — Database layer (`IDataRepository`)
+
+**Why first:** Direct SQL embedded throughout methods is the single biggest barrier to reasoning about the code. Once the DB access is behind an interface, you can test all business logic with an in-memory store, removing non-determinism from the equation.
+
+**Interface design** (keep it minimal — only the queries actually called):
+
+```python
+"""src/domain/repositories.py"""
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+class IRepository(ABC):
+    """Minimal query surface needed by OrderService."""
+
+    @abstractmethod
+    def find_order_by_id(self, order_id: str) -> dict[str, Any] | None:
+        pass
+
+    @abstractmethod
+    def insert_order(self, order_data: dict[str, Any]) -> str:
+        pass
+
+    @abstractmethod
+    def update_order_status(self, order_id: str, status: str, updated_at: str) -> None:
+        pass
+
+    @abstractmethod
+    def insert_order_line_items(self, order_id: str, items: list[dict[str, Any]]) -> None:
+        pass
+
+    @abstractmethod
+    def get_tax_rate_for_region(self, region_code: str) -> float:
+        pass
+
+    @abstractmethod
+    def upsert_inventory_reservation(self, sku: str, qty: int) -> None:
+        pass
+
+    @abstractmethod
+    def delete_inventory_reservation(self, reservation_id: str) -> None:
+        pass
+
+
+class LegacySqlRepository(IRepository):
+    """Thin adapter wrapping the existing raw-SQL execution the way
+    OrderService currently calls it. Serves as a drop-in replacement
+    while we extract the domain logic outward."""
+
+    def __init__(self, raw_connection) -> None:
+        self._conn = raw_connection
+
+    def find_order_by_id(self, order_id: str) -> dict[str, Any] | None:
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def insert_order(self, order_data: dict[str, Any]) -> str:
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            INSERT INTO orders (id, customer_id, status, total, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+        """, (order_data["id"], order_data["customer_id"],
+              order_data["status"], order_data["total"]))
+        return order_data["id"]
+
+    def update_order_status(self, order_id: str, status: str, updated_at: str) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            UPDATE orders SET status = ?, updated_at = ? WHERE id = ?
+        """, (status, updated_at, order_id))
+
+    def insert_order_line_items(self, order_id: str, items: list[dict[str, Any]]) -> None:
+        cursor = self._conn.cursor()
+        for item in items:
+            cursor.execute("""
+                INSERT INTO order_lines (order_id, sku, description, unit_price, qty)
+                VALUES (?, ?, ?, ?, ?)
+            """, (order_id, item["sku"], item["description"],
+                  item["unit_price"], item["qty"]))
+
+    def get_tax_rate_for_region(self, region_code: str) -> float:
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT rate FROM tax_rates WHERE region_code = ?", (region_code,))
+        row = cursor.fetchone()
+        return float(row[0]) if row else 0.0
+
+    def upsert_inventory_reservation(self, sku: str, qty: int) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            INSERT INTO inventory_reservations (sku, qty, status)
+            VALUES (?, ?, 'reserved')
+            ON CONFLICT(sku) DO UPDATE SET qty = qty + excluded.qty
+        """, (sku, qty))
+
+    def delete_inventory_reservation(self, reservation_id: str) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute("DELETE FROM inventory_reservations WHERE id = ?",
+                       (reservation_id,))
+```
+
+**Inversion point:** Change `OrderService.__init__` to accept `IRepository` instead of raw `Connection`. Run golden-master tests. If they still pass, you're done with this step.
+
+#### Step 2b — Email notification layer (`INotificationService`)
+
+**Why second:** Email has zero fan-in from other domain modules right now, so interfacing it won't expose downstream breaking changes. It's purely an output concern.
+
+```python
+"""src/domain/services.py"""
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class INotificationService(ABC):
+    @abstractmethod
+    def send_order_confirmation(self, order_id: str, customer_email: str,
+                                items: list[dict], subtotal: float,
+                                tax: float, total: float) -> None:
+        pass
+
+    @abstractmethod
+    def send_tax_receipt(self, order_id: str, customer_email: str,
+                         tax_amount: float) -> None:
+        pass
+
+    @abstractmethod
+    def send_cancellation_notice(self, order_id: str, customer_email: str,
+                                 refund_total: float) -> None:
+        pass
+
+
+class LegacyEmailAdapter(INotificationService):
+    """Wraps the current self._smtp.send_* calls so we can swap the
+    transport without rewriting caller code."""
+
+    def __init__(self, smtp_client) -> None:
+        self._smtp = smtp_client
+
+    def send_order_confirmation(self, order_id, customer_email, items,
+                                subtotal, tax, total):
+        self._smtp.send_template("order_confirmation", customer_email, {
+            "order_id": order_id, "items": items,
+            "subtotal": subtotal, "tax": tax, "total": total,
+        })
+
+    def send_tax_receipt(self, order_id, customer_email, tax_amount):
+        self._smtp.send_template("tax_receipt", customer_email, {
+            "order_id": order_id, "tax_amount": tax_amount,
+        })
+
+    def send_cancellation_notice(self, order_id, customer_email, refund_total):
+        self._smtp.send_template("order_cancellation", customer_email, {
+            "order_id": order_id, "refund_total": refund_total,
+        })
+```
+
+#### Step 2c — Pricing engine (`IPricingStrategy`)
+
+**Why third:** Pricing is pure-computation with no side effects — easy to characterize and easy to swap once the collaborator abstraction exists.
+
+```python
+class IPricingStrategy(ABC):
+    @abstractmethod
+    def compute(self, items: list[dict], region_code: str,
+                promo_code: str | None) -> dict[str, float]:
+        """Returns {subtotal, discounts, shipping, tax, grand_total}."""
+        pass
+
+
+class DefaultPricingEngine(IPricingStrategy):
+    """Keeps the existing inline pricing math isolated from OrderService."""
+
+    def __init__(self, repository: IRepository) -> None:
+        self._repo = repository
+
+    def compute(self, items, region_code, promo_code):
+        subtotal = sum(item["unit_price"] * item["qty"] for item in items)
+        discount = self._apply_promo(subtotal, promo_code)
+        shipping = self._compute_shipping(subtotal - discount, items)
+        tax_rate = self._repo.get_tax_rate_for_region(region_code)
+        tax = (subtotal - discount) * tax_rate
+        grand_total = subtotal - discount + shipping + tax
+        return {
+            "subtotal": round(subtotal, 2),
+            "discounts": round(discount, 2),
+            "shipping": round(shipping, 2),
+            "tax": round(tax, 2),
+            "grand_total": round(grand_total, 2),
+        }
+
+    def _apply_promo(self, subtotal: float, promo_code: str | None) -> float:
+        if not promo_code:
+            return 0.0
+        # Existing promo logic moved here verbatim
+        ...
+
+    def _compute_shipping(self, net: float, items: list[dict]) -> float:
+        # Existing shipping logic moved here verbatim
+        ...
+```
+
+#### Step 2d — Validation layer (`IOrderValidator`)
+
+**Why fourth:** Validation touches 34 fields across multiple methods. Isolate it last because it depends on knowing the final shape of the order aggregate.
+
+```python
+class IOrderValidator(ABC):
+    @abstractmethod
+    def validate_create(self, data: dict[str, Any]) -> list[str]:
+        """Returns list of error strings. Empty = valid."""
+        pass
+
+    @abstractmethod
+    def validate_cancel(self, order: dict, reason: str) -> list[str]:
+        pass
+
+    @abstractmethod
+    def validate_refund(self, order: dict) -> list[str]:
+        pass
+
+
+class LegacyValidator(IOrderValidator):
+    """Extracts the ~200 lines of field-level validation scattered through
+    OrderService methods. Copy-paste each conditional into the matching
+    method below, then remove from OrderService. Run golden-master after
+    each removal to confirm behavioral identity."""
+
+    def validate_create(self, data: dict) -> list[str]:
+        errors = []
+        if not data.get("customer_id"):
+            errors.append("customer_id is required")
+        if not data.get("items") or len(data["items"]) == 0:
+            errors.append("at least one line item required")
+        for i, item in enumerate(data.get("items", [])):
+            if not item.get("sku"):
+                errors.append(f"item[{i}].sku is required")
+            if item.get("qty", 0) <= 0:
+                errors.append(f"item[{i}].qty must be positive")
+            if item.get("unit_price", 0) < 0:
+                errors.append(f"item[{i}].unit_price must be non-negative")
+        if not data.get("region_code"):
+            errors.append("region_code is required")
+        return errors
+```
+
+#### Step 2e — Audit logging (`IAuditTrail`)
+
+**Why last:** Audit is append-only observability. It has the softest contract (write-and-forget), so swapping its implementation is the lowest-risk seam. It also doesn't affect return values or control flow — removing it from OrderService never breaks behavior, but keeping it there masks what matters.
+
+```python
+class IAuditTrail(ABC):
+    @abstractmethod
+    def log_order_created(self, order_id: str, customer_id: str, total: float) -> None:
+        pass
+
+    @abstractmethod
+    def log_status_change(self, order_id: str, from_status: str,
+                          to_status: str, actor: str) -> None:
+        pass
+
+    @abstractmethod
+    def log_order_cancelled(self, order_id: str, reason: str) -> None:
+        pass
+
+    @abstractmethod
+    def log_refund_processed(self, order_id: str, amount: float) -> None:
+        pass
+```
+
+---
+
+## Phase 3 — Strangler Fig Steps (Incremental Shipping)
+
+Each step replaces a vertical slice of behavior behind the existing public API. Every step ships as a working, tested commit.
+
+### Strangler Roadmap
+
+```
+Public API (frozen until Phase 4)
+┌─────────────────────────────────────────────────────────┐
+│  create_order()     ──►  Phase 3.1                      │
+│  update_status()    ──►  Phase 3.2                      │
+│  cancel_order()     ──►  Phase 3.3                      │
+│  process_refund()   ──►  Phase 3.4                      │
+│  get_order()        ──►  Phase 3.5                      │
+│  calculate_pricing() ──►  Phase 3.6                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Step 3.1 — Migrate `create_order()` behind the new layers
+
+```
+Before:                                                        After:
+                                                              ┌─────────────────┐
+OrderService.create_order()                                    │  StranglerRouter │
+├── validate (inline ~40 lines)                              ├─────────────────┤
+│    └──► copy to LegacyValidator                              │                  │
+├── compute pricing (inline ~60 lines)                       │  create_order() │
+│    └──► copy to DefaultPricingEngine                        │   │             │
+├── reserve inventory (raw SQL)                               │   ▼             │
+│    └──► adapt via Repository.insert_order +                 │ ┌─────────────┐ │
+│           upsert_inventory_reservation                      │ │ NewService  │ │
+├── persist (raw SQL 2 statements)                           │ │  .create()  │ │
+│    └──► adapt via Repository methods                        │ └─────────────┘ │
+├── send confirmation email (smtp call)                       │                 │
+│    └──► adapt via EmailAdapter                              │ ┌─────────────┐ │
+├── log audit entry                                           │ │ OldService  │ │
+│    └──► delegate to IAuditTrail                             │ │  .create()  │ │
+└─────────────────────────────────────────────────────────────┘ └─────────────────┘
+```
+
+**Implementation pattern per public method:**
+
+1. In `OrderService`, add a `_delegate_to_new_or_legacy()` helper
+2. Route `create_order()` to `NewService.create_order()` by default
+3. Add a feature flag: `USE_NEW_ORDER_SERVICE=False` falls back to the legacy inline implementation
+4. Run golden-master tests
+5. Ship. Rollback is one config toggle.
+
+```python
+# In the migrated OrderService (after creating NewService)
+class OrderService:
+    def __init__(self, ...):
+        self._use_new_impl = bool(os.environ.get("USE_NEW_ORDER_SERVICE"))
+        if self._use_new_impl:
+            self._new_svc = NewOrderService(
+                repository=self._repo,
+                pricing=DefaultPricingEngine(self._repo),
+                notifications=self._email_adapter,
+                audit=self._audit,
+                validator=LegacyValidator(),
+            )
+
+    def create_order(self, data: dict) -> dict:
+        if self._use_new_impl:
+            return self._new_svc.create(data)
+        # Fallback: legacy inline logic (preserved verbatim until Phase 4)
+        return self._legacy_create_order(data)
+```
+
+**Behavior proof:** Golden-master tests must pass with both paths active. Compare results from both branches in CI to catch divergence early.
+
+### Step 3.2 — Migrate `update_status()`
+
+Same routing pattern. The key difference: this method contains the status-transition guard rails (`pending→confirmed→shipped→delivered`). Move those guards into the new service alongside the repository call.
+
+### Step 3.3 — Migrate `cancel_order()`
+
+Handles:
+- Status transition to `cancelled`
+- Inventory release (`delete_inventory_reservation`)
+- Cancellation email
+- Audit log
+
+Migrate as a vertical slice. No shared logic with other methods.
+
+### Step 3.4 — Migrate `process_refund()`
+
+Most complex method: refunds depend on partial fulfillment states, proration logic, and tax adjustments. Characterize thoroughly — golden-master tests should cover partial refunds, full refunds, and already-refunded edge cases.
+
+### Step 3.5 — Migrate `get_order()`
+
+Read-only. Safest migration. Just wire the repository lookup through the new `IRepository.find_order_by_id()`.
+
+### Step 3.6 — Migrate `calculate_pricing()`
+
+Standalone pure function. Move it to `DefaultPricingEngine.compute()` behind `IPricingStrategy`. Update callers from `self._calculate_pricing(...)` to `self._pricing_engine.compute(...)`.
+
+---
+
+## Phase 4 — Module Boundary Realignment (Once All Routes Are Strawmen)
+
+With every public method delegating to the new services, flip the default and delete the legacy bodies. Then split into proper module boundaries:
+
+```
+src/
+├── order_service.py              ← Thin facade / DI container (30 lines)
+├── domain/
+│   ├── aggregates/
+│   │   └── order.py              ← Order value object / entity (data only)
+│   ├── services/
+│   │   ├── new_order_service.py  ← Pure orchestration (no SQL, no SMTP)
+│   │   ├── pricing_engine.py     ← IPricingStrategy impl
+│   │   └── notification_service.py ← Business rules for WHEN to notify
+│   ├── repositories/
+│   │   ├── interfaces.py         ← IRepository, INotificationService, etc.
+│   │   └── sql_repository.py     ← LegacySqlRepository (still uses raw SQL,
+│   │                               ←  but lives in its own module now)
+│   └── validators/
+│       └── order_validator.py    ← IOrderValidator impl
+├── infrastructure/
+│   ├── email/
+│   │   └── smtp_sender.py        ← Real SMTP transport
+│   └── db/
+│       └── connection.py         ← Actual DB driver wrapper
+└── audit/
+    └── logger.py                 ← File/log-based audit trail impl
+```
+
+### Facade Pattern (Final Shape)
+
+```python
+"""src/order_service.py — public entry point. Thin wiring layer."""
+
+from src.domain.services.new_order_service import NewOrderService
+from src.domain.services.pricing_engine import DefaultPricingEngine
+from src.domain.repositories.sql_repository import LegacySqlRepository
+from src.domain.validators.order_validator import LegacyValidator
+from src.infrastructure.email.smtp_sender import SmtpSender
+from src.audit.logger import FileAuditTrail
+
+
+def build_production(service_config: dict):
+    """Construct the full dependency graph. Called once at application start."""
+    conn = Connection(service_config["database_url"])
+    repo = LegacySqlRepository(conn)
+    email = LegacyEmailAdapter(SmtpSender(service_config["smtp_host"]))
+    audit = FileAuditTrail(service_config["audit_log_path"])
+    pricing = DefaultPricingEngine(repo)
+    validator = LegacyValidator()
+
+    svc = NewOrderService(repo, pricing, email, audit, validator)
+    return OrderServiceFacade(svc)
+
+
+class OrderServiceFacade:
+    """Matches the original OrderService public API exactly."""
+
+    def __init__(self, delegate: NewOrderService):
+        self._svc = delegate
+
+    def create_order(self, data: dict) -> dict:
+        return self._svc.create(data)
+
+    def update_status(self, order_id: str, new_status: str,
+                      actor: str) -> dict:
+        return self._svc.update_status(order_id, new_status, actor)
+
+    def cancel_order(self, order_id: str, reason: str,
+                     actor: str) -> dict:
+        return self._svc.cancel(order_id, reason, actor)
+
+    def process_refund(self, order_id: str, reason: str,
+                       actor: str) -> dict:
+        return self._svc.refund(order_id, reason, actor)
+
+    def get_order(self, order_id: str) -> dict | None:
+        return self._svc.lookup(order_id)
+
+    def calculate_pricing(self, items: list, region: str,
+                          promo: str | None) -> dict:
+        return self._svc.calculate(items, region, promo)
+```
+
+---
+
+## Phase 5 — Post-Strangulation Improvements (Optional, Out of Scope for v1)
+
+With the clean architecture in place and tests covering everything:
+
+| Improvement | Effort | Risk |
+|---|---|---|
+| Replace `LegacySqlRepository` with an ORM or typed query builder | Medium | Low — covered by golden masters |
+| Extract `OrderStateMachine` for transition guards | Low | None — pure logic |
+| Add unit tests to `NewOrderService` and each domain service | Low | None — black box now |
+| Add integration tests against a real PostgreSQL in CI | Medium | Depends on infra setup |
+
+---
+
+## Commit Discipline Checklist
+
+Every commit during Phases 2–4 must pass:
+
+```bash
+# 1. Golden-master characterization tests
+pytest tests/fixtures/order_characterization.py -v
+
+# 2. No new SQL in the service layer (only in Repository classes)
+! grep -q 'execute(' src/domain/services/new_order_service.py
+
+# 3. Public API surface unchanged
+python scripts/check_api_surface.py src/order_service.py src/order_service.py.baseline
+
+# 4. Full test suite (once Phase 2 unit tests are added)
+pytest tests/ -x --tb=short
+```
+
+If any gate fails, the commit does **not** ship. Rollback is a single `git revert`.
+
+---
+
+## Summary: What Changes First, Why, and Proof
+
+| Order | Seam | Why First | Behavior Proof |
+|---|---|---|---|
+| 1 | `IRepository` (DB) | Biggest cognitive load; removes non-determinism | Golden-master records all SQL tuples; replay proves equivalence |
+| 2 | `INotificationService` | Zero fan-in, purely outbound | Captured email dicts compared verbatim |
+| 3 | `IPricingStrategy` | Pure function, easiest to isolate | Golden-master captures computed floats to 2dp |
+| 4 | `IOrderValidator` | Depends on knowing the final aggregate shape | Error-string lists compared verbatim |
+| 5 | `IAuditTrail` | Append-only, no control-flow impact | Audit entry lists compared verbatim |
+
+No behavior changes happen at any point. The public API stays frozen until Phase 4. Each commit ships a working system where the strangler router transparently delegates to either the old inline code or the new layer — golden-master tests verify both produce identical observable outcomes.

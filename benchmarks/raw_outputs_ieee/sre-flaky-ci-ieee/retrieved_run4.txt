@@ -1,0 +1,220 @@
+[exit=0 latency=43.79s]
+## Systematic Debugging Analysis
+
+### Phase 1: Observe — Symptoms & Pattern Recognition
+
+Three tests fail out of 240 (~1.25% failure rate). All three share a common trait: they depend on state that isn't under the program's control — system clock, thread scheduling, or data structure internal order. Reruns go green because the race condition or environment dependency doesn't manifest every time.
+
+| Symptom | What it rules out | What it implicates |
+|---|---|---|
+| 3/240 fail (sparse) | No structural bug in core logic | Non-deterministic state dependence |
+| Reruns go green | No stale resource leak | Transient, intermittent state |
+| Correlates with machine load | Purely software-order bugs | Timing/threading/race conditions |
+| Developer timezone matters | Generic timing issues | Wall-clock / timezone references |
+
+### Phase 2: Hypotheses — Ranked by Likelihood
+
+**H1: Test 3 relies on set → unordered iteration.** Python sets have randomized insertion order (via `PYTHONHASHSEED`), and dict insertion order depends on that. This produces different fixture IDs per run. High probability because the symptom is exactly "sometimes fails, rerun goes green" with no external dependency.
+
+**H2: Test 1 asserts a formatted timestamp without controlling the clock.** If the formatted value crosses a boundary (e.g., `"2026-08-25T23:59:59"` vs `"2026-08-26T00:00:01"` at midnight UTC) or assumes a specific tz offset (e.g., `UTC` but local is `EST`), the assertion drifts based on when/how the developer runs it. The timezone correlation is a direct smoking gun.
+
+**H3: Test 2 uses a fixed `sleep(2)` to poll an async worker.** Under load, the event loop may not drain within 2 seconds. On fast CI machines the worker finishes; on a loaded dev box it times out. Classic polling-with-fixed-delay anti-pattern.
+
+### Phase 3: Minimal Reproduction Strategies
+
+For each test, I'll define what the reproduction needs to do and then write the fix code.
+
+---
+
+#### Fix 1: Timestamp Assertion — Freeze Time + Force TZ
+
+**Root cause:** The test calls real-time functions (`datetime.now()`, etc.) whose output depends on wall-clock position and system timezone setting. There is zero determinism.
+
+**Reproduction strategy:** `pytest-timeout` won't help — this isn't slow. Instead, run the test with the system clock shifted (e.g., simulate running at midnight UTC while local TZ is UTC−5) using `freezegun`. The reproduction forces the "bad edge" timestamps and confirms the assertion breaks only when the clock lands on boundaries the real code doesn't guard against.
+
+**Deterministic fix:** Use `freezegun.freeze_time()` to pin `datetime.now()` to a fixed instant, AND explicitly set the expected value against a known tz rather than relying on `localtime`:
+
+```python
+# BEFORE (flaky):
+def test_order_deadline_format():
+    deadline = compute_deadline(order)  # calls datetime.utcnow() internally
+    assert deadline.strftime("%Y-%m-%dT%H:%M:%S") == "2026-08-25T14:30:00"
+
+# AFTER (deterministic):
+from freezegun import freeze_time
+
+@freeze_time("2026-08-25T14:30:00+00:00")  # pinned instant, explicit tz
+def test_order_deadline_format():
+    deadline = compute_deadline(order)
+    # Compare aware datetimes, not strings (strings can mask tz confusion)
+    expected = datetime(2026, 8, 25, 14, 30, 0, tzinfo=timezone.utc)
+    assert deadline.astimezone(timezone.utc) == expected
+```
+
+Key changes:
+1. **Freeze the clock** via `@freeze_time` — eliminates all temporal nondeterminism
+2. **Compare datetime objects**, not formatted strings — removes presentation-layer coupling from the assertion
+3. **Explicit UTC conversion** with `.astimezone(timezone.utc)` — neutralizes any local-TZ mismatch
+
+If `freezegun` isn't already a dev dependency: `pip install -e ".[test]"` (ensure it's in `[test]`). If the codebase uses `time.monotonic()` for delays, replace it consistently so `freezegun` covers it.
+
+---
+
+#### Fix 2: Async Worker Polling — Replace `sleep(2)` with Proper Await
+
+**Root cause:** A fixed `sleep(2)` makes no guarantee about async completion. It's a guess, not a synchronization point. Under CPU/network/disk contention the worker hasn't finished yet.
+
+**Reproduction strategy:** Stress the machine with parallel processes (`stress-ng --cpu 4 --timeout 30 &`) while running just this one test. The `sleep(2)` will exceed the worker's actual runtime, making the timeout fire consistently. Confirm the failure disappears once we switch to a waiter pattern.
+
+**Deterministic fix:** Replace the polling loop with either (a) `asyncio.wait_for()` around the coroutine, or (b) a `asyncio.Event` / queue-based signal, depending on how the worker exposes its result:
+
+```python
+# BEFORE (flaky):
+@pytest.mark.asyncio
+async def test_worker_processes_message(queue):
+    start = asyncio.get_event_loop().time()
+    worker = AsyncWorker(queue)
+    worker.spawn()
+    queue.put_nowait({"type": "process", "payload": "data"})
+
+    await asyncio.sleep(2)  # magic number — hopes the worker is done
+    assert worker.result is not None
+    assert f"{worker.result['latency']:.0f}ms" in str(worker.metrics)
+
+# AFTER (deterministic) — Option A: wait_for the coroutine directly:
+@pytest.mark.asyncio
+async def test_worker_processes_message(queue):
+    worker = AsyncWorker(queue)
+    queue.put_nowait({"type": "process", "payload": "data"})
+
+    # Wait up to 10s for the coroutine; raises TimeoutError if it doesn't complete
+    result = await asyncio.wait_for(worker.process_next(), timeout=10.0)
+
+    assert result is not None
+    latency_ms = int(result["latency"] * 1000)
+    assert f"{latency_ms}ms" in str(worker.metrics)
+
+
+# AFTER (deterministic) — Option B: Event-driven callback (better architecture):
+class AsyncWorker:
+    def __init__(self, queue: asyncio.Queue):
+        self.queue = queue
+        self._ready = asyncio.Event()
+
+    async def process_one(self):
+        msg = await self.queue.get()
+        result = await self._handle(msg)
+        self._ready.set()         # signal completion
+        return result
+
+    @property
+    def done(self):
+        return self._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_worker_processes_message(queue):
+    worker = AsyncWorker(queue)
+    task = asyncio.create_task(worker.process_one())
+    queue.put_nowait({"type": "process", "payload": "data"})
+
+    await worker._ready.wait()   # blocks until the worker signals, zero guessing
+    assert not task.done() or task.exception() is None  # check for errors
+    result = await task
+
+    latency_ms = int(result["latency"] * 1000)
+    assert f"{latency_ms}ms" in str(worker.metrics)
+```
+
+Option B is superior because the worker itself owns the signaling. Option A works if you don't want to change the worker API. Either way: **no more `sleep(n)` in tests**.
+
+---
+
+#### Fix 3: Set-Based Fixture Iteration Order — Sort Before Use
+
+**Root cause:** Sets in Python have non-deterministic iteration order (seeded by `PYTHONHASHSEED`, which randomizes by default since Python 3.3). Converting a set to a list implicitly (`list(my_set)`) produces a different sequence across runs. If downstream logic (or an assertion) depends on that order, the test flakes.
+
+**Reproduction strategy:** Run the same test 50 times with `PYTHONHASHSEED=random` (the default). On some iterations the fixture IDs arrive in ascending order (pass); on others they don't (fail). Confirmed non-determinism.
+
+**Deterministic fix:** Never iterate over a set when order matters. Convert to a sorted collection before yielding or iterating:
+
+```python
+# BEFORE (flaky):
+import pytest
+
+FURNITURE_IDS = {"chair", "table", "lamp"}  # a set!
+
+@pytest.fixture(params=FURNITURE_IDS)  # iteration order is random
+def furniture(request):
+    return get_fixture_item(request.param)
+
+def test_furniture_inventory(furniture):
+    # If FURNITURE_IDS iterates as [lamp, chair, table], the combined count
+    # may differ from when it iterates [chair, table, lamp] due to
+    # mutation side-effects in get_fixture_item().assertion depends on
+    # processing order → sometimes wrong.
+    total = sum(item.price for item in [furniture])
+    assert total <= MAX_BUDGET
+
+
+# AFTER (deterministic):
+@pytest.fixture(params=sorted(FURNITURE_IDS))  # sorted() returns a stable list
+def furniture(request):
+    return get_fixture_item(request.param)
+
+
+# Alternatively — explicitly enumerate in a list literal (clearest intent):
+@pytest.fixture(params=["chair", "lamp", "table"])  # explicit, ordered list
+def furniture(request):
+    return get_fixture_item(request.param)
+```
+
+The sorted approach scales better (add/remove items without updating two places). The list-literal approach is best when you also want the test names to be predictable in CI logs.
+
+Additionally, audit the codebase for any other `for x in some_set:` patterns in tests or fixtures — this was almost certainly not the only place a set's randomness leaked into assertion logic.
+
+---
+
+### Phase 4: Unified Stress-Run Script
+
+To verify all three fixes together, stress-run the suite with controlled conditions:
+
+```bash
+#!/usr/bin/env bash
+# stress_tests.sh — verifies all three fixes under adversarial conditions
+set -euo pipefail
+
+echo "=== Stress-running the 3 target tests ==="
+
+# Load the machine (this simulates CI-vs-dev load differential for Test 2)
+stress-ng --cpu $(nproc) --vm 2 --timeout 30 &
+STRESS_PID=$!
+
+# Run with randomized hash seeds (exposes Set-order bugs for Test 3)
+FAILED=0
+for i in $(seq 1 10); do
+    PYTHONHASHSEED=random pytest \
+        tests/test_timestamp.py::test_order_deadline_format \
+        tests/test_worker.py::test_worker_processes_message \
+        tests/test_furniture.py::test_furniture_inventory \
+        -v -x || FAILED=$((FAILED+1))
+done
+
+kill $STRESS_PID 2>/dev/null || true
+
+if [ $FAILED -gt 0 ]; then
+    echo "FAIL: $FAILED/10 runs failed under adversarial conditions"
+    exit 1
+fi
+echo "PASS: All 10 runs clean under load + random seed"
+```
+
+### Summary of Fixes
+
+| Test | Root Cause | Fix | Category |
+|---|---|---|---|
+| Timestamp assertion | Real clock + implicit TZ | `freezegun` + compare aware datetimes | Temporal determinism |
+| Async worker sleep | Fixed delay ≠ completion signal | `asyncio.wait_for` or `Event` | Synchronization |
+| Set iteration order | `set` → random order | `sorted(set)` or explicit list | Ordering determinism |
+
+All three failures share a single underlying principle: **the test asserts on state it doesn't control**. The fix is always the same — eliminate the uncontrolled variable by freezing it, replacing it with a deterministic primitive, or removing it entirely.

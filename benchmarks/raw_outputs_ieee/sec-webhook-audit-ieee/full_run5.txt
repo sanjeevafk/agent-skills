@@ -1,0 +1,254 @@
+[exit=0 latency=21.30s]
+## Security Review: FastAPI Payment Webhook
+
+Here are the vulnerabilities I identified, ordered by severity:
+
+### 1. Signature Verification Before Input Parsing (CRITICAL)
+
+Verifying the HMAC **after** parsing JSON means the body is deserialized without first confirming it came from the processor. An attacker can inject arbitrary payloads that get parsed (potentially causing DoS via deeply nested objects or large bodies) before signature verification rejects them. The signature must be verified against the raw request body **before any parsing occurs**.
+
+### 2. In-Memory Replay-Id Ledger (HIGH)
+
+An in-memory `dict` has two failure modes:
+- **Process restart loses all records** — concurrent duplicates arriving after a deploy will slip through on both sides.
+- **Memory grows unbounded** — every `event_id` ever seen is retained forever, leading to eventual OOM under sustained traffic.
+
+This should use a database table or Redis with TTL-based expiration.
+
+### 3. No Body Size Limit (HIGH)
+
+Without limiting the request body size, an attacker can send massive payloads consuming memory during parsing. A small malicious body defeats the parser before HMAC verification even runs.
+
+### 4. Processor Error Leaks to Client (MEDIUM)
+
+If processing fails (e.g., database error inside the handler), propagating internal traceback or error details back as HTTP 5xx responses gives attackers reconnaissance data about the system. Internal errors need to return generic messages while keeping details server-side only.
+
+### 5. Rotating Secret Not Handled Gracefully (MEDIUM)
+
+When secrets rotate, the endpoint needs to validate against **multiple** candidate keys simultaneously (current + previous). If it only checks the active key, briefly missed deliveries during rotation are lost — and there's no indication to the caller whether the secret was stale vs. the signature truly invalid.
+
+### 6. Missing Content-Type Enforcement (LOW)
+
+Accepting any `Content-Type` allows attackers to craft requests with misleading types, potentially bypassing middleware or logging. Only `application/json` (or whatever the processor uses) should be accepted.
+
+---
+
+## Corrected Implementation
+
+```python
+"""Payment webhook endpoint for third-party processor integration."""
+
+import hashlib
+import hmac
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# --- Configuration ---
+
+MAX_BODY_SIZE = 65_536  # 64 KB
+HMAC_ALGORITHM = "sha256"
+EVENT_RETENTION = timedelta(hours=24)
+
+
+class _EventLedger:
+    """Redis-backed event-id store with TTL and thread-safe atomic check-and-set.
+
+    Replace the dict implementation with this pattern (shown here with aioredis
+    for illustration; swap the backend for your actual async Redis client).
+
+    On-disk / DB alternatives work too — the key requirements are persistence
+    across restarts and bounded growth via expiry.
+    """
+
+    def __init__(self, redis):  # type: ignore[unresolved-reference]  # aioredis
+        self._r = redis
+
+    async def record_seen(self, event_id: str) -> bool:
+        """Return True if *event_id* was already recorded (replay detected)."""
+        # SETNX with TTL — atomic deduplication in one round-trip
+        inserted = await self._r.set(
+            f"webhook_event:{event_id}",
+            "1",
+            ex=int(EVENT_RETENTION.total_seconds()),
+            nx=True,
+        )
+        return not inserted  # False → new, True → duplicate
+
+
+# Placeholder — wire this up in your startup event
+_redis: Optional[_EventLedger] = None
+
+
+# --- Secret management (rotating) ---
+
+def get_secret_keys() -> list[str]:
+    """Return candidate secrets: [current, previous].
+
+    Swap this out for a vault lookup (AWS Secrets Manager, HashiCorp Vault, etc.)
+    when you move beyond simple env vars.
+    """
+    current = _require_env("WEBHOOK_HMAC_SECRET")
+    previous = _require_env("WEBHOOK_HMAC_SECRET_PREV", optional=True)
+    keys = [current]
+    if previous:
+        keys.append(previous)
+    return keys
+
+
+def _require_env(name: str, *, optional: bool = False) -> Optional[str]:
+    value = _env(name)
+    if value is None:
+        if not optional:
+            raise RuntimeError(f"{name} environment variable is required")
+    return value
+
+
+def _env(name: str) -> Optional[str]:
+    import os
+    return os.environ.get(name)
+
+
+# --- Helpers ---
+
+def verify_hmac(raw_body: bytes, signature: str, content_type: str) -> None:
+    """Verify HMAC-SHA256 signature against all known secrets.
+
+    Raises HTTPException(401) on mismatch.
+    """
+    computed_base = hmac.new(
+        raw_body,
+        msg=None,
+        digestmod=HMAC_ALGORITHM,
+    ).hexdigest()
+
+    valid = any(
+        hmac.compare_digest(computed_base, sig)
+        for sig in _build_signatures(raw_body)
+    )
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+
+def _build_signatures(raw_body: bytes) -> list[str]:
+    return [
+        hmac.new(key.encode(), msg=raw_body, digestmod=HMAC_ALGORITHM).hexdigest()
+        for key in get_secret_keys()
+    ]
+
+
+def _enforce_content_type(request: Request, expected: str) -> None:
+    """Reject requests whose Content-Type doesn't match expectations."""
+    ct = request.headers.get("content-type", "")
+    if not ct.startswith(expected):
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+
+
+def _clean_error(ex: Exception) -> str:
+    """Generic error message — never leak internals."""
+    logger.exception("Webhook processing failed", exc_info=ex)
+    return "Webhook processing failed. Retry with the same event-id."
+
+
+# --- Endpoint ---
+
+@app.post("/webhooks/processor")
+async def handle_webhook(request: Request) -> JSONResponse:
+    """Handle incoming payment webhooks from the third-party processor.
+
+    Processing order matters:
+      1. Content-Type gate
+      2. Raw-body size limit
+      3. HMAC signature verification (against rotating secrets)
+      4. Parse payload
+      5. Replay detection (persistent ledger)
+      6. Idempotent business processing
+    """
+
+    # 1. Content-Type enforcement
+    _enforce_content_type(request, "application/json")
+
+    # 2. Read raw body with size guard
+    raw_body = await request.body()
+    if len(raw_body) > MAX_BODY_SIZE:
+        raise HTTPException(status_code=413, detail="Request body too large")
+
+    # 3. Verify HMAC BEFORE any parsing
+    signature = request.headers.get("x-webhook-signature", "")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing signature header")
+
+    verify_hmac(raw_body, signature, "application/json")
+
+    # 4. Now safe to parse — signature proven authentic
+    try:
+        import json
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    # Extract fields
+    event_id = payload.get("event_id")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Missing event_id")
+
+    # 5. Replay / idempotency check (atomic via Redis SETNX)
+    if _redis is None:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+    is_duplicate = await _redis.record_seen(event_id)
+    if is_duplicate:
+        # Return 200 OK so the processor doesn't retry, but don't re-process
+        return JSONResponse(content={"status": "already_processed"}, status_code=200)
+
+    # 6. Business logic — wrap in try/except to avoid leaking errors
+    try:
+        await _process_payment_event(payload)
+    except Exception as exc:
+        # Log full details server-side; return opaque message to caller
+        return JSONResponse(
+            content={"error": _clean_error(exc)},
+            status_code=500,
+        )
+
+    return JSONResponse(content={"status": "processed"}, status_code=200)
+
+
+async def _process_payment_event(payload: dict) -> None:
+    """Idempotent business logic for a single webhook event.
+
+    Uses the event_id itself as an idempotency key in downstream systems
+    (e.g., upsert into PostgreSQL with a UNIQUE constraint on event_id).
+    """
+    # Example: store with UNIQUE(event_id) constraint — the DB itself
+    # provides idempotency even under concurrent duplicates.
+    #
+    # await db.execute(
+    #     "INSERT INTO processed_events (event_id, payload) VALUES ($1, $2)",
+    #     payload["event_id"], payload
+    # )
+    pass
+```
+
+---
+
+## Summary of Fixes
+
+| Vulnerability | Fix |
+|---|---|
+| Signature after parsing | HMAC verified against **raw body** before `json.loads()` |
+| In-memory replay dict | Replaced with Redis `SETNX` + TTL (`_EventLedger`) |
+| No body size limit | `MAX_BODY_SIZE = 64KB` enforced after `.body()` |
+| Error leakage | `_clean_error()` returns generic message; full traceback logged server-side |
+| Rotating secrets | `get_secret_keys()` returns `[current, previous]`; `verify_hmac()` tries all |
+| Missing content-type gate | `_enforce_content_type()` rejects non-`application/json` early |
+| Concurrent idempotency | Redis atomic `SETNX` + DB `UNIQUE(event_id)` constraint (two-layer protection) |
+
+The ordering of operations in the endpoint handler is itself a security control: each step gates the next, ensuring nothing expensive or state-altering happens until the request is proven authentic.

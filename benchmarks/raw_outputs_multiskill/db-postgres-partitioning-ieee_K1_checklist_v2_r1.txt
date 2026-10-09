@@ -1,0 +1,581 @@
+I'll design a complete zero-downtime partitioning migration for the 500M row `audit_logs` table. This strategy uses a shadow-partitioned table with concurrent backfill, then a brief atomic swap.
+
+## Phase 1: Target Partitioned Table DDL
+
+```sql
+-- ============================================================================
+-- PHASE 1: Create the partitioned target table structure
+-- ============================================================================
+
+-- The partitioned parent table (range partitioning on timestamp)
+CREATE TABLE audit_logs_partitioned (
+    id              bigint GENERATED ALWAYS AS IDENTITY,
+    org_id          bigint NOT NULL,
+    user_id         bigint,
+    action          text NOT NULL,
+    resource_type   text NOT NULL,
+    resource_id     bigint,
+    metadata        jsonb DEFAULT '{}'::jsonb,
+    ip_address      inet,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    severity        smallint DEFAULT 0,
+
+    -- Constraints must be declared on parent for partition attach
+    CONSTRAINT audit_logs_partitioned_pkey PRIMARY KEY (id, created_at),
+    CONSTRAINT audit_logs_partitioned_org_id_fk FOREIGN KEY (org_id)
+        REFERENCES organizations (id) ON DELETE CASCADE
+) PARTITION BY RANGE (created_at);
+
+-- Indexes defined here are template; pg_partman manages per-partition
+CREATE INDEX audit_logs_partitioned_org_created_idx
+    ON audit_logs_partitioned (org_id, created_at);
+
+CREATE INDEX audit_logs_partitioned_action_idx
+    ON audit_logs_partitioned (action, created_at);
+
+CREATE INDEX audit_logs_partitioned_metadata_gin_idx
+    ON audit_logs_partitioned USING gin (metadata);
+
+CREATE INDEX audit_logs_partitioned_severity_idx
+    ON audit_logs_partitioned (severity, created_at)
+    WHERE severity >= 5;  -- Partial index for high-severity events
+
+-- Prevent direct inserts into parent (safety)
+-- Not needed with pg_partman, but useful as guardrail
+```
+
+## Phase 2: pg_partman Configuration
+
+```sql
+-- ============================================================================
+-- PHASE 2: Configure pg_partman for automated partition management
+-- ============================================================================
+
+-- Install extension if not present
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+
+-- Register the parent table with pg_partman
+-- This handles creation, retention, and future partition automation
+SELECT partman.create_parent(
+    p_parent_table    := 'public.audit_logs_partitioned',
+    p_control         := 'created_at',
+    p_type            := 'range',
+    p_interval        := '1 month',
+    p_premake         := 3,          -- Create 3 months ahead
+    p_start_partition := '2023-01-01' -- Adjust to your earliest data
+);
+
+-- Configure retention policy (keep 24 months, then drop)
+UPDATE partman.part_config
+SET
+    retention                    = '24 months',
+    retention_keep_table         = false,  -- Drop old partitions entirely
+    retention_keep_index         = false,
+    infinite_partitions          = true,   -- Never stop creating future parts
+    automatic_maintenance        = 'on',
+    jobmon                       = true
+WHERE parent_table = 'public.audit_logs_partitioned';
+
+-- Run maintenance now to create initial partitions for backfill window
+SELECT partman.partition_data_time(
+    p_parent_table    := 'public.audit_logs_partitioned',
+    p_batch_count     := 1,  -- One partition per call (controlled)
+    p_interval        := '1 month',
+    p_start_partition := '2023-01-01',
+    p_end_partition   := '2026-09-01'
+);
+
+-- Or create partitions for a specific range:
+-- Premake ensures future partitions exist; backfill targets historical ones
+SELECT partman.run_maintenance(p_analyze := false);
+```
+
+## Phase 3: Zero-Downtime Backfill Script
+
+```python
+#!/usr/bin/env python3
+"""
+audit_logs_zero_downtime_backfill.py
+
+Backfills audit_logs_partitioned in concurrent, batched chunks
+with lock timeouts, progress tracking, and idempotent retries.
+"""
+
+import asyncio
+import signal
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+
+import asyncpg
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass
+class Config:
+    dsn: str = "postgresql://user:pass@localhost:5432/appdb"
+    source_table: str = "audit_logs"
+    target_table: str = "audit_logs_partitioned"
+    batch_size: int = 50_000            # Rows per batch
+    max_lock_wait_ms: int = 5_000      # Max wait for row lock
+    max_duration_ms: int = 2_000       # Max statement runtime
+    sleep_between_batches_ms: float = 50  # Throttle to reduce I/O pressure
+    concurrency: int = 4               # Parallel batch workers
+    dry_run: bool = False
+    start_date: str = "2023-01-01"
+    end_date: str = "2026-09-01"
+
+
+# ============================================================================
+# Backfill State Tracking (resumable)
+# ============================================================================
+
+BACKFILL_STATE_CREATE = """
+CREATE TABLE IF NOT EXISTS _backfill_audit_logs_state (
+    partition_range    tstzrange NOT NULL PRIMARY KEY,
+    rows_backfilled    bigint NOT NULL DEFAULT 0,
+    status             text NOT NULL DEFAULT 'pending',
+    started_at         timestamptz,
+    completed_at       timestamptz,
+    last_id            bigint,
+    error_message      text
+);
+CREATE INDEX IF NOT EXISTS _backfill_state_status_idx
+    ON _backfill_audit_logs_state (status);
+"""
+
+
+# ============================================================================
+# Core Backfill Logic
+# ============================================================================
+
+class AuditLogBackfiller:
+    def __init__(self, config: Config):
+        self.config = config
+        self.pool: Optional[asyncpg.Pool] = None
+        self._shutdown = asyncio.Event()
+
+    async def initialize(self):
+        self.pool = await asyncpg.create_pool(
+            self.config.dsn,
+            min_size=self.config.concurrency,
+            max_size=self.config.concurrency + 2,
+            statement_cache_size=0,
+        )
+        async with self.pool.acquire() as conn:
+            await conn.execute(BACKFILL_STATE_CREATE)
+
+    async def get_partition_ranges(self) -> list[tuple[datetime, datetime]]:
+        """Fetch pending partition ranges from pg_partman."""
+        query = f"""
+            SELECT to_timestamp(
+                substring(partition_boundary FROM 'to_timestamp\\((\\d+)\\)'),
+                'YYYY-MM-DD HH24:MI:SS'
+            )::date AS range_start,
+            to_timestamp(
+                substring(partition_boundary FROM 'to_timestamp\\((\\d+)\\)'),
+                'YYYY-MM-DD HH24:MI:SS'
+            )::date + interval '1 month' AS range_end
+            FROM partman.show_partition_children('{self.config.target_table}')
+            WHERE partition_boundary != ''
+            ORDER BY partition_boundary;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query)
+            return [(r["range_start"], r["range_end"]) for r in rows]
+
+    async def backfill_range(
+        self,
+        range_start: datetime,
+        range_end: datetime,
+        worker_id: int,
+    ) -> int:
+        """Backfill a single monthly partition range with adaptive batching."""
+        total_migrated = 0
+
+        async with self.pool.acquire() as conn:
+            # Set session-level timeouts for this connection
+            await conn.execute(f"SET LOCAL lock_wait_timeout = '{self.config.max_lock_wait_ms}ms'")
+            await conn.execute(f"SET LOCAL statement_timeout = '{self.config.max_duration_ms}ms'")
+            await conn.execute("SET LOCAL idle_in_transaction_session_timeout = '10s'")
+
+            while not self._shutdown.is_set():
+                # Use keyset pagination for O(1) batching
+                insert_sql = f"""
+                    WITH batch AS (
+                        SELECT id
+                        FROM {self.config.source_table}
+                        WHERE created_at >= $1
+                          AND created_at < $2
+                          AND id > COALESCE(
+                              (SELECT last_id FROM _backfill_audit_logs_state
+                               WHERE partition_range = tstzrange($1::timestamptz, $2::timestamptz)),
+                              0
+                          )
+                        ORDER BY id
+                        LIMIT $3
+                        FOR UPDATE SKIP LOCKED  -- Skip rows locked by other workers
+                    )
+                    INSERT INTO {self.config.target_table} (
+                        id, org_id, user_id, action, resource_type,
+                        resource_id, metadata, ip_address, created_at, severity
+                    )
+                    SELECT
+                        id, org_id, user_id, action, resource_type,
+                        resource_id, metadata, ip_address, created_at, severity
+                    FROM {self.config.source_table}
+                    WHERE id IN (SELECT id FROM batch)
+                    ON CONFLICT (id, created_at) DO NOTHING;
+
+                    GET DIAGNOSTICS batch_count = ROW_COUNT;
+                    SELECT batch_count;
+                """
+
+                if self.config.dry_run:
+                    count = await conn.fetchval(
+                        f"SELECT COUNT(*) FROM {self.config.source_table} "
+                        f"WHERE created_at >= $1 AND created_at < $2",
+                        range_start, range_end
+                    )
+                    print(f"[DRY RUN] Would migrate {count} rows for {range_start} to {range_end}")
+                    return count
+
+                try:
+                    batch_count = await conn.fetchval(
+                        insert_sql, range_start, range_end, self.config.batch_size
+                    )
+                except asyncpg.LockNotAvailableError:
+                    print(f"  [W{worker_id}] Lock timeout, retrying range {range_start}")
+                    await asyncio.sleep(1)
+                    continue
+                except asyncpg.QueryCanceledError:
+                    print(f"  [W{worker_id}] Statement timeout, reducing batch or retrying")
+                    # Adaptive: reduce batch size on timeout
+                    self.config.batch_size = max(self.config.batch_size // 2, 1000)
+                    continue
+
+                if batch_count == 0:
+                    break  # No more rows in this range
+
+                total_migrated += batch_count
+
+                # Update progress state (resumable)
+                await conn.execute(
+                    f"""
+                    INSERT INTO _backfill_audit_logs_state (partition_range, rows_backfilled, status, last_id)
+                    VALUES (tstzrange($1::timestamptz, $2::timestamptz), $3, 'in_progress',
+                        (SELECT MAX(id) FROM {self.config.target_table}
+                         WHERE created_at >= $1 AND created_at < $2))
+                    ON CONFLICT (partition_range) DO UPDATE
+                        SET rows_backfilled = _backfill_audit_logs_state.rows_backfilled + $3,
+                            last_id = EXCLUDED.last_id
+                    """,
+                    range_start, range_end, batch_count
+                )
+
+                if total_migrated % 500_000 == 0:
+                    print(f"  [W{worker_id}] {range_start}: {total_migrated:,} rows migrated")
+
+                await asyncio.sleep(self.config.sleep_between_batches_ms / 1000)
+
+        return total_migrated
+
+    async def mark_range_complete(self, range_start: datetime, range_end: datetime):
+        await self.pool.execute(
+            """
+            UPDATE _backfill_audit_logs_state
+            SET status = 'completed', completed_at = now()
+            WHERE partition_range = tstzrange($1::timestamptz, $2::timestamptz)
+            """,
+            range_start, range_end
+        )
+
+    async def run(self):
+        await self.initialize()
+        ranges = await self.get_partition_ranges()
+
+        if not ranges:
+            print("No partition ranges found. Run pg_partman.create_parent first.")
+            return
+
+        print(f"Starting backfill of {len(ranges)} partition ranges with {self.config.concurrency} workers")
+
+        semaphore = asyncio.Semaphore(self.config.concurrency)
+
+        async def worker(range_start, range_end):
+            async with semaphore:
+                if self._shutdown.is_set():
+                    return 0
+                total = await self.backfill_range(range_start, range_end, id(asyncio.current_task()))
+                await self.mark_range_complete(range_start, range_end)
+                print(f"  Completed {range_start}: {total:,} total rows")
+                return total
+
+        tasks = [worker(rs, re) for rs, re in ranges]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        total = sum(r for r in results if isinstance(r, int))
+        errors = [r for r in results if isinstance(r, Exception)]
+
+        print(f"\nBackfill complete: {total:,} rows migrated")
+        if errors:
+            print(f"Errors in {len(errors)} ranges: {errors[:3]}")
+
+    def shutdown(self):
+        print("\nGraceful shutdown requested...")
+        self._shutdown.set()
+
+
+async def main():
+    config = Config()
+    backfiller = AuditLogBackfiller(config)
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, backfiller.shutdown)
+
+    await backfiller.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Phase 4: Atomic Cutover (Minimal Downtime Window)
+
+```sql
+-- ============================================================================
+-- PHASE 4: Atomic table rename swap (sub-second downtime)
+-- ============================================================================
+
+-- Prerequisite: verify backfill completeness
+DO $$
+DECLARE
+    source_count bigint;
+    target_count bigint;
+BEGIN
+    SELECT COUNT(*) INTO source_count FROM audit_logs
+        WHERE created_at >= '2023-01-01' AND created_at < '2026-09-01';
+    SELECT COUNT(*) INTO target_count FROM audit_logs_partitioned;
+
+    IF source_count != target_count THEN
+        RAISE EXCEPTION 'Count mismatch: source=%, target=%', source_count, target_count;
+    END IF;
+END $$;
+
+-- Execute atomic swap in a single transaction
+BEGIN;
+
+-- Brief ACCESS EXCLUSIVE lock (~milliseconds for renames)
+ALTER TABLE audit_logs RENAME TO audit_logs_legacy;
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+-- Rename constraints/indexes if needed
+ALTER INDEX audit_logs_partitioned_pkey RENAME TO audit_logs_pkey;
+
+COMMIT;
+
+-- Post-swap: verify row counts and partition health
+SELECT
+    parent.relname AS parent_table,
+    child.relname AS partition_name,
+    pg_size_pretty(pg_total_relation_size(child.oid)) AS size,
+    pg_stat_user_tables.n_live_tup AS estimated_rows
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relid = child.oid
+WHERE parent.relname = 'audit_logs'
+ORDER BY child.relname;
+
+-- Handle ongoing writes during migration gap (CDC catch-up)
+-- If using WAL-based CDC or trigger-based delta table, replay now:
+-- INSERT INTO audit_logs SELECT * FROM audit_logs_delta WHERE processed = false;
+```
+
+## Phase 5: Partition Pruning Verification
+
+```sql
+-- ============================================================================
+-- PHASE 5: Verify partition pruning is working correctly
+-- ============================================================================
+
+-- Enable verbose EXPLAIN to see actual pruning
+SET enable_partition_pruning = on;
+
+-- Test 1: Single partition query (should scan only 1 partition)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT * FROM audit_logs
+WHERE created_at >= '2024-06-01' AND created_at < '2024-07-01'
+  AND org_id = 42;
+
+-- Expected output: "Seq Scan on audit_logs_2024_06" (single partition)
+
+-- Test 2: Multi-month range (should scan exactly 3 partitions)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT COUNT(*), date_trunc('month', created_at) AS month
+FROM audit_logs
+WHERE created_at >= '2024-03-01' AND created_at < '2024-06-01'
+GROUP BY month;
+
+-- Expected: "Append" with 3 child scans: 2024_03, 2024_04, 2024_05
+
+-- Test 3: Verify constraint exclusion reports correctly
+EXPLAIN (COSTS OFF)
+SELECT * FROM audit_logs
+WHERE created_at BETWEEN '2024-01-15' AND '2024-02-15';
+
+-- Expected: Only 2024_01 and 2024_02 partitions
+
+-- Test 4: Confirm no full-table scans on date-filtered queries
+-- This diagnostic identifies any non-pruned queries
+CREATE OR REPLACE VIEW audit_pruning_audit AS
+SELECT
+    query,
+    calls,
+    mean_exec_time,
+    rows,
+    shared_blks_hit + shared_blks_read AS total_blocks
+FROM pg_stat_statements
+WHERE query LIKE '%audit_logs%'
+  AND query NOT LIKE '%pg_stat_statements%'
+ORDER BY total_blocks DESC
+LIMIT 20;
+
+-- Run, then execute typical application queries, then:
+-- SELECT * FROM audit_pruning_audit;
+
+-- Test 5: Verify partition sizes are reasonable
+SELECT
+    child.relname AS partition,
+    pg_size_pretty(pg_relation_size(child.oid)) AS data_size,
+    pg_size_pretty(pg_indexes_size(child.oid)) AS index_size,
+    pg_stat_user_tables.n_live_tup AS approx_rows,
+    pg_stat_user_tables.last_vacuum,
+    pg_stat_user_tables.last_analyze
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relid = child.oid
+WHERE parent.relname = 'audit_logs'
+ORDER BY child.relname;
+```
+
+## Phase 6: Automated Maintenance
+
+```sql
+-- ============================================================================
+-- PHASE 6: Schedule automated partition maintenance via pg_partman + pg_cron
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Run partition maintenance every day at 2 AM
+-- Handles: creating future partitions, detaching expired ones
+SELECT cron.schedule(
+    'audit_logs-partition-maintenance',
+    '0 2 * * *',
+    $$SELECT partman.run_maintenance(p_parent_table := 'public.audit_logs', p_analyze := true)$$
+);
+
+-- Monitor maintenance job health
+SELECT
+    jobid,
+    command,
+    status,
+    start_time,
+    end_time,
+    return_message
+FROM cron.job_run_details
+WHERE jobid = (SELECT jobid FROM cron.job WHERE schedule = '0 2 * * *')
+ORDER BY start_time DESC
+LIMIT 10;
+
+-- Alert on missing future partitions (check that next 3 months exist)
+DO $$
+DECLARE
+    missing_count int;
+BEGIN
+    SELECT COUNT(*) INTO missing_count
+    FROM generate_series(1, 3) AS months_ahead
+    WHERE NOT EXISTS (
+        SELECT 1 FROM partman.show_partition_children('public.audit_logs')
+        WHERE partition_range && tstzrange(
+            date_trunc('month', now() + (months_ahead || ' months')::interval),
+            date_trunc('month', now() + ((months_ahead + 1) || ' months')::interval)
+        )
+    );
+
+    IF missing_count > 0 THEN
+        RAISE WARNING '% future partitions missing for audit_logs', missing_count;
+        -- Integrate with alerting: NOTIFY, PagerDuty, etc.
+        PERFORM pg_notify('partition_alert',
+            json_build_object(
+                'table', 'audit_logs',
+                'missing_partitions', missing_count
+            )::text
+        );
+    END IF;
+END $$;
+```
+
+## Rollback Procedure
+
+```sql
+-- ============================================================================
+-- EMERGENCY ROLLBACK: If issues detected post-migration
+-- ============================================================================
+
+-- Option A: Quick rename back (if legacy table still exists and is intact)
+BEGIN;
+ALTER TABLE audit_logs RENAME TO audit_logs_partitioned_failed;
+ALTER TABLE audit_logs_legacy RENAME TO audit_logs;
+COMMIT;
+
+-- Option B: If data divergence, compare and repair
+SELECT
+    (SELECT COUNT(*) FROM audit_logs_legacy) AS legacy_count,
+    (SELECT COUNT(*) FROM audit_logs) AS partitioned_count,
+    (SELECT COUNT(*) FROM audit_logs_legacy) - (SELECT COUNT(*) FROM audit_logs) AS diff;
+```
+
+## Monitoring Queries
+
+```sql
+-- Active partition health dashboard
+SELECT
+    parent.relname AS table_name,
+    COUNT(child.oid) AS partition_count,
+    SUM(pg_relation_size(child.oid)) AS total_data_bytes,
+    SUM(pg_indexes_size(child.oid)) AS total_index_bytes,
+    MIN(child.relname) AS oldest_partition,
+    MAX(child.relname) AS newest_partition
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+WHERE parent.relname = 'audit_logs'
+GROUP BY parent.relname;
+
+-- Bloat detection on partitioned table
+SELECT
+    schemaname, tablename,
+    n_dead_tup,
+    n_live_tup,
+    round(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 2) AS dead_pct
+FROM pg_stat_user_tables
+WHERE tablename LIKE 'audit_logs_%'
+  AND n_dead_tup > 10000
+ORDER BY n_dead_tup DESC;
+```
+
+**Key design decisions:**
+- **Keyset pagination** (`id > last_id`) instead of OFFSET for O(1) batching through 500M rows
+- **`FOR UPDATE SKIP LOCKED`** enables concurrent workers without blocking
+- **Resumable state table** (`_backfill_audit_logs_state`) allows mid-migration restarts
+- **pg_partman** handles all partition lifecycle, retention, and future creation
+- **Atomic rename swap** gives sub-second cutover (only rename operations hold locks)
+- **Partial index** on `severity >= 5` keeps the hot index small for the common alerting query pattern

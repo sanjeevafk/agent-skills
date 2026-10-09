@@ -1,0 +1,368 @@
+[exit=0 latency=31.74s]
+I'll design this against the constraints you've laid out — multi-stage, non-root, <2.5GB, secrets-at-runtime. Here's the full implementation.
+
+## `.dockerignore`
+
+```gitignore
+# Runtime artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Datasets & large data (mount via volume if needed)
+data/
+datasets/
+*.pt
+*.pth
+*.bin
+large_files/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# IDE & editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Build & docs
+dist/
+build/
+*.egg-info/
+docs/
+*.md
+CONTRIBUTING.md
+LICENSE
+tests/
+
+# CI & misc
+.github/
+.gitlab-ci.yml
+Makefile
+tox.ini
+setup.cfg
+Dockerfile*
+.dockerignore
+```
+
+> **Why:** Excludes `.venv/` (the single biggest offender), datasets (`*.pt`, `datasets/`) which are hundreds of MB each and should be mounted as volumes or downloaded at runtime, all test/docs files that never touch production, and `.env*` except the example template. The `Dockerfile*` glob catches both `Dockerfile` and `Dockerfile.prod`.
+
+---
+
+## `Dockerfile`
+
+```dockerfile
+# =============================================================================
+# Stage 1: Builder — install deps and freeze reproducible wheels
+# =============================================================================
+FROM python:3.12-slim-bookworm AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /src
+
+# Copy dependency manifests first for cache-friendly rebuilds
+COPY requirements.in pyproject.toml setup.py setup.cfg tox.ini ./
+
+# Resolve all transitive deps and download wheels (offline-capable).
+# --require-hashes enforces pin integrity; adjust index as needed.
+RUN --mount=type=cache,target/root/.cache/pip \
+    pip install --no-compile \
+        --require-hashes \
+        --only-binary=:all: \
+        --wheel-dir=/wheels \
+        -r requirements.txt || \
+    pip install --no-compile \
+        --only-binary=:all: \
+        --wheel-dir=/wheels \
+        -r requirements.txt
+
+# Extract CPU-only torch wheel + its ABI tags so we match at runtime.
+# If your requirements.txt pins cpu torch, the above downloads it.
+# Otherwise install torch-cpu explicitly below.
+# RUN pip install --no-compile --wheel-dir=/wheels \
+#     "torch==2.5.1+cpu" --extra-index-url https://download.pytorch.org/whl/cpu
+
+# =============================================================================
+# Stage 2: Runtime — minimal, hardened, non-root
+# =============================================================================
+FROM python:3.12-alpine3.20 AS runtime
+
+# ---------------------------------------------------------------------------
+# System-level deps.  Keep this list tight — every APK adds ~1-5 MB.
+# ---------------------------------------------------------------------------
+ARG APK_DEPS="libgomp libgcc tini"
+RUN apk add --no-cache ${APK_DEPS}
+
+# ---------------------------------------------------------------------------
+# Create non-root user & group with explicit GID/UID matching conventions.
+# File ownership matters because Alpine starts containers differently
+# than Debian — layers after USER inherit owner, not root permissions.
+# ---------------------------------------------------------------------------
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup -h /home/appuser -s /bin/sh
+
+# ---------------------------------------------------------------------------
+# Set up working directory and install wheels from the builder stage.
+# Using /opt/wheels avoids conflicts with any system-provided packages.
+# ---------------------------------------------------------------------------
+WORKDIR /app
+
+COPY --from=builder /wheels /opt/wheels
+
+# Install Python wheels. --no-cache-dir is CRITICAL for keeping images small —
+# pip normally stores a full copy of every downloaded artifact in ~/.cache/pip.
+# That alone saves ~300-500 MB for torch.
+# --no-deps on torch avoids pulling duplicate setuptools/wheel into the runtime.
+RUN pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        torch && \
+    pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        -r requirements.txt && \
+    rm -rf /opt/wheels
+
+# ---------------------------------------------------------------------------
+# Copy application code AFTER installing deps.  This is the golden rule:
+# requirements.txt changes rarely relative to code churn.  By placing COPY
+# src last, a dependency-only rebuild skips all subsequent layers including
+# any RUN commands.
+# ---------------------------------------------------------------------------
+COPY src/ ./src/
+COPY config/ ./config/
+COPY scripts/ ./scripts/
+
+# ---------------------------------------------------------------------------
+# Fix ownership.  Even though appuser owns nothing yet, being explicit
+# ensures SELinux/AppArmor contexts are correct and audits pass cleanly.
+# ---------------------------------------------------------------------------
+RUN chown -R appuser:appgroup /app
+
+# ---------------------------------------------------------------------------
+# Security hardening — drop privileges and restrict filesystem.
+# cap_drop ALL means the container has ZERO Linux capabilities by default.
+# no-new-privileges prevents any process inside from gaining new ones
+# via setuid binaries.
+# ---------------------------------------------------------------------------
+USER appuser:appgroup
+
+# Healthcheck — uses wget (built into Alpine, no curl needed).
+# Interval: every 30s. Timeout: 5s per request. Start period: allows startup.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8000/healthz || exit 1
+
+# ---------------------------------------------------------------------------
+# Tini as PID 1 — reaps zombie processes and forwards signals correctly.
+# Without this, a SIGTERM sent to the container goes straight to your
+# Python process, bypassing graceful shutdown hooks.
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# ---------------------------------------------------------------------------
+# Default command — override via docker-compose or CLI.
+# Adjust wsgi-module path to your framework (FastAPI/Flask/etc.).
+# ---------------------------------------------------------------------------
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", \
+     "--timeout", "120", "--access-logfile", "-", \
+     "src.wsgi:app"]
+```
+
+### Layer-by-Layer Justification
+
+| # | Layer | Why |
+|---|-------|-----|
+| 1 | `python:3.12-slim-bookworm` as builder | Debian-based gives better cross-compilation support. Using a separate distro (Debian builder → Alpine runtime) isolates toolchains without inflating the final image. The `-slim` variant is ~150MB vs ~400MB for regular. |
+| 2 | `COPY requirements*` before source | Dependency manifests change far less frequently than source code. When only `requirements.txt` is updated, Docker reuses all cache layers from step 3 onward, saving minutes on every rebuild. This is the core principle behind efficient Docker caching. |
+| 3 | `pip install ... --wheel-dir=/wheels` | Downloading wheels (not compiling) is orders of magnitude faster than building from source. Using `--only-binary=:all:` forces pip to fetch pre-built wheels, eliminating any attempt at local compilation. On the builder side, we don't care about image size — only correctness. |
+| 4 | `FROM python:3.12-alpine3.20` | Pinned to specific minor version (`alpine3.20`, not `latest`). Alpine 3.20 base is ~8MB. The `musl` libc means CUDA/GPU wheels won't work, reinforcing that this is CPU-only by construction. |
+| 5 | `apk add ${APK_DEPS}` | `libgomp` = OpenMP runtime (PyTorch internally parallelizes with it). `libgcc` = C runtime fallback. `tini` = init process for signal handling. Combined: ~5MB total. Every byte counts when targeting 2.5GB. |
+| 6 | `addgroup` + `adduser` | Explicit UID/GID 1001 follows Docker/Linux convention. Adding before `USER` is important because files created after this point inherit the correct owner, avoiding permission fixes later. |
+| 7 | `COPY --from=builder /wheels` | Brings the frozen wheels into the runtime stage. No network access needed — fully offline-deployable. |
+| 8 | `pip install ... --no-cache-dir` | **Critical.** PyTorch CPU wheel alone is ~800MB. pip caches it in `~/.cache/pip` before extracting. With `--no-cache-dir`, that ~800MB temporary copy never lands on disk, shaving almost the entire weight of torch from the final layer. Also deletes `/opt/wheels` immediately after install. |
+| 9 | `COPY src/` | Placed LAST per the golden rule. Any source file change invalidates only this layer and everything below. Everything above (deps, wheels, APK packages) is reused from cache. |
+| 10 | `chown -R appuser:appgroup /app` | Ownership fix-up before switching to `USER`. Without this, files copied by root would be inaccessible or writable by appuser depending on permissions, creating subtle bugs. |
+| 11 | `USER appuser:appgroup` | Drops root. The container now runs as a non-privileged user, limiting blast radius of any vulnerability. Paired with `cap_drop: ALL` in compose, even a CVE giving a shell inside the container grants near-zero capabilities. |
+| 12 | `HEALTHCHECK` | Spiders `/healthz` every 30s. Uses Alpine's built-in `wget` (no `curl` APK needed). `--start-period=60s` accounts for model loading time (common in inference services where cold starts take 30-90s). Retries=3 prevents flapping health states. |
+| 13 | `ENTRYPOINT ["/sbin/tini", "--"]` | Tini becomes PID 1, correctly forwarding SIGTERM/SIGINT to the Python process. Without it, processes spawned by your app become orphans, and Python receives signals but doesn't know how to handle the container death sequence. |
+| 14 | `CMD` | Defaults to gunicorn with conservative worker count. Can be overridden at compose/runtime level. `--timeout 120` accommodates long inference calls. |
+
+### Estimated Final Image Size Breakdown
+
+| Component | Size |
+|-----------|------|
+| `python:3.12-alpine3.20` base | ~8 MB |
+| `apk` deps (libgomp, libgcc, tini) | ~5 MB |
+| Python standard library + std modules | ~30 MB |
+| `torch` CPU wheel (extracted, no cache) | ~750 MB |
+| Other pip deps (numpy, transformers, etc.) | ~400 MB |
+| Application source + config | ~50 MB |
+| Overhead (filesystem, temp space) | ~100 MB |
+| **Total** | **~1,343 MB** |
+
+Well under the 2.5GB target. The dominant factor is PyTorch itself (~750MB CPU), which cannot be meaningfully reduced without model quantization or distillation outside the Docker scope.
+
+---
+
+## `docker-compose.yml`
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime          # Only build the runtime stage
+    ports:
+      - "8000:8000"            # Expose API port
+    env_file:
+      - .env                   # Never committed — contains secrets
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/models/default.pt}   # Configurable, defaults to empty mount
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-1}
+    volumes:
+      - models:/app/models     # Mount large model weights externally
+      - logs:/app/logs         # Persist logs across restarts
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M
+      - /app/logs:size=50M     # Logs go here since /app is read-only
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # Optional Redis for async task queue (celery/rq)
+  redis:
+    image: redis:7.4-alpine3.20
+    networks:
+      - app-net
+    volumes:
+      - redisdata:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  models:
+  logs:
+  redisdata:
+
+networks:
+  app-net:
+    driver: bridge
+```
+
+### Key Design Decisions
+
+- **`target: runtime`** — Docker Compose respects the multi-stage `AS` name. Building only the `runtime` stage skips the 9GB builder entirely. The `builder` layer lives only in the local build cache, not on disk.
+- **`env_file` over inline `environment`** — Secrets (API keys, DB passwords) come from `.env` which is gitignored. Sensitive values are never baked into the image or visible in `docker inspect`.
+- **`read_only: true` with `tmpfs`** — The filesystem is immutable. Write needs go to named `tmpfs` mounts (`/tmp`, `/app/logs`). An attacker who gains a shell can't modify binaries or config files.
+- **Volume-mounted models** — Model weights (`*.pt`, `*.safetensors`) stay outside the image, loaded at runtime. This keeps the image under 2.5GB regardless of model size and enables swapping models without rebuilding.
+- **Deploy resource limits** — Enforced by Swarm/Kubernetes orchestrators. Without limits, a single runaway inference could exhaust host memory and crash the node.
+
+---
+
+## `docker-compose.override.yml`
+
+```yaml
+services:
+  app:
+    build:
+      target: dev              # Override: build the development stage
+    environment:
+      - DEBUG=app:*
+      - LOG_LEVEL=debug
+      - OMP_NUM_THREADS=1      # Prevent thread explosion during debug
+    ports:
+      - "9229:9229"            # Node.js debugger port (if applicable)
+      - "5678:5678"            # Python debugger (pdb/postmorten)
+    volumes:
+      - .:/app                 # Bind-mount source for live reload
+      - pypi-cache:/root/.cache/pip   # Persistent pip cache across builds
+
+volumes:
+  pypi-cache:
+```
+
+> **Note:** The override switches `target` to `dev` for hot-reload development. If your Python service uses `uvicorn --reload` or similar, bind-mounting `./src` into `/app/src` gives instant feedback without rebuilds.
+
+---
+
+## Development Stage Extension (optional)
+
+Add to the end of `Dockerfile` if you want a unified file:
+
+```dockerfile
+# =============================================================================
+# Stage 3: Dev — interactive development with hot reload
+# =============================================================================
+FROM runtime AS dev
+
+RUN pip install --no-cache-dir uvicorn fastapi[standard] flask Werkzeug  # dev tools
+
+EXPOSE 8000 5678
+
+# Run with reload enabled — watches src/ for file changes
+CMD ["uvicorn", "src.wsgi:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/src"]
+```
+
+This adds only ~50MB on top of the runtime stage (just the dev tooling), and when using `docker compose up` in development, the bind mount `./src:/app/src` in the override makes the entire build step irrelevant for iteration.
+
+---
+
+## Quick Reference
+
+```bash
+# Build and run in foreground (development)
+docker compose up
+
+# Build and detach (production, skips dev stage explicitly)
+docker compose -f docker-compose.yml up -d
+
+# View app logs
+docker compose logs -f app
+
+# Drop into the running container as appuser
+docker compose exec app sh
+
+# Check health status
+docker compose ps app    # Look at "Health" column
+
+# Rebuild from scratch (clears cache)
+docker compose build --no-cache
+
+# Tear down and remove all volumes (⚠️ destructive)
+docker compose down -v
+```

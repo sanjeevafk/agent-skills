@@ -1,0 +1,1320 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+Security-review a FastAPI payment webhook endpoint that accepts POSTs from a third-party processor. It must verify HMAC signatures against a rotating secret, reject replayed deliveries using an event-id ledger, enforce idempotent processing under concurrent duplicate webhooks, and avoid leaking processor errors to clients. The current implementation verifies the signature AFTER parsing the JSON body and stores replay-ids in an in-memory dict. Identify the vulnerabilities in order of severity, then provide a corrected implementation with code.
+
+---
+[Response A]:
+Here's my full security review and corrected implementation.
+
+---
+
+## Security Review: FastAPI Payment Webhook Endpoint
+
+### Vulnerability Analysis (Ordered by Severity)
+
+#### 1. SECRET — Signature Verification Happens After JSON Body Parsing
+
+The current code validates the HMAC *after* deserializing the request body. An attacker can flood the endpoint with massive JSON payloads (e.g., `{ "amount": "<repeated-gibberish-for-hours>" }`), burning CPU, memory, and database connections before the signature check even runs. This is a resource-exhaustion DoS vector. The signature must be verified *first*, then the raw bytes fed into a streaming/parser-limited JSON reader.
+
+**Impact:** High availability risk, expensive denial-of-service with trivial payload size.
+
+#### 2. CRITICAL — In-Memory Dict for Event-ID Ledger Is Non-Durable
+
+Storing replay-ids in `set()` or `dict()` means:
+- All state is lost on process restart/redeploy → every restart becomes a valid replay window
+- Multi-worker/multi-container deployments have isolated sets → no cross-process dedup
+- Unbounded growth → memory leak over time
+
+**Impact:** Complete loss of replay protection after any restart; also breaks horizontal scaling.
+
+#### 3. CRITICAL — No Idempotency Guard Under Concurrency
+
+An in-memory set only protects *sequential* duplicates. Two simultaneous requests with the same `event_id` arrive at different worker threads/processes, both pass the lookup, both process the payment, resulting in double-charging. A simple `if event_id_seen: reject` pattern is a TOCTOU race.
+
+**Impact:** Financial loss — double billing customers, incorrect reconciliation.
+
+#### 4. HIGH — Error Information Leakage
+
+When the webhook processor raises an exception, FastAPI will often return the exception message and traceback directly in the HTTP response body. Internal error details (database states, library names, stack traces) become visible to the payment processor — intelligence useful for targeted attacks.
+
+**Impact:** Information disclosure aiding further exploitation.
+
+#### 5. HIGH — No Secret Rotation Support
+
+Webhooks should tolerate signing with either the current secret *or* the immediately-previous one (during rollover). Verifying against only one key creates maintenance windows where legitimate webhooks fail.
+
+**Impact:** Service disruption during planned rotations.
+
+#### 6. MEDIUM — No Clock-Skew Window for Timestamps
+
+Payment processors include timestamps for freshness. Without checking them against the server clock with an allowed skew, old captured webhooks remain valid indefinitely.
+
+**Impact:** Replay attacks using recorded legitimate traffic.
+
+#### 7. MEDIUM — No Content-Type Enforcement
+
+Accepting bodies regardless of Content-Type allows attackers to send non-JSON content that bypasses validation logic or exploits parser quirks.
+
+**Impact:** Parser confusion, potential injection vectors.
+
+#### 8. LOW — No Rate Limiting on Webhook Endpoint
+
+Public endpoints receive unthrottled requests. While HMAC mitigates spoofing, a compromised signing key enables volumetric abuse.
+
+**Impact:** Abuse vector if signing key is leaked.
+
+---
+
+### Corrected Implementation
+
+```python
+"""
+Production-grade payment webhook handler for FastAPI.
+
+Security features:
+- HMAC-SHA256 signature verification BEFORE body parsing (prevents DoS)
+- Persistent event-id ledger (PostgreSQL UNIQUE constraint, not in-memory)
+- Advisory-lock-based idempotency guards for concurrent dedup
+- Rotating HMAC secrets with forward-compatible multi-key check
+- Strict content-type enforcement
+- Generic error responses (no internal detail leakage)
+- Timestamp freshness check with configurable skew
+- Rate limiting via slowapi (Redis-backed)
+- Structured audit logging with PII/redaction discipline
+"""
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import time
+from datetime import datetime, timezone, timedelta
+from enum import Enum
+from typing import Any, Optional
+
+# Third-party imports installed as project dependencies:
+#   fastapi, pydantic, asyncpg or sqlalchemy(dialect=postgresql),
+#   slowapi (rate limiting), redis
+from fastapi import FastAPI, Request, Response, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, EmailStr, field_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# ──────────────────────────────────────────────
+# Configuration (all from environment, never hardcoded)
+# ──────────────────────────────────────────────
+
+class Settings:
+    """Load secrets exclusively from environment variables."""
+
+    # HMAC signing secret(s) — ROTATE by adding PREVIOUS_SECRET to env var list
+    HMAC_SECRETS: list[str] = [
+        s.strip()
+        for s in (os.environ.get("WEBHOOK_HMAC_SECRET", "") + "," +
+                  os.environ.get("WEBHOOK_HMAC_PREVIOUS_SECRET", ""))
+        if s.strip()
+    ]
+    if not HMAC_SECRETS:
+        raise RuntimeError(
+            "WEBHOOK_HMAC_SECRET environment variable is not configured"
+        )
+
+    # Clock skew tolerance — 5 minutes allows NTP drift without opening long replay windows
+    TIMESTAMP_SKEW_SECONDS: int = int(
+        os.environ.get("WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
+    )
+
+    # Max JSON body size — 1 MB cap prevents gzip-bomb / oversized payloads
+    MAX_BODY_BYTES: int = int(
+        os.environ.get("WEBHOOK_MAX_BODY_BYTES", str(1_048_576))
+    )
+
+    # Database connection string (never hardcoded)
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not configured")
+
+    # Redis for rate-limit backend + advisory locks (if using async pg)
+    REDIS_URL: str = os.environ.get("REDIS_URL", "")
+
+    # Logging configuration
+    LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
+
+
+settings = Settings()
+
+# ──────────────────────────────────────────────
+# Logger — NEVER logs sensitive data
+# ──────────────────────────────────────────────
+
+logger = logging.getLogger("payment_webhook")
+logger.setLevel(logging.DEBUG if settings.LOG_LEVEL == "DEBUG" else logging.INFO)
+
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+)
+logger.addHandler(_stream_handler)
+
+
+def _audit_info(event_id: str, message: str, **extra: Any) -> None:
+    """Structured audit log entry. Sensitive fields are intentionally excluded."""
+    logger.info(
+        "webhook.event_id=%s %s",
+        event_id,
+        message,
+        extra={k: v for k, v in extra.items() if k not in ("card_number", "cvv", "token")},
+    )
+
+
+def _audit_error(event_id: str, message: str, exc: Exception | None = None) -> None:
+    """Log full detail internally but mask for audit info."""
+    logger.error(
+        "webhook.event_id=%s %s %s",
+        event_id,
+        message,
+        repr(exc) if exc else "",
+    )
+
+
+# ──────────────────────────────────────────────
+# Pydantic models — strict schema validation
+# ──────────────────────────────────────────────
+
+class WebhookEvent(BaseModel):
+    """Typed model for incoming webhook payload. Validated BEFORE business logic."""
+
+    event_id: str = Field(..., min_length=32, max_length=128)
+    event_type: str = Field(..., pattern=r"^payment\.[a-z_]+$")
+    timestamp: float = Field(..., gt=0)
+    amount_cents: int = Field(..., ge=0, le=10_000_000)  # max $100,000
+    currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+    customer_email: Optional[EmailStr] = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def metadata_max_size(cls, v: Any) -> dict:
+        if isinstance(v, dict) and len(v) > 50:
+            raise ValueError("metadata key count exceeds 50")
+        return v
+
+
+# ──────────────────────────────────────────────
+# Rate limiter (Redis-backed via slowapi)
+# ──────────────────────────────────────────────
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Payment Webhook Receiver")
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """Consume the full body so middleware doesn't hang, then return safe error."""
+    await request.body()  # drain
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": "Too many requests. Please retry later."},
+    )
+
+
+# ──────────────────────────────────────────────
+# HMAC Utilities
+# ──────────────────────────────────────────────
+
+def compute_hmac_hex(body_bytes: bytes, secret: str) -> str:
+    """HMAC-SHA256 of raw body bytes, hex-encoded."""
+    return hmac.new(
+        secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_signature(raw_body: bytes, provided_sig: str) -> bool:
+    """
+    Verify HMAC against ALL known secrets (current + previous rotation slot).
+    Returns False for ANY mismatch — timing-safe comparison via hmac.compare_digest.
+    """
+    if not provided_sig or len(provided_sig) != 64:  # sha256 hex length
+        return False
+
+    for secret in settings.HMAC_SECRETS:
+        if hmac.compare_digest(
+            compute_hmac_hex(raw_body, secret),
+            provided_sig,
+        ):
+            return True
+
+    return False
+
+
+# ──────────────────────────────────────────────
+# Persistence Layer (PostgreSQL + asyncio)
+# ──────────────────────────────────────────────
+
+# Use asyncpg or SQLAlchemy engine. Below is asyncpg-style pseudocode;
+# replace with actual connection pool initialization at startup.
+#
+# CREATE TABLE IF NOT EXISTS webhook_events (
+#     event_id       VARCHAR(128) PRIMARY KEY,
+#     event_type     VARCHAR(64)  NOT NULL,
+#     received_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+#     processed_at   TIMESTAMPTZ,
+#     status         VARCHAR(1
+...[truncated]
+---[Response B]:
+Here's my analysis of the vulnerabilities and a corrected implementation.
+
+---
+
+## Vulnerabilities in Order of Severity
+
+### 1. Signature Verification After Body Parsing (HIGH — Resource Exhaustion + Bypass)
+
+Parsing the JSON body before verifying the HMAC signature is a resource exhaustion vulnerability. An attacker can flood the endpoint with multi-megabyte fake payloads, each of which gets fully deserialized by `json.loads()` or Pydantic before the signature check rejects it. Beyond DoS, there's a subtle bypass risk: some parsers have quirks where differently-encoded equivalent bodies produce different parsed results, and if an attacker controls the parser's behavior they may confuse server vs client interpretations.
+
+**Fix**: Read the raw request body first (`await request.body()`), verify the HMAC against that exact byte sequence, then parse JSON from the verified bytes.
+
+### 2. In-Memory Dict for Replay-ID Ledger (HIGH — State Loss + Memory Leak)
+
+An in-memory dict has three fatal flaws:
+- **Crash = replay window resets.** A process restart wipes all seen event IDs, so duplicate deliveries arrive after every deploy/restart.
+- **No scaling.** Multi-worker deployments (Uvicorn gunicorn, multiple pods) each maintain their own dict; one worker may see an event while another doesn't, causing duplicate processing.
+- **Unbounded growth.** No TTL, eviction, or size limit — the dict grows forever until OOM.
+
+**Fix**: Store event IDs in PostgreSQL with a `UNIQUE` constraint and a `deleted_at` TTL (e.g., 24h). The uniqueness constraint guarantees idempotency across all workers and survives restarts.
+
+### 3. Race Condition on Concurrent Duplicate Webhooks (MEDIUM — Double Processing)
+
+Even with a replay ledger, the check-and-insert must be atomic. Two concurrent requests with the same `event-id` could both read "not found," both insert, and both process the payment twice. Standard ORMs don't protect you here without explicit locking.
+
+**Fix**: Use `INSERT ... ON CONFLICT DO NOTHING` and only proceed if the insert was successful. As a belt-and-suspenders measure, wrap the operation in an advisory lock on the event ID hash.
+
+### 4. Processor Error Leakage to Clients (MEDIUM — Information Disclosure)
+
+If the downstream payment processor throws during idempotent re-processing, stack traces, SQL errors, or internal service names can end up in the HTTP response. This reveals infrastructure details to potential attackers.
+
+**Fix**: Catch all exceptions during webhook processing, log internally, and return a generic `200 OK` (or `202 Accepted`) — webhooks are best-effort; the processor will retry. Never return 5xx for internal failures during idempotent re-delivery handling.
+
+### 5. Rotating Secret Without Key Versioning (MEDIUM — Signature Verification Gap)
+
+A "rotating secret" needs a clear key version identifier so old signatures signed with previous keys can still be validated during the rotation window. Without key versioning, a rotation causes a brief period where valid signatures fail verification. Conversely, accepting both old and new keys indefinitely defers the rotation.
+
+**Fix**: Require the webhook header to include `x-secret-version` (or similar), and verify against the current key AND the immediately preceding key. Archive old keys with a hard expiration date.
+
+### 6. Missing Content-Type Validation (LOW — Parser Confusion)
+
+Not validating that the `Content-Type` is exactly `application/json` leaves room for MIME-type sniffing attacks or confusion between `application/json` and `text/plain`.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+payment_webhook.py — Secure FastAPI payment webhook endpoint.
+
+Accepts POSTs from a third-party payment processor. Features:
+  • HMAC-SHA256 signature verification BEFORE body parsing
+  • Event-ID replay prevention via unique DB constraint
+  • Idempotent concurrent-duplicate protection (atomic insert)
+  • Generic error responses — never leaks processor internals
+  • Rotating secret support via x-secret-version header
+"""
+
+import hashlib
+import hmac
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+class Settings:
+    SECRET_KEY: str = "change-me-in-production"        # Current signing secret
+    PREVIOUS_SECRET_KEY: Optional[str] = None           # Previous secret during rotation
+    SECRET_VERSION: int = 1
+    PREVIOUS_SECRET_VERSION: int = 0
+    REPLAY_WINDOW_HOURS: int = 24                       # How long to track event IDs
+    WEBHOOK_HMAC_HEADER: str = "x-hmac-signature"
+    WEBHOOK_EVENT_ID_HEADER: str = "x-event-id"
+    WEBHOOK_SECRET_VERSION_HEADER: str = "x-secret-version"
+
+settings = Settings()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("webhook")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logger.addHandler(_handler)
+
+# ---------------------------------------------------------------------------
+# Database setup
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = "postgresql://user:password@localhost/webhook_db"
+engine = sa.create_engine(DATABASE_URL)
+
+metadata = sa.MetaData()
+
+# Webhook deliveries table — UNIQUE constraint enforces replay detection
+deliveries_table = sa.Table(
+    "webhook_deliveries",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column(
+        "event_id",
+        sa.String(255),
+        nullable=False,
+        unique=True,
+        index=True,
+    ),
+    sa.Column("processor_response", sa.Text, nullable=True),
+    sa.Column("processed_at", sa.DateTime(timezone=True), default=sa.func.now()),
+    sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
+)
+
+metadata.create_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_active_secrets() -> list[tuple[int, str]]:
+    """Return [(version, secret), ...] ordered newest-first."""
+    pairs: list[tuple[int, str]] = [(settings.SECRET_VERSION, settings.SECRET_KEY)]
+    if settings.PREVIOUS_SECRET_KEY:
+        pairs.append((settings.PREVIOUS_SECRET_VERSION, settings.PREVIOUS_SECRET_KEY))
+    return pairs
+
+
+def verify_hmac(raw_body: bytes, signature: str, expected_version: int) -> bool:
+    """
+    Verify HMAC-SHA256 over the *raw* request body.
+
+    We try the current secret first, then the previous secret during
+    rotation windows. Returns True on match.
+    """
+    computed = hmac.new(
+        raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    # Normalize the provided signature for safe comparison
+    provided_bytes = bytes.fromhex(signature) if len(signature) > 128 else signature.encode()
+
+    for version, secret in _get_active_secrets():
+        if version != expected_version:
+            continue
+        sig_hex = hmac.new(
+            secret.encode("utf-8"),
+            raw_body,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(computed, sig_hex):
+            return True
+
+    return False
+
+
+def _purge_expired_events() -> None:
+    """DELETE event IDs older than REPLAY_WINDOW_HOURS. Run periodically."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.REPLAY_WINDOW_HOURS)
+    with engine.begin() as conn:
+        conn.execute(
+            deliveries_table.delete().where(
+                deliveries_table.c.deleted_at.is_not(None),
+                deliveries_table.c.deleted_at < cutoff,
+            )
+        )
+
+
+def mark_expired_events() -> None:
+    """Soft-delete events past the replay window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.REPLAY_WINDOW_HOURS)
+    with engine.begin() as conn:
+        conn.execute(
+            deliveries_table.update()
+            .where(
+                deliveries_table.c.deleted_at.is_(None),
+                deliveries_table.c.processed_at < cutoff,
+            )
+            .values(deleted_at=cutoff)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Payment processing (simulated — replace with real logic)
+# ---------------------------------------------------------------------------
+
+class ProcessorError(Exception):
+    """Raised when the downstream payment processor fails."""
+
+
+def process_payment(event_id: str, payload: dict) -> dict:
+    """
+    Process a payment webhook payload.
+
+    Replace this stub with actual payment processing logic.
+    Must be idempotent — calling it twice with the same event_id
+    must produce the same result and not double-charge.
+    """
+    logger.info("Processing payment for event_id=%s", event_id)
+    # TODO: Implement real payment processing here
+    raise ProcessorError("Simulated processor failure for demo purposes")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Payment Webhook")
+
+
+@app.post("/webhooks/payments")
+async def handle_payment_webhook(request: Request) -> JSONResponse:
+    """
+    Accept payment webhook deliveries from the third-party processor.
+
+    Security pipeline:
+      1. Validate required headers
+      2. Read RAW body
+      3. Verify HMAC over raw bytes
+...[truncated]
+---[Response C]:
+# Security Review: FastAPI Payment Webhook Endpoint
+
+## Vulnerabilities (Ordered by Severity)
+
+### CRITICAL — 1. Signature Verification After JSON Parsing
+
+```python
+@app.post("/webhook")
+async def webhook(payload: dict = Body(...)):  # ← Parsed BEFORE auth check
+    sig = request.headers.get("X-Webhook-Signature")
+    verify_hmac(sig, payload)  # ← Only checked after Expensive JSON parse
+```
+
+**Attack vectors:**
+- **CPU DoS**: Attacker sends millions of malformed payloads; each triggers full JSON deserialization + model validation before HMAC check fails. At ~50MB/s per core, a single core gets saturated.
+- **Injection via parser**: If using Pydantic with `model_validate` accepting arbitrary extra fields or nested structures crafted to trigger recursive parsing bugs.
+
+**Fix:** Read raw bytes, verify HMAC against the *exact* request body, THEN parse. This ensures only valid-signed payloads touch the JSON parser.
+
+---
+
+### CRITICAL — 2. In-Memory Dict for Replay Ledger
+
+```python
+_seen_event_ids: set[str] = set()  # ← Dies on deploy, shares nothing across Uvicorn workers
+```
+
+**Problems:**
+- **Lost on restart**: New deployment wipes history → allows replays of every historic event.
+- **No worker sharing**: Multi-worker Uvicorn (4+ workers by default) → each worker has its own empty set → 75% of requests bypass replay check depending on which worker handles it.
+- **Unbounded growth**: No eviction policy → OOM under sustained delivery.
+- **No expiry window**: Event IDs accumulate forever; should only need ~24h dedup window.
+
+**Fix:** Persistent store (SQLite file-level lock for simplicity, or Redis). Bounded TTL (~24 hours). Works identically across all workers.
+
+---
+
+### HIGH — 3. Race Condition in Idempotency Check-and-Insert
+
+```python
+if event_id not in _seen_event_ids:
+    _seen_event_ids.add(event_id)  # ← TOCTOU between check and insert
+    result = process_payment(event_id)  # ← Two concurrent requests both pass the guard
+return {"status": "ok"}
+```
+
+With two near-simultaneous deliveries of the same `event_id`, both requests can pass the `not in` check, both call `process_payment()` (charging the customer twice), then both write. Classic TOCTOU.
+
+**Fix:** Use a database `INSERT ... ON CONFLICT DO NOTHING` (atomic) or a filesystem-based advisory lock (`fcntl.flock`). With SQLite in WAL mode + a dedicated `webhook_events` table, the INSERT is atomic under concurrent connections.
+
+---
+
+### HIGH — 4. Secrets Loaded at Import Time / Not Rotated Gracefully
+
+A common pattern loads secrets once at module import:
+
+```python
+with open("/etc/secrets/webhook_secret") as f:
+    CURRENT_HMAC_SECRET = f.read().strip()  # ← Never re-reads; stale forever
+```
+
+If the processor rotates the signing secret, your service won't accept valid signatures until a redeploy. There's also no multi-secret support for a grace period where both old and new secrets are accepted.
+
+**Fix:** Load secrets lazily on each request, support a list of candidate keys (new first, then fallbacks), and rotate the on-disk file independently of deployments.
+
+---
+
+### MEDIUM — 5. Processor Errors Leaked to Clients
+
+```python
+try:
+    process_payment(event_id)
+except ProcessingError as e:
+    raise HTTPException(status_code=500, detail=str(e.internal_code))  # ← leaks internals
+```
+
+Internal error codes, stack snippets, or processor response bodies become visible in the HTTP 500 response. Attackers use this for fingerprinting.
+
+**Fix:** Log internally, return a generic `{ "error": "processing_failed" }` to the client with status 200 or 502 (processor-side failure, not our failure).
+
+---
+
+### MEDIUM — 6. No Payload Size Limit
+
+No `Content-Length` check means an attacker can stream a 1GB body to exhaust server memory before the HMAC even gets verified.
+
+**Fix:** Add a middleware or lifespan handler that rejects requests above a reasonable limit (e.g., 1 MB).
+
+---
+
+## Corrected Implementation
+
+```python
+"""payment_webhook_secure.py — Hardened FastAPI webhook for third-party processor."""
+
+import hashlib
+import hmac
+import logging
+import os
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ---------------------------------------------------------------------------
+# Configuration — loaded fresh per request for secret rotation support
+# ---------------------------------------------------------------------------
+
+WEBHOOK_SECRET_DIR = Path(os.environ.get("WEBHOOK_SECRET_DIR", "/etc/secrets"))
+MAX_PAYLOAD_SIZE = int(os.environ.get("MAX_WEBHOOK_SIZE", 1_000_000))  # 1 MB
+DB_PATH = Path(os.environ.get("WEBHOOK_DB", "/var/lib/webhook/events.db"))
+REPLAY_TTL_SECONDS = int(os.environ.get("REPLAY_TTL", 86_400))  # 24 hours
+
+PROCESSOR_ERROR_LOG_PREFIX = "[webhook_processor_error]"
+
+logger = logging.getLogger("webhook")
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Payment Webhook")
+
+# ---------------------------------------------------------------------------
+# Database-backed replay/idempotency ledger
+# ---------------------------------------------------------------------------
+
+
+def _ensure_db() -> None:
+    """Create the SQLite database and table if they don't exist."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS webhook_events (
+            event_id   TEXT PRIMARY KEY,
+            created_at REAL NOT NULL DEFAULT strftime('%s', 'now')
+        )
+        """
+    )
+    # Index for expired-row pruning (see _prune_expired)
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_webhook_created
+        ON webhook_events (created_at)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+@contextmanager
+def _db_conn():
+    """Provide a connection with WAL mode + busy timeout for concurrency."""
+    ensure = not DB_PATH.exists()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")  # 5 s wait on contention
+        yield conn
+    finally:
+        conn.close()
+    if ensure:
+        _ensure_db()
+
+
+def record_event_id(event_id: str) -> bool:
+    """Atomically record an event ID. Returns True if *new*, False if dup."""
+    now = time.time()
+    with _db_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO webhook_events (event_id, created_at) VALUES (?, ?)",
+            (event_id, now),
+        )
+        inserted = cursor.rowcount == 1
+        if inserted:
+            conn.commit()
+        else:
+            conn.rollback()
+        return inserted
+
+
+def _prune_expired() -> None:
+    """Remove event IDs older than REPLAY_TTL_SECONDS. Call periodically."""
+    cutoff = time.time() - REPLAY_TTL_SECONDS
+    with _db_conn() as conn:
+        conn.execute("DELETE FROM webhook_events WHERE created_at < ?", (cutoff,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Secret rotation helper
+# ---------------------------------------------------------------------------
+
+
+def _load_candidate_secrets() -> list[bytes]:
+    """Load all available HMAC secrets from disk (newest first).
+
+    Expects files named like:
+      webhook_secret.current   — newest
+      webhook_secret.previous  — old (for overlap period)
+    """
+    candidates: list[bytes] = []
+    for name in ("webhook_secret.current", "webhook_secret.previous"):
+        path = WEBHOOK_SECRET_DIR / name
+        if path.is_file():
+            candidates.append(path.read_bytes().rstrip(b"\n"))
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# HMAC verification on RAW bytes (BEFORE any JSON parsing)
+# ---------------------------------------------------------------------------
+
+EXPECTED_ALGO = "sha256"
+
+
+def verify_hmac_raw(raw_body: bytes, signature: Optional[str]) -> bool:
+    """Verify HMAC against the *raw* request body bytes.
+
+    Tries each candidate secret; returns True on first match.
+    """
+    if not signature:
+        return False
+
+    expected_prefix = f"{EXPECTED_ALGO}="
+    if not signature.startswith(expected_prefix):
+        return False
+
+    computed_value = signature[len(expected_prefix):]
+
+    for secret in _load_candidate_secrets():
+        digest = hmac.new(
+            secret,
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(digest, computed_value):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Middleware: size gate & cleanup
+# ---------------------------------------------------------------------------
+
+_REQUEST_COUNTER = 0
+
+
+class WebhookMiddleware(BaseHTTPMiddleware):
+    """Reject oversized payloads BEFORE routing; prune ledger periodically."""
+
+    async def dispatch(self, request: Request, call_next):
+        global _REQUEST_COUNTER
+
+        # --- Size gate --------------------------------------------------
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_PAYLOAD_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "payload_too_large"},
+            )
+
+        response = await call_next(request)
+
+        # --- Periodic ledger pruning (every 100 requests) ---------------
+        _REQUEST_COUNTER += 1
+        if _REQUEST_COUNTER % 100 == 0:
+            try:
+                _prune_expired()
+            except Exception:
+                logger.exception("failed to prune webhook ledger")
+
+        return response
+
+
+app.add_middleware(WebhookMiddleware)
+
+# Run on
+...[truncated]
+---[Response D]:
+This repo already contains detailed webhook security review artifacts. I've reviewed them — let me synthesize a clean standalone analysis based on the exact vulnerable patterns you described, then provide the corrected code.
+
+---
+
+## Security Review: FastAPI Payment Webhook Endpoint
+
+### Vulnerabilities Identified (Ordered by Severity)
+
+**VULN-01 [CRITICAL] — HMAC Verified *After* JSON Body Parsing**
+
+The handler calls `await request.json()` before checking the HMAC-SHA256 signature on raw payload bytes. This creates three attack surfaces:
+
+1. **Resource exhaustion DoS:** An attacker sends a 500 MB body; the parser drains memory before signature rejection ever runs.
+2. **Parser-side ReDoS / stack overflow:** Malformed nested JSON triggers catastrophic backtracking or max-recursion exceptions *before* the auth check.
+3. **Information leakage via parser errors:** Stack traces from `json.JSONDecodeError` leak framework versions, internal module paths, and middleware ordering to unauthenticated callers.
+
+The signature must be computed over the *exact raw bytes* received, verified first, and only then parsed.
+
+**VULN-02 [CRITICAL] — Replay-ID Ledger in In-Memory Dict**
+
+Using `{}` to track `event_id` values means:
+
+1. **No durability across restarts:** Every deploy/crash silently resets the ledger, allowing double-charging until the dict fills up again.
+2. **TOCTOU race under concurrency:** Two simultaneous identical webhooks both see `"id" not in seen`, both insert, both process — defeating dedup entirely. Python's GIL does *not* serialize `in` + `set.add`.
+3. **Unbounded memory growth:** No eviction policy → eventual OOM kill of the worker.
+
+**VULN-03 [CRITICAL] — No Body Size Limit Before Signature Check**
+
+No ceiling on `Content-Length`. An attacker streams arbitrary-sized data before HMAC verification ever aborts. Classic post/flood slowloris variant against signed endpoints.
+
+**VULN-04 [HIGH] — Expired Secret Keys Accepted After Rotation**
+
+When a rotating secret passes its expiry timestamp, the original code may still accept signatures made with that key because rotation revokes the entry without enforcing `expires_at` checks during verification. A compromised old secret remains usable forever.
+
+**VULN-05 [HIGH] — Timing Side-Channel in Fallback Key Search**
+
+The fallback loop breaks on first match without iterating all keys. Total computation time leaks *which* key position matched, giving an active-network attacker information about key ring composition.
+
+**VULN-06 [HIGH] — Internal Exception Details Leaked to HTTP Clients**
+
+Returning `{"detail": str(exc)}` on processing failures exposes database URIs, file system paths, library internals, and framework stack traces. OWASP Top 10 CWE-209.
+
+**VULN-07 [MEDIUM] — Sensitive Fields Logged Unmasked**
+
+Payload fields like `order_id`, `customer_email`, card references emitted verbatim in log statements — PCI-DSS and GDPR violations.
+
+**VULN-08 [MEDIUM] — Rotating Secret Ring Has No Concurrency Guard**
+
+`SecretRing.add()` appends + sorts + pops the underlying list without a lock. Concurrent rotations from admin operations corrupt ring state, causing false accepts or false rejects.
+
+**VULN-09 [MEDIUM] — Deprecated `asyncio.get_event_loop()` Usage**
+
+`get_event_loop()` is deprecated since 3.10; fails outside a running loop context on 3.12+.
+
+**VULN-10 [LOW] — No Rate Limiting on Webhook Path**
+
+Authenticated flood of valid-but-replay-signed requests exhausts HMAC compute and I/O per-second. Each request is individually rejected but aggregate cost degrades availability.
+
+---
+
+### Corrected Implementation
+
+```python
+"""
+Hardened FastAPI payment-webhook endpoint.
+
+Corrects the original vulnerabilities:
+  (a) HMAC verified on raw bytes BEFORE any JSON parsing
+  (b) Replay ledger uses persistent SQLite with atomic INSERT PRIMARY KEY
+      instead of an in-memory dict
+  (c) Idempotent dedup guaranteed by single-statement conflict detection
+      — two concurrent callers cannot both succeed
+  (d) Processor errors return generic message; full traceback logged server-side only
+
+Additional hardening: configurable body-size ceiling, expired-key rejection,
+constant-time key-ring iteration, mutex-guarded secret rotation, rate limiting.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac as _hmac_mod
+import logging
+import os
+import sqlite3
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# Optional: graceful degrade when slowapi is absent
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    _HAS_RATE_LIMIT = True
+except ImportError:
+    _HAS_RATE_LIMIT = False
+    Limiter = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+
+# ===================================================================
+# 1. Secrets Management
+# ===================================================================
+
+@dataclass(frozen=True)
+class WebhookSecret:
+    key_id: str
+    secret_bytes: bytes
+    activated_at: float
+    expires_at: float | None   # None  → permanent
+
+
+class SecretRing:
+    """Bounded secret ring with mutex-guarded rotation."""
+
+    MAX_KEYS = 10
+
+    def __init__(self, active: WebhookSecret) -> None:
+        self._ring: list[WebhookSecret] = [active]
+        self._lock = asyncio.Lock()
+
+    async def add(self, secret: WebhookSecret) -> None:
+        async with self._lock:
+            self._ring.append(secret)
+            self._ring.sort(key=lambda s: s.activated_at, reverse=True)
+            while len(self._ring) > self.MAX_KEYS:
+                self._ring.pop()
+
+    def get_by_key_id(self, key_id: str) -> WebhookSecret | None:
+        for s in self._ring:
+            if s.key_id == key_id:
+                return s
+        return None
+
+    @property
+    def all_keys(self) -> list[WebhookSecret]:
+        return sorted(self._ring, key=lambda s: s.activated_at)
+
+
+async def build_secret_ring(env_var: str = "WEBHOOK_SECRET") -> SecretRing:
+    raw = os.environ.get(env_var)
+    if not raw:
+        raise RuntimeError(f"{env_var} environment variable is required")
+    return WebhookSecret(
+        key_id="v1",
+        secret_bytes=raw.encode(),
+        activated_at=time.time(),
+        expires_at=None,
+    )
+
+
+# ===================================================================
+# 2. Replay Ledger – persistent SQLite, atomic dedup
+# ===================================================================
+
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
+)
+"""
+
+
+def _init_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(_LEDGER_SCHEMA)
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+class ReplayLedger:
+    """Atomic check-and-insert on PRIMARY KEY(event_id).
+
+    Two concurrent callers issuing the same INSERT cannot both succeed
+    because SQLite serialises writes at WAL level — one raises
+    IntegrityError, the other inserts cleanly.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+        self._conn: sqlite3.Connection | None = None
+
+    async def __aenter__(self) -> ReplayLedger:
+        self._conn = await asyncio.get_running_loop().run_in_executor(
+            None, _init_db, self._db_path,
+        )
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    async def consume(self, event_id: str) -> bool:
+        """Return True if this is a *new* event_id (unique delivery).
+
+        Returns False when the row already exists (duplicate/replay).
+        """
+        assert self._conn is not None
+        loop = asyncio.get_running_loop()
+
+        def _insert(eid: str) -> bool:
+            try:
+                self._conn!.execute(
+                    "INSERT INTO webhook_events (event_id, created_at) VALUES (?, ?)",
+                    (eid, time.time()),
+                )
+                self._conn!.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+        return await loop.run_in_executor(None, _insert, event_id)
+
+    async def cleanup_old_entries(self, older_than_seconds: int = 604_800) -> int:
+        cutoff = time.time() - older_than_seconds
+        loop = asyncio.get_running_loop()
+
+        def _delete() -> int:
+            cur = self._conn!.execute(
+                "DELETE FROM webhook_events WHERE created_at < ?", (cutoff,),
+            )
+            self._conn!.commit()
+            return cur.rowcount
+
+        return await loop.run_in_executor(None, _delete)
+
+
+@asynccontextmanager
+async def ledger_from_path(db_path: str):
+    async with ReplayLedger(db_path) as lg:
+        yield lg
+
+
+# ===================================================================
+# 3. HMAC helpers
+# ===================================================================
+
+def _compute_hmac_hex(payload: bytes, secret: bytes) -> str:
+    return _hmac_mod.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def _ct_compare(a: str, b: str) -> bool:
+    return _hmac_mod.compare_digest(a.encode(), b.encode())
+
+
+# ===================================================================
+# 4. Raw-body capture with size ceiling
+# ===================================================================
+
+_MAX_BODY_BYTES = 256 * 1024  # 256 KB
+
+async def _capture_raw_body(request: Request) -> bytes:
+    parts: list[bytes] = []
+    total = 0
+    receive = requ
+...[truncated]
+---[Response E]:
+I'll work through this systematically — analyzing the described vulnerabilities and building a corrected implementation.
+
+## Vulnerability Analysis (Ordered by Severity)
+
+### 1. HIGH — Signature Verification After Body Parsing
+
+The code parses the entire request body as JSON *before* verifying the HMAC. An attacker can flood the endpoint with massive payloads (e.g., nested structures causing ReDoS, or multi-gigabyte bodies) and the server will waste CPU/memory on every one without ever reaching the auth check. This is a textbook **ReDoS / resource-exhaustion** attack path.
+
+### 2. CRITICAL — In-Memory Replay-ID Ledger
+
+Storing event IDs in a Python `dict` means:
+- All replay protection vanishes on process restart
+- Multi-instance deployments each have independent ledgers — duplicates slip through between instances
+- Unbounded growth → eventual OOM
+
+### 3. MEDIUM — No Content-Type Enforcement on Incoming Webhook
+
+Accepting arbitrary `Content-Type` headers lets an attacker send a body that doesn't match what the HMAC was signed over, creating ambiguity about whether verification is meaningful.
+
+### 4. MEDIUM — Rotating Secret Handling Gaps
+
+"Rotating secret" implies multiple active keys (current + previous). Without supporting multiple candidate secrets, legitimate deliveries arrive during transition windows and get falsely rejected.
+
+### 5. MEDIUM — Missing Race Condition Handling
+
+Under concurrent duplicate webhooks (same `event-id` arriving simultaneously), a naïve "check dict → insert dict" pattern has a TOCTOU race. Both requests pass the check and process the payment twice.
+
+### 6. LOW — Error Leakage to Client
+
+Processor errors (JSON parse failures, missing headers, HMAC mismatches) surfacing in the HTTP response leak internal state an attacker can use for reconnaissance.
+
+### 7. LOW — Absent Rate Limiting & Timeout
+
+No rate limiting per IP/event source, and no timeout on outbound processing hooks, allowing slow-loris style attacks.
+
+---
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request, Response, Header, HTTPException
+from fastapi.responses import JSONResponse
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+WEBHOOK_HMAC_ALGORITHM = "sha256"
+HMAC_SECRET_KEY_ID_HEADER = "X-Webhook-Secret-Id"
+HMAC_SIGNATURE_HEADER = "X-Webhook-Signature"
+EVENT_ID_HEADER = "X-Event-Id"
+MAX_BODY_BYTES = 65_536          # 64 KB hard cap before reading body
+REPLAY_LEDGER_TTL_SECONDS = 86_400 * 7  # keep event IDs for 7 days
+
+logger = logging.getLogger("webhook")
+
+
+class ReplayLedger:
+    """Redis-backed or fallback in-memory set for deduplicating webhooks."""
+
+    def __init__(self, redis_client=None):
+        self._redis = redis_client
+        # Fallback for dev environments only — DO NOT rely on this in prod
+        self._memory: dict[str, float] = {}
+
+    async def add_if_absent(self, event_id: str) -> bool:
+        """Return True if the event_id was NOT previously recorded."""
+        now = datetime.now(timezone.utc).timestamp()
+
+        if self._redis is not None:
+            # Atomic SETNX with TTL — single round-trip, no race
+            inserted = await self._redis.set(
+                f"replay:{event_id}", 1, nx=True, ex=REPLAY_LEDGER_TTL_SECONDS
+            )
+            return bool(inserted)
+
+        # --- Fallback in-memory (not safe across processes) ---
+        # Use asyncio.Lock to protect the dict; still fragile across forks
+        if event_id in self._memory:
+            return False
+        self._memory[event_id] = now
+        # Prune stale entries periodically
+        cutoff = now - REPLAY_LEDGER_TTL_SECONDS
+        self._memory = {k: v for k, v in self._memory.items() if v > cutoff}
+        return True
+
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Payment Webhook Receiver")
+ledger = ReplayLedger(redis_client=None)  # replace with actual Redis client
+
+
+def _get_secret_key(key_id: str | None) -> bytes | None:
+    """Look up the signing key for the given ID.
+
+    Returns the active secret bytes, or None if unknown. Supports rotation
+    by checking a *previous* key id when current fails (detailed below).
+    """
+    # Production: query your KMS / DB for key_id -> secret
+    # For demo we keep two candidates: current + previous rotation slot
+    SECRETS_BY_ID: dict[str, bytes] = {
+        "key-v1": b"SECRET_PREVIOUS",
+        "key-v2": b"SECRET_CURRENT",
+    }
+    return SECRETS_BY_ID.get(key_id)
+
+
+async def _verify_hmac(raw_body: bytes, *, signature: str, secret_id: str) -> bool:
+    """Verify HMAC-SHA256 over raw bytes using ONLY the exact header values."""
+    expected = hmac.new(
+        _get_secret_key(secret_id),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+# ---------------------------------------------------------------------------
+# Middleware: reject obviously malicious requests immediately
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def webhook_security_middleware(request: Request, call_next):
+    """Fast path rejects for common abuse patterns before handler runs."""
+    # Only allow POST to our webhook route
+    if request.url.path == "/webhook/payment" and request.method != "POST":
+        return JSONResponse(status_code=405, content={"error": "method not allowed"})
+
+    # Reject oversized bodies BEFORE reading
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": "payload too large"},
+        )
+
+    # Enforce application/json content type early
+    ct = request.headers.get("content-type", "")
+    if not ct.startswith("application/json"):
+        return JSONResponse(
+            status_code=415,
+            content={"error": "unsupported media type"},
+        )
+
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        # Internal error — never leak stack traces or processor details
+        logger.error("webhook middleware error: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal server error"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook/payment")
+async def handle_payment_webhook(request: Request):
+    """Receive, verify, deduplicate, and process a payment webhook."""
+
+    # --- 1. Extract required headers FIRST (no body read yet) ------------
+    secret_id = request.headers.get(HMAC_SECRET_KEY_ID_HEADER)
+    signature = request.headers.get(HMAC_SIGNATURE_HEADER)
+    event_id = request.headers.get(EVENT_ID_HEADER)
+
+    if not all([secret_id, signature, event_id]):
+        logger.warning("missing required webhook headers from %s", request.client.host)
+        return JSONResponse(status_code=400, content={"error": "bad request"})
+
+    # --- 2. Check replay ledger BEFORE any processing -------------------
+    #    Using an atomic operation in the ledger (SETNX) prevents races.
+    is_new = await ledger.add_if_absent(event_id)
+    if not is_new:
+        # We've already processed this event — silent success to avoid
+        # triggering the processor to resend.
+        return JSONResponse(status_code=200, content={"status": "already_processed"})
+
+    # --- 3. Read raw body (bytes, not parsed JSON) ----------------------
+    raw_body = await request.body()
+    if not raw_body:
+        return JSONResponse(status_code=400, content={"error": "empty body"})
+
+    # --- 4. Verify HMAC over RAW BYTES ----------------------------------
+    #    We do NOT parse JSON first — prevents ReDoS / injection in parser.
+    if not await _verify_hmac(raw_body, signature=signature, secret_id=secret_id):
+        # If it fails with current key, try the *previous* key (rotation window)
+        if not await _try_previous_key_verification(raw_body, signature):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    # --- 5. Parse JSON body safely (after auth!) ------------------------
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("invalid JSON body from %s", request.client.host)
+        return JSONResponse(status_code=400, content={"error": "bad request"})
+
+    # Basic schema sanity check — reject nonsense early
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "bad request"})
+
+    # --- 6. Process the payment ------------------------------------------
+    try:
+        await _process_payment(payload)
+    except Exception as exc:
+        # Log fully, respond generically
+        logger.error("payment processing failed: %s", exc, exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "processing failed"})
+
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+
+async def _try_previous_key_verification(raw_body: bytes, signature: str) -> bool:
+    """Attempt verification with the previous rotation key."""
+    # Derive the previous key ID; in production this would come from config/DB
+    prev_ids = {"key-v1"}  # subset of known retired but still-valid keys
+    for prev_id in prev_ids:
+        if await _verify_hmac(raw_body, signature=signature, secret_id=prev_id):
+            logger.info("webhook verified with rotated key %s", prev_id)
+            return True
+    return Fal
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

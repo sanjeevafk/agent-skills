@@ -1,0 +1,483 @@
+[exit=0 latency=29.52s]
+# FastAPI p99 Regression Investigation Plan
+
+## Problem Statement
+
+p50 barely changed (80→85ms) but p99 nearly 10× worse (210→1900ms). CPU/memory flat. DB connections + query count per request increased. Pattern: most requests are fine, but a tail of requests went from ~200ms to ~2s. That ratio — stable median, broken tail — points to **one or two slow code paths** hitting either N+1 queries or connection pool starvation.
+
+---
+
+## Step 1 — Instrument Under Live Traffic
+
+Do not spin up separate profiles. Attach instruments that survive traffic:
+
+### Continuous Profiler (CPU + wall time)
+
+```python
+# middleware/profiler.py — drop-in FastAPI middleware
+import cProfile, pstats, io, time
+from starlette.middleware.base import BaseHTTPMiddleware
+
+_profiler_cache = {}  # request_id -> (profiler, start_time)
+
+class SamplingProfilerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        profiler = cProfile.Profile()
+        key = f"{request.method}:{request.url.path}"
+        _profiler_cache[key] = (profiler, time.time())
+        
+        try:
+            response = await call_next(request)
+        finally:
+            profiler.disable()
+            _, start = _profiler_cache.pop(key, (None, None))
+            
+            # Only dump when latency crosses threshold
+            elapsed_ms = int((time.time() - start) * 1000)
+            if elapsed_ms > 500:
+                stream = io.StringIO()
+                stats = pstats.Stats(profiler, stream=stream)
+                stats.sort_stats('cumulative')
+                stream.truncate(0)
+                stats.stream.seek(0)
+                stats.print_stats(30)  # top-30 callers by cumulative time
+                
+                # Log with correlation id so you can correlate to dashboard traces
+                logger.warning(
+                    "SLOW_REQUEST ms=%d path=%s %s",
+                    elapsed_ms, request.url.path, stream.getvalue(),
+                )
+                
+        return response
+```
+
+This gives you **call stacks for only the slow requests** (~top 10% of traffic), keeping overhead near zero while capturing the tail where p99 lives.
+
+### Query Tracing (SQLAlchemy / asyncpg)
+
+If using SQLAlchemy:
+
+```python
+# middleware/query_tracer.py
+from sqlalchemy.event import listens_for, event
+import time, logging
+
+logger = logging.getLogger(__name__)
+_query_start = {}
+
+@listens_for("before_execute", "Connection")
+def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    conn_info = f"pid={conn.pid} queue_age={conn._echo_pool_queue_age}"
+    _query_start[id(statement)] = (time.perf_counter(), conn_info)
+
+@listens_for("after_execute", "Connection")
+def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    start, conn_info = _query_start.pop(id(statement), (time.time(), ""))
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    
+    if elapsed_ms > 10:
+        logger.info(
+            "SLOW_QUERY %s %dms\n  %s\nParams: %s",
+            conn_info, elapsed_ms,
+            statement[:500], str(parameters)[:200],
+        )
+```
+
+For asyncpg (direct driver):
+
+```python
+async def tracing_exec(conn, method, query, args, timeout):
+    t0 = time.perf_counter()
+    result = await getattr(conn, method)(query, *args, timeout=timeout)
+    ms = (time.perf_counter() - t0) * 1000
+    if ms > 10:
+        logger.info("SLOW_QUERY %dms | %s", ms, query[:500])
+    return result
+```
+
+### Connection Pool Metrics Middleware
+
+```python
+# middleware/pool_metrics.py
+import asyncio, time, logging
+from prometheus_client import Histogram, Gauge, Counter
+from starlette.middleware.base import BaseHTTPMiddleware
+
+pool_active = Gauge('db_pool_active', 'connections currently checked out')
+pool_queue_size = Gauge('db_pool_queue_size', 'requests waiting for a connection')
+pool_max = Gauge('db_pool_max', 'max configured pool size')
+
+request_query_count = Histogram('db_requests_per_endpoint', 'queries per request', ['endpoint'])
+request_latency_ms = Histogram('db_request_latency_ms', 'request latency', ['endpoint'])
+
+class PoolMetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        t0 = time.perf_counter()
+        
+        # Inject a counter into the request state
+        request.state.query_count = 0
+        
+        @functools.wraps(some_db_call)  # wrap your DB call helper
+        def count_query():
+            request.state.query_count += 1
+        
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        
+        # Emit metrics at the end of each request
+        request_query_count.labels(endpoint=request.url.path).observe(request.state.query_count)
+        request_latency_ms.labels(endpoint=request.url.path).observe(elapsed_ms)
+        
+        return response
+```
+
+Hook into SQLAlchemy via `SessionEvents.after_flush` or an ORM-level hook:
+
+```python
+from sqlalchemy.orm import Session
+
+@listens_for(Session, "after_flush")
+def track_queries(session, flush_context):
+    session.bind._query_count_tracker = getattr(session.bind, '_query_count_tracker', 0) + 1
+```
+
+---
+
+## Step 2 — Distinguish N+1 vs Pool Saturation vs Lock Contention
+
+| Signal | Diagnosis |
+|---|---|
+| Flame graph shows the same endpoint repeatedly calling `SELECT ... WHERE id = ?` in a loop | **N+1 query pattern** |
+| Queue depth consistently hits pool max (e.g., 20), `queue_age` logs show 1–5s waits | **Pool saturation** — too many concurrent requests exceeding pool size |
+| `SLOW_QUERY` shows short individual queries (>10ms) but query count per request jumped from 3→47 | **N+1** — small queries, many of them |
+| Queries are individually fast (<2ms) but total time is high | Could be pool saturation OR lock contention; read next row |
+| Same tables hit concurrently, long locks shown in `pg_stat_activity` | **Lock contention** on hot rows/tables |
+| `wait_event_type` in PostgreSQL = `Lock` or `IO` | Lock/contention vs compute-bound |
+
+**Concrete discrimination:**
+
+```bash
+# From postgres side — run during the incident to check wait events
+SELECT 
+  wait_event_type,
+  wait_event,
+  count(*),
+  min(now() - query_start) AS min_wait,
+  max(now() - query_start) AS max_wait,
+  avg(now() - query_start) AS avg_wait
+FROM pg_stat_activity 
+WHERE state != 'active'
+GROUP BY wait_event_type, wait_event;
+```
+
+- `Lock` → contentions between concurrent transactions
+- `IO` → disk/page cache misses (missing indexes)
+- `Client` → waiting on the client (connection pool exhaustion from app side)
+
+```sql
+-- Also check for idle-in-transaction sessions holding locks
+SELECT pid, usename, state, query,
+       now() - query_start AS duration
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+ORDER BY duration DESC;
+```
+
+```python
+# Application-side heuristic: log query count distribution per request
+def audit_n_plus_one(route, endpoints):
+    """After collecting metrics for a day, flag routes with high p95 query counts."""
+    for route, data in endpoints.items():
+        q_counts = data['query_counts']  # list of integers per request
+        p50 = sorted(q_counts)[len(q_counts)//2]
+        p95 = sorted(q_counts)[int(len(q_counts)*0.95)]
+        if p95 > p50 * 5:  # tail queries far exceed median
+            print(f"N+1 suspected on {route}: p50={p50} queries, p95={p95} queries")
+```
+
+---
+
+## Step 3 — How to Read the Flame Graph Output
+
+When `cProfile` dumps land, sort by **cumulative** time (not self time), which is the default `sort_stats('cumulative')`. Here's what a typical N+1 vs pool-saturation profile looks like:
+
+### N+1 Pattern in Profile
+
+```
+SlowRequestHandler.process → UserViewSet.detail (850ms)
+  └─ UserRepository.get_user (5ms)                     ← 1 call, fast
+     └─ Database.session.execute SELECT users...
+  
+  └─ OrderRepository.get_orders (user.id) (62ms)      ← called once, but...
+     └─ 47× ItemRepository.get_items(order.id)          ← LOOP! Each is 1.2ms
+        └─ 47× Database.session.execute SELECT items...
+                                                    ↑ 47 calls, small but summed = 62ms
+```
+
+In the flame graph: one wide branch (the single endpoint handler), then **one narrow leaf repeated dozens of times**. The cumulative column will show `get_items` having very low per-call cost but high total because of repetition.
+
+### Pool Saturation Pattern
+
+```
+EndpointA.handle → EndpointB.handle → some_other_db_call (1200ms)
+  └─ ConnectionPool.checkout() [WAITING 1150ms]       ← stuck here
+     └─ ConnectionPool.wait()                          ← blocked by another request
+  
+  └─ EndpointC.handle → heavy_computation (50ms)       ← fast once it gets the conn
+```
+
+Key tells: `check_out` dominates cumulative time. Individual queries are fast. The wait appears as idle time in the profile (flame graph segment with no functions called, just the pool layer).
+
+### Lock Contention Pattern
+
+```
+EndpointX.handle → Transaction.commit() [WAITING 900ms]
+  └─ PG_lock_advisory(row_id)                         ← waiting on lock held by PID 447
+     └─ Trace: PID 447 holds lock on orders table, transaction started 12s ago
+```
+
+In practice you'll see commit or transaction boundaries dominate time, plus PostgreSQL showing locks.
+
+---
+
+## Step 4 — Proposed Fixes Ranked by Expected p99 Impact
+
+### Fix 1 — Add Eager Loading / JOINs for N+1 (Expected p99 savings: 800–1500ms)
+
+Most likely root cause given the symptom description. Replace per-row lookups with batched queries.
+
+```python
+# BEFORE: N+1 in repository
+class UserRepository:
+    async def get_user_with_details(self, user_id: int) -> UserDTO:
+        user = await self.session.get(User, user_id)
+        orders = [
+            OrderDTO(**o.__dict__) 
+            for o in await self.session.execute(
+                select(Order).where(Order.user_id == user_id)
+            )
+        ]
+        items = []
+        for order in orders:
+            item_rows = await self.session.execute(
+                select(Item).where(Item.order_id == order.id)
+            )
+            items.extend(item_rows.scalars().all())  # ← THIS IS THE N+1
+        return UserDTO(user=user, orders=orders, items=items)
+
+# AFTER: Single JOIN or COALESCE subquery
+class UserRepository:
+    async def get_user_with_details(self, user_id: int) -> UserDTO:
+        subq = (
+            select(Order.user_id, Order.id, Order.total)
+            .where(Order.user_id == user_id)
+        )
+        orders_subq = aliased(subq, name='o')
+        
+        items_subq = (
+            select(Item.order_id, Item.id, Item.name, Item.price)
+            .where(Item.order_id.in_(
+                select(Order.id).where(Order.user_id == user_id)
+            ))
+        )
+        
+        result = await self.session.execute(
+            select(User, orders_subq, items_subq)
+            .outerjoin(orders_subq, User.id == orders_subq.c.user_id)
+            .outerjoin(items_subq, User.id == items_subq.c.order_id)
+            .where(User.id == user_id)
+        )
+        # Parse flat rows back into nested structure
+        return self._flatten_to_dto(result)
+```
+
+If the relationship is already defined in the ORM model, use lazy=False or joinedload:
+
+```python
+# Or simpler — configure relationship loading strategy
+class User(Base):
+    orders = relationship("Order", lazy="joined", back_populates="user")  # Always JOIN
+    # or
+    orders = relationship("Order", lazy="selectin")  # IN-subquery batch
+```
+
+### Fix 2 — Correct Indexes (Expected p99 savings: 5–50ms per query × number of missing indexes)
+
+```sql
+-- Check which queries are doing seq scans
+EXPLAIN ANALYZE
+SELECT * FROM items WHERE order_id = $1;
+
+-- If scan type = Seq Scan, add index
+CREATE INDEX CONCURRENTLY idx_items_order_id ON items(order_id);
+
+-- For composite queries (common in APIs)
+CREATE INDEX CONCURRENTLY idx_orders_user_id_status ON orders(user_id, status);
+```
+
+Verify with EXPLAIN ANALYZE — look for `Index Scan` replacing `Seq Scan`, and `rows estimated` matching `rows actual`.
+
+### Fix 3 — Tune Connection Pool (Expected p99 savings: 200–500ms if saturated)
+
+```python
+# config/database.py
+from sqlalchemy.pool import QueuePool, StaticPool
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+engine = create_engine(
+    DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=20,           # keep connections alive even when idle
+    max_overflow=10,        # allow burst beyond pool_size for spikes
+    pool_timeout=30,        # seconds to wait before failing checkout (was probably <10)
+    pool_recycle=1800,      # recycle stale connections every 30 min (avoids auth/session expiry)
+    pool_pre_ping=True,     # verify connection health before handing out
+    echo=False,             # keep off in prod
+)
+
+# For async (FastAPI recommended):
+# from sqlmodel.ext.asyncio.engine import AsyncEngine
+# engine = create_async_engine(DATABASE_URL, ...)
+```
+
+The critical setting: **`pool_timeout`**. If it was set to 1–5s and traffic spiked, half your requests would block until timeout, creating that p99 spike. Raising to 30s with proper monitoring prevents hard failures while giving the system room to recover.
+
+### Fix 4 — Response Caching (Expected p99 savings: varies, highest impact on hot endpoints)
+
+```python
+from functools import lru_cache, wraps
+import hashlib
+
+def redis_cached(ttl_seconds: int = 60):
+    """Cache decorator for read-only API endpoints."""
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            cache_key = hashlib.sha256(
+                f"{fn.__name__}:{args}:{kwargs}".encode()
+            ).hexdigest()
+            
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+            
+            result = await fn(*args, **kwargs)
+            await redis.setex(cache_key, ttl_seconds, json.dumps(result))
+            return result
+        return wrapper
+    return decorator
+
+# Apply to idempotent GET endpoints
+@router.get("/users/{user_id}")
+@redis_cached(ttl_seconds=30)
+async def get_user(user_id: int):
+    return await user_repo.get_user_with_details(user_id)
+```
+
+### Fix 5 — Database-Level Batch Operations (Expected p99 savings: network round-trips eliminated)
+
+```python
+# Instead of iterating and inserting/selecting one at a time:
+# BAD: N database round trips
+for order_id in order_ids:
+    await session.execute(select(Item).where(Item.order_id == order_id))
+
+# GOOD: single IN clause
+results = await session.execute(
+    select(Item).where(Item.order_id.in_(order_ids))
+)
+
+# Or batch INSERT with unnest/postgres array
+await session.execute(text("""
+    INSERT INTO analytics_events (user_id, event_type, timestamp, metadata)
+    SELECT * FROM jsonb_array_elements($1::jsonb)
+    WITH ORDINALITY AS arr(elem, idx)
+    CROSS JOIN LATERAL jsonb_to_record(arr.elem) AS x(
+        user_id BIGINT, event_type TEXT, timestamp TIMESTAMP, metadata JSONB
+    )
+"""), {"params": json.dumps(event_batches)})
+```
+
+---
+
+## Verification Protocol
+
+After applying fixes, **measure both before and after**:
+
+```python
+# scripts/load_test_profile.py
+import kubernetes, time, statistics, httpx, asyncio
+
+BASE_URL = "https://api.example.com"
+
+async def benchmark_endpoint(path: str, concurrency: int = 50, duration_s: int = 60) -> dict:
+    """Run load test, collect p50/p99, compare against baseline."""
+    latencies = []
+    
+    async def hit(client: httpx.AsyncClient):
+        t0 = time.perf_counter()
+        try:
+            resp = await client.get(f"{BASE_URL}{path}")
+            resp.raise_for_status()
+        except Exception:
+            pass
+        finally:
+            latencies.append((time.perf_counter() - t0) * 1000)
+    
+    tasks = [asyncio.create_task(hit(client)) for _ in range(concurrency)]
+    await asyncio.sleep(duration_s)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    latencies.sort()
+    n = len(latencies)
+    return {
+        'latencies_ms': latencies,
+        'count': n,
+        'p50': latencies[int(n*0.5)],
+        'p90': latencies[int(n*0.9)],
+        'p95': latencies[int(n*0.95)],
+        'p99': latencies[min(int(n*0.99), n-1)],
+        'min': latencies[0],
+        'max': latencies[-1],
+        'avg': statistics.mean(latencies),
+    }
+
+# Run against production-like load
+baseline = json.load(open('baseline_metrics.json'))  # capture pre-fix
+post_fix = asyncio.run(benchmark_endpoint('/users/me', concurrency=100, duration_s=120))
+
+print(f"Before p99: {baseline['p99']}ms")
+print(f"After  p99: {post_fix['p99']}ms")
+print(f"Reduction:  {(1 - post_fix['p99']/baseline['p99'])*100:.0f}%")
+```
+
+---
+
+## Summary Decision Tree
+
+```
+Query count/request UP, DB connections UP, p99 10× worse
+         │
+         ├──→ p50 unchanged (80→85ms)
+         │    → Slow path affects only a subset of requests
+         │
+         ├──→ Check flame graph on slow requests
+         │    │
+         │    ├──→ One function repeated N times in loop  → N+1 queries → Fix 1 (eager load)
+         │    ├──→ Time spent in pool checkout()           → Pool saturation → Fix 3 (pool tuning)
+         │    └──→ Time spent in PG lock wait              → Lock contention → Fix: reduce TX scope, retry logic
+         │
+         └──→ Check pg_stat_activity for wait_event_type
+              │
+              ├──→ Lock → Row/table level lock contention
+              ├──→ IO   → Missing indexes → Fix 2
+              └──→ Client → App-side pool exhaustion
+```
+
+**Ranked by expected impact on p99** based on the symptoms described:
+1. **Fix 1 (N+1 eager loading)** — highest impact, most likely root cause
+2. **Fix 2 (index addition)** — immediate win if seq scans confirmed
+3. **Fix 3 (pool timeout tuning)** — secondary contributor, cheap to apply
+4. **Fix 4 (response caching)** — structural improvement for read-heavy endpoints
+5. **Fix 5 (batch operations)** — polish for remaining patterns

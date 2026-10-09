@@ -1,0 +1,251 @@
+I'll analyze the security vulnerabilities in order of severity, then provide a corrected implementation.
+
+## Vulnerability Analysis
+
+| # | Severity | Vulnerability | Impact |
+|---|----------|---------------|--------|
+| 1 | **CRITICAL** | Signature verified AFTER JSON parsing | Server processes untrusted input before authentication — payload parsing exploits hit unauthenticated code path |
+| 2 | **CRITICAL** | In-memory replay store | Replays succeed across restarts, multi-worker deployments, or horizontal scaling — complete bypass of replay protection |
+| 3 | **HIGH** | No atomic check-and-set for idempotency | Race condition: concurrent duplicate webhooks both pass the "not seen" check before either writes — double processing |
+| 4 | **HIGH** | Error leakage to client | Stack traces, DB errors, or internal paths returned to attacker — information disclosure aids targeted attacks |
+| 5 | **MEDIUM** | Non-constant-time HMAC comparison | `==` operator leaks timing information — byte-by-byte signature forgery possible |
+| 6 | **MEDIUM** | No timestamp/ttl on webhook | Old captured payloads replayable forever — no temporal bound on replay window |
+
+## Corrected Implementation
+
+```python
+# webhook_handler.py
+import hashlib
+import hmac
+import json
+import logging
+import time
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+import asyncpg  # or your async DB driver
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# --- Configuration (from env/secrets manager) ---
+WEBHOOK_SECRET_CURRENT = "whsec_current_secret_from_env"
+WEBHOOK_SECRET_PREVIOUS = "whsec_previous_secret_from_env"  # rotation grace period
+WEBHOOK_MAX_AGE_SECONDS = 300  # 5 minute tolerance
+REPLAY_TTL_DAYS = 7
+
+
+class WebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    timestamp: int
+    data: dict
+
+
+class ReplayStore:
+    """Persistent, atomic replay protection via database."""
+
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
+
+    async def try_acquire(self, event_id: str, ttl_days: int) -> bool:
+        """
+        Atomic check-and-insert. Returns True if event_id was unseen and
+        successfully claimed. Returns False if already seen.
+        Uses INSERT ... ON CONFLICT for atomicity under concurrency.
+        """
+        try:
+            result = await self.pool.fetchval(
+                """
+                INTO webhook_events (event_id, processed_at)
+                VALUES ($1, NOW())
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                event_id,
+            )
+            return result is not None
+        except Exception as e:
+            logger.error("Replay store error", extra={"event_id": event_id})
+            raise
+
+    async def cleanup_expired(self, ttl_days: int):
+        """Periodic cleanup of old entries."""
+        await self.pool.execute(
+            "DELETE FROM webhook_events WHERE processed_at < NOW() - INTERVAL '$1 days'",
+            ttl_days,
+        )
+
+
+class SignatureVerifier:
+    """HMAC-SHA256 signature verification with constant-time comparison."""
+
+    def __init__(self, current_secret: str, previous_secret: Optional[str] = None):
+        self.current_secret = current_secret.encode()
+        self.previous_secret = previous_secret.encode() if previous_secret else None
+
+    def verify(self, raw_body: bytes, signature_header: str, timestamp_header: str) -> bool:
+        """
+        Verify signature BEFORE any parsing. Checks timestamp freshness,
+        then tries current secret, then previous secret (rotation grace).
+        """
+        # Validate timestamp first (prevent replay of old signed payloads)
+        try:
+            timestamp = int(timestamp_header)
+        except (ValueError, TypeError):
+            logger.warning("Invalid timestamp header")
+            return False
+
+        now = int(time.time())
+        if abs(now - timestamp) > WEBHOOK_MAX_AGE_SECONDS:
+            logger.warning("Stale webhook", extra={"age": abs(now - timestamp)})
+            return False
+
+        # Construct signed payload: timestamp.body (standard pattern)
+        signed_payload = f"{timestamp}.".encode() + raw_body
+
+        # Compute expected signature with current secret
+        expected = hmac.new(self.current_secret, signed_payload, hashlib.sha256).hexdigest()
+
+        # Constant-time comparison against provided signature
+        if self._safe_compare(signature_header, expected):
+            return True
+
+        # Try previous secret (grace period during rotation)
+        if self.previous_secret:
+            expected_prev = hmac.new(self.previous_secret, signed_payload, hashlib.sha256).hexdigest()
+            if self._safe_compare(signature_header, expected_prev):
+                return True
+
+        return False
+
+    @staticmethod
+    def _safe_compare(provided: str, expected: str) -> bool:
+        """Constant-time comparison to prevent timing attacks."""
+        return hmac.compare_digest(provided.encode(), expected.encode())
+
+
+# --- Application setup ---
+replay_store: Optional[ReplayStore] = None
+signature_verifier: Optional[SignatureVerifier] = None
+
+
+@app.on_event("startup")
+async def startup():
+    global replay_store, signature_verifier
+    pool = await asyncpg.create_pool(dsn="postgresql://...")
+    replay_store = ReplayStore(pool)
+    signature_verifier = SignatureVerifier(
+        current_secret=WEBHOOK_SECRET_CURRENT,
+        previous_secret=WEBHOOK_SECRET_PREVIOUS,
+    )
+
+
+@app.post("/webhooks/payment")
+async def handle_payment_webhook(request: Request):
+    """
+    Secure webhook handler:
+    1. Read raw body (no parsing yet)
+    2. Verify signature against raw bytes
+    3. Check replay ledger atomically
+    4. Parse and validate payload
+    5. Process idempotently
+    """
+    # Step 1: Read raw body — signature is over bytes, not parsed JSON
+    raw_body = await request.body()
+
+    if not raw_body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+
+    # Step 2: Extract and verify signature BEFORE any parsing
+    signature = request.headers.get("x-webhook-signature", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+
+    if not signature or not timestamp:
+        logger.warning("Missing signature headers")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    if not signature_verifier.verify(raw_body, signature, timestamp):
+        logger.warning("Signature verification failed")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # Step 3: Atomic replay check — only proceeds if event_id is unseen
+    # We need event_id before parsing, so extract it from raw JSON minimally
+    # OR: parse first (safe now that signature is verified), then check replay
+    try:
+        parsed_json = json.loads(raw_body)
+        event_id = parsed_json.get("event_id")
+        if not event_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+
+    # Atomic claim: returns False if already processed (concurrent-safe)
+    is_new = await replay_store.try_acquire(event_id, REPLAY_TTL_DAYS)
+    if not is_new:
+        # Already processed — return 200 to prevent retries, but don't reprocess
+        logger.info("Duplicate webhook suppressed", extra={"event_id": event_id})
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={"status": "already_processed"},
+        )
+
+    # Step 4: Validate payload structure (now safe — signature verified)
+    try:
+        payload = WebhookPayload(**parsed_json)
+    except ValidationError as e:
+        logger.warning("Invalid payload structure", extra={"errors": e.errors()})
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    # Step 5: Process the event
+    try:
+        await process_payment_event(payload)
+    except Exception as e:
+        # Log full details internally, return generic error to client
+        logger.error(
+            "Webhook processing failed",
+            extra={"event_id": event_id, "error": str(e)},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Processing failed",  # Generic — no internal details leaked
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "processed"},
+    )
+
+
+async def process_payment_event(payload: WebhookPayload) -> None:
+    """Idempotent business logic — safe to call with same event_id."""
+    # Your payment processing logic here
+    # Database operations should also be idempotent (e.g., INSERT ... ON CONFLICT)
+    pass
+```
+
+## Required Database Schema
+
+```sql
+CREATE TABLE webhook_events (
+    event_id TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Index for efficient cleanup
+CREATE INDEX idx_webhook_events_processed_at ON webhook_events (processed_at);
+```
+
+## Key Security Properties
+
+1. **Signature before parse** — raw bytes verified before any JSON processing
+2. **Constant-time comparison** — `hmac.compare_digest` prevents timing attacks
+3. **Atomic idempotency** — `INSERT ... ON CONFLICT DO NOTHING RETURNING` is race-proof under concurrency
+4. **Persistent replay store** — survives restarts, works across workers
+5. **Timestamp freshness** — signed payload includes timestamp; stale signatures rejected
+6. **Secret rotation** — previous secret accepted during grace period
+7. **Error containment** — internal errors logged server-side, generic message returned to client

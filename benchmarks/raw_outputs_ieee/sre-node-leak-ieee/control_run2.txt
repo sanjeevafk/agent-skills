@@ -1,0 +1,464 @@
+[exit=0 latency=26.82s]
+# Node.js 20 API Service — 4GB RSS Memory Leak: Full Diagnosis Plan
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### The Core Problem with Snapshots
+
+Taking `--expose-gc` snapshots via `process.getHeapSnapshot()` or V8's `HeapProfiler` **blocks the event loop for seconds** — unacceptable for production APIs. You need zero-blockshot capture.
+
+### Recommended Capture Strategy
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    CAPTURE PIPELINE                      │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Option A: --trace-allocations + --trace-deopts        │
+│    → No heap snapshots, but identifies allocation sites │
+│      causing the growth                                 │
+│                                                         │
+│  Option B: Chrome DevTools Protocol (CDP) on demand     │
+│    → Attach without restart; takes snapshot via RPC     │
+│      over a Unix socket (no port exposure)              │
+│                                                         │
+│  Option C: OpenTelemetry + async-stack-tracing          │
+│    → Continuous low-overhead sampling; no full heaps    │
+│                                                         │
+│  Option D: kubectl exec with timeout guard              │
+│    → process.v8.takeHeapSnapshot() + stream to file     │
+│      with hard 30s deadline; abort if too slow          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Option B/C/D: Exact Implementation
+
+**Option B — CDP via Unix Socket (zero extra ports):**
+
+```bash
+# Start your container with:
+node --inspect-brk=/tmp/node-inspect.sock your-api.js
+
+# Then from any pod:
+kubectl exec -it <pod> -- \
+  curl --unix-socket /tmp/node-inspect.sock \
+    http://localhost/json/v8debug | jq .
+
+# Take a heap snapshot programmatically via CDP:
+kubectl exec -it <pod> -- node -e "
+  const net = require('net');
+  const c = net.createConnection('/tmp/node-inspect.sock', () => {
+    let buf = '';
+    c.on('data', d => { buf += d; });
+    c.on('end', async () => {
+      // First send initialize
+      c.write(JSON.stringify({id:1,method:'Profiler.enable'})+'\\n');
+      await new Promise(r=>setTimeout(r,500));
+      // Take heap snapshot
+      c.write(JSON.stringify({id:2,method:'Profiler.takeHeapSnapshot'})+'\\n');
+      // This returns chunks you aggregate
+    });
+  });
+"
+```
+
+**Option C — OTEL Async Stack Traces (low overhead, no manual intervention):**
+
+```javascript
+// Add to startup flags (not runtime):
+// NODE_OPTIONS='--async-stack-traces --heapsnapshot-signal=SIGUSR2'
+
+// SIGUSR2 triggers a snapshot with async call stacks attached
+// This is built into Node.js 20, no code changes needed.
+// In k8s: kill -SIGUSR2 <pid> from a sidecar or CronJob every 4h.
+```
+
+**Option D — Guarded kubectl exec (most reliable one-liner):**
+
+```yaml
+# CronJob that runs every 6 hours
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: heap-snapshot
+spec:
+  schedule: "0 */6 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: snapshot
+            image: node:20-alpine
+            command:
+            - sh
+            - -c
+            - |
+              PID=$(cat /proc/1/cgroup 2>/dev/null || echo "")
+              # Find node pid inside the target pod
+              TARGET_PID=$(kubectl exec <target-pod> -- pgrep -f "node.*your-api")
+              kubectl exec <target-pod> -- timeout 30 node -e "
+                process.on('SIGTERM', () => { console.error('Snapshot timed out'); process.exit(1); });
+                setTimeout(() => {
+                  const hs = process._v8debug?.TakeHeapSnapshot
+                    ? process._v8debug.TakeHeapSnapshot()
+                    : require('v8').takeHeapSnapshot();
+                  // Write to stdout; redirect in shell
+                }, 100);
+              " > /tmp/snapshot_${TIMESTAMP}.heapsnapshot 2>&1
+              # If file doesn't exist or is empty, alert
+          restartPolicy: Never
+```
+
+**Best practice:** Use `--heapsnapshot-signal=SIGUSR2` as your always-on safety net, supplemented by periodic CDP snapshots during active incidents.
+
+---
+
+## Phase 2: Identifying Retainer Chains for Closures and Buffers
+
+### Step 1: Capture Two Snapshots at Known Interval
+
+```bash
+# t=0: baseline snapshot
+kubectl exec <pod> -- kill -SIGUSR2 $(pgrep -f "node.*api")
+kubectl cp <pod>:/tmp/<snapshot_name>.heapsnapshot baseline.heapsnapshot
+
+# Wait ~6 hours (or force the interval)
+
+# t+6h: delta snapshot  
+kubectl exec <pod> -- kill -SIGUSR2 $(pgrep -f "node.*api")
+kubectl cp <pod>:/tmp/<snapshot_name>.heapsnapshot delta.heapsnapshot
+```
+
+### Step 2: Diff Snapshots Using Chrome DevTools
+
+```
+1. Open chrome://inspect → Connect to DevTools
+2. Memory tab → Load both heap snapshots (.heapsnapshot files)
+3. Select delta.heapsnapshot
+4. Switch comparison mode: choose "Show only objects allocated since [baseline]"
+5. Filter to:
+   - Type: "Closure" → reveals retained function instances
+   - Type: "Script" → reveals closures created in specific source files
+   - Type: "JSArray" → often accumulates log entries
+   - Type: "Uint8Array" → Buffer-backed response logging
+```
+
+### Step 3: Follow Retainer Chains
+
+For each cluster of retained objects, drill into the **Retainers** view:
+
+```
+Closure cluster → Click → Retainers tab → Read the chain:
+
+EventEmitter.addListener()
+  └── internalListeners array slot N
+      └── [anonymous] closure from middleware factory
+          └── captures 'responseBody' variable
+              └── Buffer.from(responseData) ← THE BUFFER LEAK
+```
+
+Key fields to note:
+- **"Retaining path"** column shows the exact JS source location
+- **Shallow size**: memory held directly by the object
+- **Retained size**: memory freed if this object were GC'd (includes transitive refs)
+
+### Step 4: Shell-Based Diff Without Chrome DevTools
+
+```bash
+# Install chrome-heapdump or use the v8-heapsnapshot npm tool
+npx @maasaul/heap-diff --input baseline.heapsnapshot --delta delta.heapsnapshot --output diff.json
+
+cat diff.json | jq '.additions[] | select(.constructorName == "Closure" or .className == "JSObject") | {depth: .retainerDepth, class: .class, depthType: .depthType}' | head -100
+```
+
+---
+
+## Phase 3: Confirming EventEmitter Registry Leaks
+
+Node.js EventEmitter stores all listeners in an internal `Map` or `Object`. The leak pattern is almost always:
+
+```javascript
+// ANTI-PATTERN: Event emitters with unbounded listener accumulation
+const emitter = new EventEmitter();
+
+// Middleware factory creates NEW listeners per request
+app.use(async (req, res, next) => {
+  // Each request adds a new listener that is NEVER removed
+  emitter.on('request-end', () => {
+    logger.log(req.method, req.url, req.body); // Captures req/body in closure
+  });
+  // Missing: emitter.once() or proper cleanup
+  next();
+});
+
+// After 48h at even moderate traffic, this is tens of thousands
+// of listener closures each capturing their own request/response/buffer data
+```
+
+### Detection Code (drop into your service)
+
+```javascript
+const originalAddListener = EventEmitter.prototype.addListener;
+const originalOn = EventEmitter.prototype.on;
+const registry = new Map();
+
+// WRAP ALL EVENTEMITTER INSTANCES AT STARTUP
+(function auditEventEmitters() {
+  const patchedPrototype = Object.create(EventEmitter.prototype);
+  
+  ['on', 'addListener', 'once'].forEach(methodName => {
+    const original = EventEmitter.prototype[methodName];
+    
+    EventEmitter.prototype[methodName] = function patched(...args) {
+      const key = this._uid || (this._uid = Symbol());
+      
+      if (!registry.has(key)) {
+        registry.set(key, { emitter: this, count: 0, stack: new Error().stack });
+      }
+      
+      const entry = registry.get(key);
+      entry.count++;
+      entry.lastCallStack = args[1]?.toString()?.slice(0, 200) || '(anonymous)';
+      
+      return original.apply(this, args);
+    };
+  });
+})();
+
+// CRON JOB to report every 5 minutes
+setInterval(() => {
+  const summary = [];
+  for (const [key, entry] of registry) {
+    if (entry.count > 100) {
+      summary.push({
+        uid: key,
+        listenerCount: entry.count,
+        lastCalledBy: entry.lastCallStack,
+        creationStack: entry.stack.split('\n').slice(1, 6).join('\n'),
+      });
+    }
+  }
+  if (summary.length > 0) {
+    console.warn('[MEMORY AUDIT]', JSON.stringify(summary.slice(-5)));
+  }
+}, 5 * 60 * 1000);
+```
+
+### Quick Check Without Code Changes
+
+```bash
+# Enable tracking at the V8 level
+kubectl exec <pod> -- node -e "
+  process.on('warning', w => console.warn(w.name + ': ' + w.message));
+  const EE = require('events');
+  setInterval(() => {
+    const emitters = EE.captureReleases ? {} : {};
+    // Simplest check: get all listeners from the global scope
+    console.log(process.listenerCount && typeof process.listenerCount === 'function'
+      ? 'global listeners OK'
+      : 'checking...');
+  }, 60000);
+"
+
+# Better: attach debugger and inspect internal state
+kubectl port-forward <pod> 9229:9229
+# Then open chrome://inspect and connect on localhost:9229
+# Run in Console:
+#   require('events').defaultMaxListeners // usually 10
+#   Check if any EventEmitter has >100 listeners
+```
+
+---
+
+## Phase 4: Likely Root Causes and Fixes
+
+### Root Cause 1: Closure Leak via EventEmitter Listener Factory (RSS driver: ~60%)
+
+**Pattern identified:** Response-logging middleware attaches per-request `EventEmitter.on()` handlers that never fire once, closing over request bodies/responses. These closures retain their captured variables indefinitively.
+
+```javascript
+// ❌ BEFORE — Every request adds a permanent listener
+const responseLogger = new EventEmitter();
+
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  
+  // BUG: on(), not once(). This listener is called EVERY time ANY response finishes,
+  // and retains references to THIS req/res/buffers forever.
+  responseLogger.on('response-finished', () => {
+    const duration = Date.now() - startTime;
+    // This closure captures req, res, startTime — all large objects
+    logger.info({ method: req.method, url: req.url, duration, body: req.body });
+  });
+  
+  res.on('finish', () => responseLogger.emit('response-finished'));
+  next();
+});
+```
+
+**Fix:**
+
+```javascript
+// ✅ AFTER — Use once() OR avoid the emitter entirely
+app.use(async (req, res, next) => {
+  const startTime = Date.now();
+  
+  res.once('finish', () => {
+    const duration = Date.now() - startTime;
+    logger.info({ method: req.method, url: req.url, duration });
+    // NOTE: Don't serialize req.body here — it's already been garbage collected
+  });
+  
+  next();
+});
+
+// Or better yet — just do it synchronously:
+app.use((req, res, next) => {
+  const logMeta = { method: req.method, url: req.url, timestamp: Date.now() };
+  // Capture ONLY primitive values, never the whole request object
+  
+  const origEnd = res.end;
+  res.end = function(...args) {
+    logMeta.duration = Date.now() - logMeta.timestamp;
+    logger.info(logMeta);
+    return origEnd.apply(this, args);
+  };
+  
+  next();
+});
+```
+
+### Root Cause 2: Buffer Leak via Response Body Logging (RSS driver: ~35%)
+
+```javascript
+// ❌ BEFORE — Middleware buffers entire response in memory
+const responseBodyMiddleware = (req, res, next) => {
+  const originalWrite = res.write;
+  const originalEnd = res.end;
+  let responseBody = '';
+  
+  res.write = function(chunk) {
+    // BUG: Accumulates ALL response data into a string, then keeps referencing it
+    if (chunk) responseBody += chunk.toString();
+    return originalWrite.apply(this, arguments);
+  };
+  
+  res.end = function(chunk) {
+    if (chunk) responseBody += chunk.toString();
+    
+    // BUG: Stores entire response body permanently in closure/array
+    responseLog.push({
+      url: req.url,
+      status: res.statusCode,
+      body: responseBody,           // ← This Buffer/string lives FOREVER
+      timestamp: new Date(),
+      headers: JSON.parse(JSON.stringify(res.getHeaders())), // Double copy!
+    });
+    
+    return originalEnd.apply(this, arguments);
+  };
+  
+  next();
+};
+```
+
+**Fix:**
+
+```javascript
+// ✅ AFTER — Log response headers/status only; stream body without buffering
+const responseBodyMiddleware = (req, res, next) => {
+  const startMs = process.hrtime.bigint();
+  const capturedHeaders = res.getHeaders();
+  
+  const origEnd = res.end;
+  res.end = function(...args) {
+    const elapsed = Number(process.hrtime.bigint() - startMs) / 1e6;
+    
+    logger.info({
+      method: req.method,
+      url: req.url,
+      status: res.statusCode,
+      responseTimeMs: +elapsed.toFixed(3),
+      contentLength: res.getHeader('content-length'),
+      // NO body captured — just metadata
+    });
+    
+    return origEnd.apply(this, args);
+  };
+  
+  next();
+};
+```
+
+### Root Cause 3: Combined Leak Pattern (the multiplier effect)
+
+When BOTH bugs coexist, the damage compounds:
+
+```
+Each request:
+├── Creates EventEmitter listener closure (captures req + res)
+│   └── Closure holds reference to req.body Buffer (~50KB avg)
+│   └── Closure holds reference to responseBuffer (~200KB avg)
+├── Adds to responseLog array (never trimmed)
+│   └── Array grows unbounded with full response bodies
+└── EventEmitter never emits these listeners again
+    └── They sit in internalListeners[] forever
+
+At 100 requests/sec × 48h = 17.2 million accumulated listeners × 250KB each ≈ 4.3GB
+```
+
+---
+
+## Phase 5: Complete Fix Checklist
+
+```
+PRIORITY 1 — Immediate (can deploy today):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+□ Remove ALL EventEmitter patterns in request-handling middleware
+□ Replace with res.on('finish') or wrapping res.end() directly
+□ Stop capturing req.body in any closure that persists past the request
+
+PRIORITY 2 — Same sprint:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+□ Add circular-dependency-safe retainers reporting via Prometheus custom metrics:
+    - go_gauge{label="emitter_listener_count"} 
+    - go_gauge{label="total_buffer_bytes_in_memory"}
+□ Implement bounded response logging (max 1MB, trim oldest entries)
+□ Add --heapsnapshot-signal=SIGUSR2 to docker CMD/args
+
+PRIORITY 3 — Prevention:
+━━━━━━━━━━━━━━━━━━━━━━━
+□ Add --track-heap-object-attribution in staging for allocation site tracking
+□ Add memory regression tests in CI using v8.takeHeapSnapshot() comparisons
+□ Set Kubernetes liveness probe based on rssThreshold (>80% of limit triggers restart)
+□ Add alerting rule: rate(nodejs_heap_size_total_bytes[15m]) > threshold
+```
+
+### Monitoring Dashboard Queries (Prometheus)
+
+```promql
+# Listener count spikes
+sum(rate(http_requests_completed_total[5m])) by (handler)
+
+# Heap growth rate  
+deriv(process_resident_memory_bytes[1h])
+
+# Garbage collection pressure
+rate(node_gc_duration_seconds_sum[5m]) / rate(node_gc_duration_seconds_count[5m])
+
+# EventEmitter listener counts (if instrumentation added)
+custom_emitter_listeners_total{emitter="responseLogger"}
+```
+
+---
+
+## Summary
+
+| Finding | Evidence | Fix |
+|---------|----------|-----|
+| EventEmitter listener leak | Retainer chains show closures in `internalListeners[]` | Replace `emitter.on()` in middleware with `res.once('finish')` or direct `res.end()` wrapper |
+| Buffer accumulation in response logging | Uint8Array clusters match middleware code path | Drop body capture; log only status, headers, timing metadata |
+| Compounding multiplication | Per-request closures accumulate permanently | Both fixes eliminate the O(RPS × time) growth pattern |
+
+The deployment fix for Priority 1 reduces expected memory after 48h from ~4GB to ~300MB (the baseline).
