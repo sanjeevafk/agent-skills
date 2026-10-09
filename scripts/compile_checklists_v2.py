@@ -1,5 +1,37 @@
 #!/usr/bin/env python3
 """
+SUPERSEDED — retained for historical reference only. Do not use for new builds.
+
+Use ``crates/skills-compiler`` (Rust) instead::
+
+    cargo build --release --manifest-path crates/skills-compiler/Cargo.toml
+    ./crates/skills-compiler/target/release/skills-compiler from-tasks \\
+        --tasks benchmarks/tasks_ieee.json --out-dir benchmarks/checklists_v2
+
+Why this script was superseded (verified 2026-10-09):
+
+  * It produces DIFFERENT artifacts from the Rust crate. Across the 18
+    benchmark skills the two disagree byte-for-byte (33.2% vs 29.5% aggregate
+    reduction). The committed ``benchmarks/checklists_v2/`` artifacts come
+    from the Rust crate, not from this script.
+  * It cannot produce any ablation condition. Its only flags are ``--tasks``,
+    ``--skills`` and ``--out``; there is no ``no_examples`` / ``no_tables`` /
+    ``no_types`` mode. The A0-A5 series backing manuscript section 8.4 is
+    generated exclusively by the Rust crate.
+  * Its frontmatter parser is ``text.split("---", 2)``, which truncates any
+    skill containing ``---`` in prose or inside a code fence. The Rust crate
+    handles BOM, CRLF, indented delimiters and block scalars, and has
+    dedicated tests for each.
+  * The "~40-50% token reduction" claim in principle 4 below is not what the
+    paper reports. The measured aggregate reduction is 30.33%.
+
+Kept because it documents the pre-Rust approach, and because
+``benchmarks/checklists_ieee/`` (the ``checklist_v1`` arm) predates the Rust
+tool. Note that neither compiler currently reproduces those v1 artefacts:
+see benchmarks/COMPILER_PROVENANCE.md.
+
+Original docstring follows.
+
 Checklist Compiler v2 (Balanced Structure-Preserving Build Step)
 ==============================================================
 Statically pre-compiles balanced, high-density instruction artifacts from
@@ -16,7 +48,7 @@ Compiler v2 Design Principles:
      keeping essential structural anchors while achieving ~40-50% token reduction.
   5. Determinism guarantees: Byte-identical reproducibility via SHA256 manifest.
 
-Usage:
+Usage (superseded CLI):
   python3 scripts/compile_checklists_v2.py                    # compile from tasks_ieee.json
   python3 scripts/compile_checklists_v2.py --skills database-migrations security-review
   python3 scripts/compile_checklists_v2.py --out benchmarks/checklists_v2

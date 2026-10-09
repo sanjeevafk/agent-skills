@@ -609,6 +609,57 @@ mod tests {
     }
 
     #[test]
+    fn a4_erases_type_predicate_return_annotations() {
+        let md = "## Rules\n\n- Always validate input\n\n```typescript\nfunction isT(x: unknown): x is T { return true; }\n```\n";
+        let (out, _) = compiler().compile(md, &no_types_opts());
+        assert!(out.contains("function isT(x) { return true; }"), "type predicate erased:\n{}", out);
+        assert!(!out.contains("x is T"), "predicate form removed:\n{}", out);
+    }
+
+    #[test]
+    fn a4_never_touches_switch_case_labels() {
+        // Regression guard: `case 1:` must not be mistaken for a typed property.
+        let md = "## Rules\n\n- Always validate input\n\n```typescript\nfunction f(x: number) {\n  switch (x) {\n    case 1: return \"a\";\n    default: return \"b\";\n  }\n}\n```\n";
+        let (out, _) = compiler().compile(md, &no_types_opts());
+        assert!(out.contains("case 1: return \"a\";"), "case label intact:\n{}", out);
+        assert!(out.contains("default: return \"b\";"), "default label intact:\n{}", out);
+        assert!(!out.contains("x: number"), "fn param still erased:\n{}", out);
+    }
+
+    // --- Known limitations, characterised deliberately. ---------------------
+    // These pin CURRENT behaviour so the gaps are explicit and any future fix
+    // surfaces as a test failure that must be reviewed on purpose rather than
+    // silently changing A4 ablation artifacts after the fact.
+    //
+    // Recorded during the v0.2.0 provenance audit. See
+    // benchmarks/COMPILER_PROVENANCE.md ("Known limitations").
+    // Their practical impact is bounded: across the 18 evaluated benchmark
+    // skills the realised A4 type-erasure magnitude is 0.9% (security-review)
+    // and 0.0% elsewhere, so these gaps do not materially affect §8.4.
+
+    #[test]
+    fn a4_known_gap_optional_param_annotation_survives() {
+        let md = "## Rules\n\n- Always validate input\n\n```typescript\nfunction g(a: string, b?: number): Promise<void> {}\n```\n";
+        let (out, _) = compiler().compile(md, &no_types_opts());
+        assert!(out.contains("b?: number"), "KNOWN GAP: optional-param annotation not erased:\n{}", out);
+        assert!(out.contains("g(a,"), "required param still erased:\n{}", out);
+    }
+
+    #[test]
+    fn a4_known_gap_variable_annotation_survives() {
+        let md = "## Rules\n\n- Always validate input\n\n```typescript\nconst arr: string[] = [];\n```\n";
+        let (out, _) = compiler().compile(md, &no_types_opts());
+        assert!(out.contains("arr: string[]"), "KNOWN GAP: variable annotation not erased:\n{}", out);
+    }
+
+    #[test]
+    fn a4_known_gap_generic_call_type_arguments_survive() {
+        let md = "## Rules\n\n- Always validate input\n\n```typescript\nconst m = new Map<string, number>();\n```\n";
+        let (out, _) = compiler().compile(md, &no_types_opts());
+        assert!(out.contains("Map<string, number>"), "KNOWN GAP: generic call args not erased:\n{}", out);
+    }
+
+    #[test]
     fn a4_keeps_conceptual_interface_prose() {
         let md = "## Workflow\n\n- Design interfaces for testability\n- Confirm with user what interface changes are needed\n";
         let (out, _) = compiler().compile(md, &no_types_opts());
