@@ -35,10 +35,11 @@ impl Default for CompilationOptions {
 
 impl CompilationOptions {
     pub fn for_domain(domain: Domain) -> Self {
-        let mut opts = Self::default();
-        opts.domain = domain;
-        opts.max_code_lines = domain.default_code_lines();
-        opts
+        Self {
+            domain,
+            max_code_lines: domain.default_code_lines(),
+            ..Self::default()
+        }
     }
 
     /// Macro-Ablation: checklist_v1 (Aggressive bulletization - strips code, types, tables)
