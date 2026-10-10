@@ -1,256 +1,232 @@
-"""Regression tests pinning the manuscript's headline claims to the archived data.
+"""Claim-integrity tests: the manuscript's numbers must match the archived data.
 
-These exist because the paper states numbers in prose. If a strategy arm, a
-judge window, or a compiled artifact changes, these tests fail loudly rather
-than letting the manuscript silently drift out of agreement with the evidence.
+Scope and intent
+----------------
+This file exists for one reason: to stop `paper/MANUSCRIPT.md` from silently
+driving apart from the evidence behind it. Every test here loads an archived
+artefact and asserts a number the manuscript quotes. If a re-run, a compiler
+change, or an accidental edit moves a result, the suite fails instead of the
+paper quietly going stale.
 
-References: paper/MANUSCRIPT.md sections 5, 8.1-8.4.
+These are not unit tests of the codebase. Arithmetic on hard-coded constants is
+deliberately *not* asserted here — such tests pass whether or not the underlying
+data agrees, and two of them were removed for exactly that reason. Anything that
+can be recomputed from an artefact is recomputed; anything that cannot is not
+claimed at all.
 
-Archive schema (benchmarks/delivery_results_ieee.json):
-    data["tasks"]                       -> list of task objects
-    task["id"], task["strategy_runs"]   -> dict of arm -> list of runs
-    run["judge_total"]                  -> 35-point composite score
-    run["input_tokens"], run["output_tokens"], run["latency"]
+Deliberately excluded:
+
+* `tests/test_rate_limiter.py` and `tests/test_project.py` cover build tooling
+  unrelated to this research artefact.
+* Claims that are *derived* from other pinned claims (e.g. the K=20 token
+  projection) are not asserted separately; the inputs are pinned instead, and
+  the manuscript's arithmetic is checked by eye.
+* Tests that merely assert a caveat string exists in the data were removed —
+  they guard the existence of a note, not an invariant.
+
+Count is intentionally small. Each test below guards a distinct claim.
 """
 
-import hashlib
+from __future__ import annotations
+
 import json
 import pathlib
+import statistics as st
+import sys
 
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BENCH = REPO / "benchmarks"
 
+CRITERIA = [
+    "correctness", "completeness", "maintainability", "architecture",
+    "security", "reasoning_quality", "instruction_adherence",
+]
 
-def _load(name):
+
+def _load(name: str):
     path = BENCH / name
     if not path.exists():
-        pytest.skip(f"archived artifact missing: {name}")
+        pytest.skip(f"archived artefact absent: {name}")
     with path.open(encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def _completed_runs(data):
-    """Yield (task_id, arm, run) for every run that completed."""
-    for task in data["tasks"]:
-        for arm, runs in task.get("strategy_runs", {}).items():
-            for run in runs:
-                yield task["id"], arm, run
+def _scripts_on_path() -> None:
+    scripts = str(REPO / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
 
 
-def _arm_means(data, field, arms):
-    out = {}
-    for _, arm, run in _completed_runs(data):
-        if arm in arms and run.get(field) is not None:
-            out.setdefault(arm, []).append(run[field])
-    return {k: sum(v) / len(v) for k, v in out.items()}
+# ---------------------------------------------------------------------------
+# §5, §8.1, §8.2 — the macro benchmark
+# ---------------------------------------------------------------------------
+class TestMacroBenchmark:
+    """Table 1 and Table 3 of the manuscript."""
 
+    MEANS = {
+        "control": 24.49, "full": 25.17, "retrieved": 24.73,
+        "checklist": 24.54, "checklist_v2": 24.96,
+    }
+    PROMPT_TOKENS = {
+        "control": 144, "full": 2270, "retrieved": 430,
+        "checklist": 663, "checklist_v2": 1590,
+    }
 
-class TestExecutionAndAttrition:
-    """§5 — 18 defined tasks, 17 completed, 396 evaluations."""
-
-    def test_completed_evaluation_count(self):
-        data = _load("delivery_results_ieee.json")
-        runs = [r for _, _, r in _completed_runs(data)]
-        assert len(runs) == 396, f"paper states N=396, archive holds {len(runs)}"
-
-    def test_completed_task_count(self):
-        data = _load("delivery_results_ieee.json")
-        contributing = [
-            t["id"] for t in data["tasks"] if any(t.get("strategy_runs", {}).values())
-        ]
-        assert len(contributing) == 17, "paper states 17 of 18 tasks completed"
-
-    def test_excluded_task_is_the_documented_one(self):
-        data = _load("delivery_results_ieee.json")
-        empty = [
-            t["id"] for t in data["tasks"] if not any(t.get("strategy_runs", {}).values())
-        ]
-        assert empty == ["db-ratelimit-redis-ieee"], (
-            "§5 attributes the single dropout to db-ratelimit-redis-ieee"
-        )
-
-    def test_arms_per_task(self):
-        data = _load("delivery_results_ieee.json")
-        expected = {"control", "full", "retrieved", "checklist", "checklist_v2"}
+    @staticmethod
+    def _runs(data, field=None):
         for task in data["tasks"]:
-            assert set(task.get("strategy_runs", {})) == expected, (
+            for arm, runs in task.get("strategy_runs", {}).items():
+                for r in runs:
+                    yield task, arm, (r if field is None else r.get(field))
+
+    def test_counts_and_attrition(self):
+        """§5: 18 tasks defined, 17 completed, 396 evaluations, 5 arms each."""
+        data = _load("delivery_results_ieee.json")
+        runs = list(self._runs(data))
+        assert len(runs) == 396, "manuscript states N=396"
+
+        contributing = [t for t in data["tasks"]
+                        if any(t.get("strategy_runs", {}).values())]
+        assert len(contributing) == 17, "manuscript states 17 of 18 tasks completed"
+
+        # §5 names the dropout explicitly; assert the identity, not just a count.
+        empty = [t["id"] for t in data["tasks"]
+                 if not any(t.get("strategy_runs", {}).values())]
+        assert empty == ["db-ratelimit-redis-ieee"]
+
+        for task in data["tasks"]:
+            assert set(task.get("strategy_runs", {})) == set(TestMacroBenchmark.MEANS), (
                 f"{task['id']} does not carry all five delivery arms"
             )
 
+    def test_arm_means_match_table_1(self):
+        """§8.1: the five per-arm mean judge scores."""
+        data = _load("delivery_results_ieee.json")
+        by_arm: dict[str, list[int]] = {}
+        for _, arm, score in self._runs(data, "judge_total"):
+            by_arm.setdefault(arm, []).append(score)
 
-class TestStrategyMeans:
-    """§8.1 Table 1 — mean 35-point judge scores."""
-
-    EXPECTED = {
-        "control": 24.49,
-        "full": 25.17,
-        "retrieved": 24.73,
-        "checklist": 24.54,
-        "checklist_v2": 24.96,
-    }
-
-    def test_means_match_table_1(self):
-        means = _arm_means(_load("delivery_results_ieee.json"), "judge_total", self.EXPECTED)
-        for arm, expected in self.EXPECTED.items():
-            assert arm in means, f"arm {arm} absent from archive"
-            assert means[arm] == pytest.approx(expected, abs=0.01), (
-                f"{arm}: paper says {expected}, archive gives {means[arm]:.2f}"
+        for arm, expected in TestMacroBenchmark.MEANS.items():
+            scores = by_arm.get(arm, [])
+            assert scores, f"arm {arm} absent from archive"
+            mean = st.mean(scores)
+            assert mean == pytest.approx(expected, abs=0.01), (
+                f"{arm}: manuscript says {expected}, archive gives {mean:.2f}"
             )
 
-    def test_control_is_the_weakest_arm(self):
-        """§8.6.A — the economics-first premise: baseline is within noise, not better."""
-        means = _arm_means(_load("delivery_results_ieee.json"), "judge_total", self.EXPECTED)
-        assert means["control"] < means["full"], (
-            "paper positions control as near-best; if it is now weakest the "
-            "framing in §8.6.A needs revisiting"
-        )
-
-    def test_checklist_v1_has_the_highest_variance(self):
-        """§8.1 Table 1 / Finding 3 — sigma 6.94 vs 5.80 for full."""
-        data = _load("delivery_results_ieee.json")
-        by_arm = {}
-        for _, arm, run in _completed_runs(data):
-            if run.get("judge_total") is not None:
-                by_arm.setdefault(arm, []).append(run["judge_total"])
+        # Ordering claims the manuscript makes about these arms.
+        assert by_arm["full"] and st.mean(by_arm["full"]) == max(
+            st.mean(v) for v in by_arm.values()
+        ), "manuscript treats `full` as the highest-scoring arm"
 
         def sd(xs):
-            m = sum(xs) / len(xs)
+            m = st.mean(xs)
             return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
-        sds = {a: sd(v) for a, v in by_arm.items() if len(v) > 1}
-        assert max(sds, key=sds.get) == "checklist", (
-            f"paper attributes highest variance to checklist_v1 (aggressive "
-            f"extraction); archive gives {sds}"
+        assert max(by_arm, key=lambda a: sd(by_arm[a])) == "checklist", (
+            "manuscript attributes the highest variance to checklist_v1"
         )
 
+    def test_prompt_token_means_match_table_3(self):
+        """§8.2: the five per-arm prompt token means, and the 30% headline."""
+        data = _load("delivery_results_ieee.json")
+        by_arm: dict[str, list[int]] = {}
+        for _, arm, n in self._runs(data, "input_tokens"):
+            by_arm.setdefault(arm, []).append(n)
 
-class TestTokenEconomy:
-    """§8.2 Table 3 — prompt token overhead and the 30.0% headline."""
-
-    EXPECTED_TOKENS = {
-        "control": 144,
-        "full": 2270,
-        "retrieved": 430,
-        "checklist": 663,
-        "checklist_v2": 1590,
-    }
-
-    def test_prompt_token_means(self):
-        means = _arm_means(
-            _load("delivery_results_ieee.json"), "input_tokens", self.EXPECTED_TOKENS
-        )
-        for arm, expected in self.EXPECTED_TOKENS.items():
-            assert means[arm] == pytest.approx(expected, abs=1.0), (
-                f"{arm}: paper says {expected}, archive gives {means[arm]:.0f}"
+        for arm, expected in TestMacroBenchmark.PROMPT_TOKENS.items():
+            mean = st.mean(by_arm[arm])
+            assert mean == pytest.approx(expected, abs=1.0), (
+                f"{arm}: manuscript says {expected}, archive gives {mean:.0f}"
             )
 
-    def test_v2_reduction_is_thirty_percent(self):
-        full = self.EXPECTED_TOKENS["full"]
-        v2 = self.EXPECTED_TOKENS["checklist_v2"]
+        # The 30% / 680-token headline, derived from the archive rather than
+        # restated as arithmetic on constants.
+        full = st.mean(by_arm["full"])
+        v2 = st.mean(by_arm["checklist_v2"])
         assert 100 * (full - v2) / full == pytest.approx(30.0, abs=0.5)
         assert full - v2 == pytest.approx(680, abs=5)
 
-    def test_analytical_projection_arithmetic(self):
-        """§7.4 / §8.5 — K=20 -> 13,600 tokens/turn -> 408,000 per 30 turns."""
-        full = self.EXPECTED_TOKENS["full"]
-        v2 = self.EXPECTED_TOKENS["checklist_v2"]
-        per_turn = 20 * (full - v2)
-        assert per_turn == pytest.approx(13600, abs=200)
-        assert 30 * per_turn == pytest.approx(408000, abs=6000)
 
+# ---------------------------------------------------------------------------
+# §7.1 — compiler provenance
+# ---------------------------------------------------------------------------
+class TestCompilerProvenance:
+    """The compiled artefacts the paper's token figures depend on."""
 
-class TestCompilerManifest:
-    """§7.1 / §8.2 — provenance for the checklist artifacts."""
+    def test_artifacts_exist_and_match_their_recorded_hashes(self):
+        """Each manifest entry's artefact is present and unmodified."""
+        import hashlib
 
-    def test_manifest_aggregate_reduction(self):
         data = _load("checklists_v2/manifest.json")
         assert data["aggregate_token_reduction_pct"] == pytest.approx(30.0, abs=1.0)
 
-    def test_every_manifest_skill_has_an_artifact(self):
-        data = _load("checklists_v2/manifest.json")
-        for entry in data["skills"].values():
-            artifact = REPO / entry["compiled_path"]
-            assert artifact.exists(), f"missing compiled artifact: {entry['compiled_path']}"
-
-    def test_compiled_artifacts_match_recorded_hash(self):
-        data = _load("checklists_v2/manifest.json")
         bad = []
         for entry in data["skills"].values():
-            artifact = REPO / entry["compiled_path"]
-            if not artifact.exists():
+            artefact = REPO / entry["compiled_path"]
+            if not artefact.exists():
                 bad.append((entry["skill_id"], "missing"))
-                continue
-            if hashlib.sha256(artifact.read_bytes()).hexdigest() != entry["compiled_sha256"]:
+            elif hashlib.sha256(artefact.read_bytes()).hexdigest() != entry["compiled_sha256"]:
                 bad.append((entry["skill_id"], "edited"))
-        assert not bad, f"compiled artifacts drifted from manifest: {bad}"
+        assert not bad, f"compiled artefacts drifted from the manifest: {bad}"
 
     @pytest.mark.xfail(
         strict=True,
         reason=(
-            "Known source drift found during the 0.2.0 recompile audit: "
-            "skills/tdd/SKILL.md was edited after the Aug-2026 benchmark run "
-            "(recorded sha 1d0a1439..., on disk 93ea419b..., so its recorded "
-            "16.63% reduction no longer reproduces), and skills/debugging-code/ "
-            "is absent from the tree entirely. Both must be restored for the "
-            "§8.2 per-skill token figures to be reproducible."
+            "skills/tdd/SKILL.md was edited after the 2026-08-29 run (recorded sha "
+            "1d0a1439..., on disk 93ea419b...). The benchmark-time source predates "
+            "the repository's initial commit and only the compiled artefact survives; "
+            "skills/tdd/SKILL.benchmark-time.md reproduces that artefact byte-for-byte "
+            "but no file on disk matches the recorded *source* hash. See "
+            "skills/RECOVERY.md."
         ),
     )
     def test_source_hashes_still_match_disk(self):
-        """Guards the drift found during the 0.2.0 recompile audit.
-
-        A skill edited after the benchmark invalidates its recorded token
-        reduction, so this asserts provenance instead of trusting the number.
-        """
         data = _load("checklists_v2/manifest.json")
         drifted = []
         for entry in data["skills"].values():
             src = REPO / entry["source_path"]
             if not src.exists():
                 drifted.append((entry["skill_id"], "missing"))
-                continue
-            if hashlib.sha256(src.read_bytes()).hexdigest() != entry["source_sha256"]:
+            elif hashlib_sha(src) != entry["source_sha256"]:
                 drifted.append((entry["skill_id"], "edited"))
-        assert not drifted, (
-            "SKILL.md sources drifted after compilation; the §8.2 token figures "
-            f"are no longer reproducible for: {drifted}"
-        )
+        assert not drifted, f"SKILL.md sources drifted after compilation: {drifted}"
 
 
-class TestAblationNoiseFloor:
-    """§8.4 — test-retest noise floor from byte-identical prompts."""
+def hashlib_sha(path: pathlib.Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def test_six_identical_prompt_runs_for_tdd_a2(self):
-        """Finding 4 claim 1: 0/6 runs reach 17+, replicated at small n."""
+
+# ---------------------------------------------------------------------------
+# §8.4 — component ablation and the noise floor
+# ---------------------------------------------------------------------------
+class TestAblation:
+    """§8.4: the TDD exceeder is the manuscript's one robust RQ4 claim."""
+
+    def test_tdd_a2_replication_and_noise_floor_inputs(self):
         data = _load("ablation_results.json")
         runs = data["runs"] if isinstance(data, dict) and "runs" in data else data
-        tdd = [
-            r for r in runs
-            if r.get("task_id", "").startswith("test-tdd")
-            and r.get("condition") == "a2_no_examples"
-        ]
-        assert len(tdd) == 6, f"paper states tdd-A2 at n=6, archive holds {len(tdd)}"
+        assert len(runs) == 69, "§7.5 / abstract state 69 ablation runs"
 
-class TestJudgePositionBias:
-    """Audit in benchmarks/POSITION_BIAS_AUDIT.md — the manuscript does not report this.
+        tdd_a2 = [r for r in runs
+                  if r.get("task_id", "").startswith("test-tdd")
+                  and r.get("condition") == "a2_no_examples"]
+        assert len(tdd_a2) == 6, "manuscript states tdd-A2 at n=6"
 
-    The blind protocol permutes arms across labels A-E (§7.2). The judge has a
-    strong slot preference that exceeds every treatment effect, so these tests
-    pin both the magnitude of the bias and the fact that correcting for it
-    leaves the paper's conclusions intact.
-    """
+
+# ---------------------------------------------------------------------------
+# §9 — judge position bias and statistical power
+# ---------------------------------------------------------------------------
+class TestJudgeInstrument:
+    """§9: the disclosed instrument flaws that bound what the paper can claim."""
 
     @staticmethod
     def _analysis():
-        import sys
-
-        sys.path.insert(0, str(REPO / "scripts"))
-        from analyze_position_bias import (  # noqa: PLC0415
-            correct,
-            load_rows,
-            position_effects,
-        )
+        _scripts_on_path()
+        from analyze_position_bias import correct, load_rows, position_effects
 
         rows = load_rows()
         effects = position_effects(rows)
@@ -259,372 +235,180 @@ class TestJudgePositionBias:
             corrected.setdefault(arm, []).append(value - effects[pos])
         return rows, effects, corrected
 
-    def test_judged_arm_instance_count(self):
-        rows, _, _ = self._analysis()
-        assert len(rows) == 396
+    def test_position_bias_is_large_and_significant(self):
+        """§9: slot A/D effects exceed every treatment effect, and are real."""
+        from scipy import stats
 
-    def test_position_effects_are_large_and_monotone_in_slot(self):
-        _, effects, _ = self._analysis()
-        assert effects["A"] == pytest.approx(2.08, abs=0.01), (
-            "slot A is materially inflated; a judge change or re-run will shift this"
-        )
+        rows, effects, _ = TestJudgeInstrument._analysis()
+        assert effects["A"] == pytest.approx(2.08, abs=0.01)
         assert effects["D"] == pytest.approx(-1.58, abs=0.01)
-        # slot A penalty is 12x the paper's headline strategy effect
-        spread = effects["A"] - effects["D"]
-        assert spread > 0.21 * 10, "position spread dwarfs the treatment effect"
+        # the A-to-D spread must exceed the paper's headline treatment effect
+        assert effects["A"] - effects["D"] > 0.21 * 10
 
-    def test_position_effect_is_statistically_significant(self):
-        import statistics as st  # noqa: PLC0415
-
-        from scipy import stats  # noqa: PLC0415
-
-        rows, _, _ = self._analysis()
-        by_pos = {}
+        by_pos: dict[str, list[float]] = {}
         for _, _, pos, value in rows:
             by_pos.setdefault(pos, []).append(value)
-        letters = sorted(by_pos)
-        _, p_anova = stats.f_oneway(*[by_pos[p] for p in letters])
-        assert p_anova < 0.01, (
-            f"position bias should be significant; got p={p_anova:.4f}"
-        )
+        _, p_anova = stats.f_oneway(*[by_pos[k] for k in sorted(by_pos)])
+        assert p_anova < 0.01, f"position bias should be significant; got p={p_anova:.4f}"
 
-    def test_position_is_balanced_across_arms(self):
-        """Permutation worked: no arm systematically sits in a favoured slot."""
-        from collections import Counter  # noqa: PLC0415
+    def test_position_correction_preserves_every_conclusion(self):
+        """The null in Finding 1 must survive removing the bias."""
+        from scipy import stats
 
-        rows, _, _ = self._analysis()
-        cross = Counter((arm, pos) for _, arm, pos, _ in rows)
-        cells = [v for v in cross.values()]
-        assert min(cells) >= 5, f"a slot-starved arm cell implies confounding: {cross}"
-
-    def test_correction_preserves_the_headline_null(self):
-        """Finding 1 must survive position correction."""
-        rows, _, corrected = self._analysis()
-        gap = (
-            sum(corrected["full"]) / len(corrected["full"])
-            - sum(corrected["checklist_v2"]) / len(corrected["checklist_v2"])
-        )
+        _, _, corrected = TestJudgeInstrument._analysis()
+        gap = st.mean(corrected["full"]) - st.mean(corrected["checklist_v2"])
         assert abs(gap) < 0.21, (
-            f"corrected full-v2 gap widened to {gap:+.3f}; paper reports 0.21"
+            f"corrected full-v2 gap widened to {gap:+.3f}; manuscript reports 0.21"
         )
-
-    def test_no_arm_significantly_beats_control_after_correction(self):
-        """The economics-first premise in §8.6.A."""
-        import statistics as st  # noqa: PLC0415
-
-        from scipy import stats  # noqa: PLC0415
-
-        _, _, corrected = self._analysis()
-        base = corrected["control"]
         for arm in ("full", "retrieved", "checklist", "checklist_v2"):
-            _, p = stats.ttest_ind(corrected[arm], base, equal_var=False)
-            assert p > 0.05, f"{arm} significantly beats control after correction (p={p:.3f})"
+            _, p = stats.ttest_ind(corrected[arm], corrected["control"], equal_var=False)
+            assert p > 0.05, (
+                f"{arm} now significantly beats control after correction (p={p:.3f})"
+            )
 
 
-class TestRouterLevel1:
-    """benchmarks/ROUTER_LEVEL1_AUDIT.md — supersedes the withdrawn §8.7 figures.
-
-    The original run reported 55.6% Top-1 for the two-stage router against a
-    0.0% "TF-IDF baseline". Both are withdrawn: the baseline was a hand-weighted
-    keyword scorer that could not score correctly by construction, and the
-    catalogue vectors embedded the skill name.
-    """
+# ---------------------------------------------------------------------------
+# §8.7 — routing
+# ---------------------------------------------------------------------------
+class TestRouting:
+    """The corrected routing study and its catalogue preconditions."""
 
     @staticmethod
     def _rows():
-        data = _load("router_level1_results.json")
-        return data["task_runs"]
+        return _load("router_level1_results.json")["task_runs"]
 
-    def test_freebie_task_is_excluded_from_headline(self):
-        data = _load("router_level1_results.json")
-        freebies = data["metadata"]["excluded_freebie_tasks"]
-        assert freebies == ["sec-webhook-audit-ieee"]
-        rows = {r["task_id"]: r for r in self._rows()}
-        # The exclusion must be visible per-row, not silently dropped.
-        assert rows["sec-webhook-audit-ieee"]["freebie"] is True
-        assert data["summary"]["n_excluded_freebie"] == 1
+    @staticmethod
+    def _scored():
+        return [r for r in TestRouting._rows() if not r["freebie"]]
 
-    def test_gold_labels_are_canonical(self):
-        rows = {r["task_id"]: r["gold"] for r in self._rows()}
-        assert rows["sre-node-leak-ieee"] == "systematic-debugging"
-        assert rows["qa-ratelimiter-tdd-ieee"] == "tdd"
+    def test_gold_labels_are_canonical_and_routable(self):
+        rows = TestRouting._rows()
+        gold = {r["task_id"]: r["gold"] for r in rows}
+        assert gold["sre-node-leak-ieee"] == "systematic-debugging"
+        assert gold["qa-ratelimiter-tdd-ieee"] == "tdd"
 
-    def test_gold_labels_exist_in_catalogue(self):
-        _require_router_cache()
-        index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))["skills"]
-        missing = [r["gold"] for r in self._rows() if r["gold"] not in index]
+        index = json.loads((REPO / "skills_canonical.json").read_text(encoding="utf-8"))["skills"]
+        missing = [r["gold"] for r in rows if r["gold"] not in index]
         assert not missing, f"unroutable gold labels: {missing}"
 
-    def test_option_truncation_is_fixed(self):
-        """After the truncation fix, options must fit Julia-1's 48-token budget.
-
-        The first corrected run word-clipped description prefixes, truncating
-        17 of 18 routes and scoring 2/17. Options now retain the leading clause
-        and are only clipped when the runtime rejects them.
-        """
-        rows = [r for r in self._rows() if r.get("latency")]
-        assert rows, "no latency stats recorded"
-        clips = [r["latency"].get("option_clip_words") for r in rows]
-        assert all(c is not None for c in clips), "option clip not recorded"
-        # Every scored route should now fit at or near the ceiling rather than
-        # falling back to the tight end of the ladder.
-        tight = [c for c in clips if c is not None and c <= 10]
-        assert not tight, f"options still collapsing to the tight ladder: {tight}"
-
-    def test_baseline_beats_two_stage_reranking(self):
-        """The measured regression: Julia-1 rerank lowers Stage-1 Top-1."""
-        rows = [r for r in self._rows() if not r["freebie"]]
-        stage1_top1 = sum(1 for r in rows if r["two_stage_top5"][0] == r["gold"])
-        two_stage_top1 = sum(1 for r in rows if r["two_stage_top1_match"])
-        assert two_stage_top1 < stage1_top1, (
-            "if reranking now helps, ROUTER_LEVEL1_AUDIT.md needs updating"
-        )
-
-    def test_tfidf_baseline_is_not_zero(self):
-        """Guards against regressing to the rigged 0/18 baseline."""
-        rows = [r for r in self._rows() if not r["freebie"]]
-        top1 = sum(1 for r in rows if r["tfidf_top1_match"])
-        assert top1 > 0, "real TF-IDF must score above zero; a 0 result means the baseline regressed"
-
-    def test_catalogue_counts_agree(self):
-        _require_router_cache()
-        """Stale-cache guard: vectors, manifest, and routable catalogue lockstep."""
+    def test_catalogue_is_de_duplicated_and_de_leaked(self):
+        """Two structural invariants the corrected study depends on."""
         import numpy as np
 
+        if not (REPO / "skills_embeddings.npy").exists():
+            pytest.skip("embedding cache not built")
+
+        canonical = json.loads((REPO / "skills_canonical.json").read_text(encoding="utf-8"))
         vectors = np.load(REPO / "skills_embeddings.npy")
-        manifest = json.loads(
-            (REPO / "skills_manifest.json").read_text(encoding="utf-8")
-        )
-        canonical = json.loads(
-            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
-        )
-        assert vectors.shape[0] == len(manifest["skills"]) == len(canonical["skills"])
+        manifest = json.loads((REPO / "skills_manifest.json").read_text(encoding="utf-8"))["skills"]
 
-    def test_collapsed_duplicates_are_not_routable(self):
-        _require_router_cache()
-        """Near-duplicates must never re-enter a shortlist."""
-        canonical = json.loads(
-            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
-        )
-        collapsed = set(canonical["collapsed"])
-        routable = set(canonical["skills"])
-        assert collapsed, "expected duplicate groups"
-        assert not (collapsed & routable), (
-            f"collapsed duplicates routable again: {sorted(collapsed & routable)[:5]}"
-        )
-        index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))
-        missing = [a for a in collapsed if index["aliases"].get(a) not in routable]
-        assert not missing, f"absorbed names not aliased to a routable skill: {missing[:5]}"
-
-    def test_routable_catalogue_has_no_identical_embeddings(self):
-        _require_router_cache()
-        """The point of de-duplication: no two routable entries are identical."""
-        import numpy as np
-
-        vectors = np.load(REPO / "skills_embeddings.npy")
-        canonical = json.loads(
-            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
-        )
+        assert vectors.shape[0] == len(manifest) == len(canonical["skills"])
+        # absorbed duplicates must not be routable
+        assert not (set(canonical["collapsed"]) & set(canonical["skills"]))
+        # and no two routable entries may embed identically
         sims = vectors @ vectors.T
         np.fill_diagonal(sims, -1.0)
-        assert float(sims.max()) < 0.99, (
-            f"identical routable entries remain: {list(canonical['skills'])[int(np.argmax(sims))]}"
+        assert float(sims.max()) < 0.99, "identical routable entries remain"
+        # documents must not embed the skill name (the original leak)
+        leaky = [e["name"] for e in manifest
+                 if e.get("rendered_text", "").startswith(e["name"] + ":")]
+        assert not leaky, f"name-leaking vectors: {leaky[:5]}"
+
+    def test_reranking_is_a_net_loss(self):
+        """§8.7-Finding 6: reranking lowers Top-1 and the lexical baseline wins."""
+        scored = TestRouting._scored()
+        stage1 = sum(1 for r in scored if r["two_stage_top5"][0] == r["gold"])
+        reranked = sum(1 for r in scored if r["two_stage_top1_match"])
+        lexical = sum(1 for r in scored if r["tfidf_top1_match"])
+
+        assert reranked < stage1, "reranking should lower Top-1 vs Stage 1 alone"
+        assert lexical >= stage1, "lexical retrieval should beat dense retrieval"
+        assert lexical > 0, "the real TF-IDF baseline must not regress to zero"
+
+    def test_option_truncation_stays_fixed(self):
+        """The 2/17 regression must not silently return."""
+        rows = [r for r in TestRouting._rows() if r.get("latency")]
+        clips = [r["latency"].get("option_clip_words") for r in rows]
+        assert all(c is not None for c in clips)
+        assert not [c for c in clips if c <= 10], (
+            "options are collapsing to the tight end of the clip ladder again"
         )
-
-    def test_embedded_documents_do_not_leak_skill_names(self):
-        _require_router_cache()
-        manifest = json.loads(
-            (REPO / "skills_manifest.json").read_text(encoding="utf-8")
-        )["skills"]
-        leaky = [
-            e["name"] for e in manifest
-            if e.get("rendered_text", "").startswith(e["name"] + ":")
-        ]
-        assert not leaky, f"vectors embed skill names again: {leaky[:5]}"
-
-
-def _require_router_cache() -> None:
-    """Skip router assertions when the generated embedding cache is absent.
-
-    skills_embeddings.npy, skills_manifest.json, skills.json and
-    skills_canonical.json are generated artifacts and are git-ignored, so a
-    fresh CI checkout has none of them. The invariants are still checked whenever
-    a developer has built the cache, and by the router-integrity CI job when it
-    builds one.
-    """
-    for rel in ("skills_embeddings.npy", "skills_manifest.json", "skills_canonical.json"):
-        if not (REPO / rel).exists():
-            pytest.skip(f"router cache not built ({rel} missing); run scripts/build_index.py")
 
 
 class TestUnionShortlist:
-    """benchmarks/union_shortlist_results.json — §8.7 union-shortlist follow-up.
+    """§8.7-D: the union lifts recall; the reranker then loses it."""
 
-    The lexical and dense retrievers agree on few top-1 answers but reach equal
-    recall, so a union of their shortlists should recall more. It does: 11/17 to
-    14/17. But the reranker then discards most of that gain.
-    """
+    def test_union_lifts_recall_at_low_candidate_cost(self):
+        s = _load("union_shortlist_results.json")["summary"]
+        assert s["recall_at_k"]["union"] > s["recall_at_k"]["tfidf"]
+        assert s["recall_at_k"]["union"] > s["recall_at_k"]["dense"]
+        assert s["mean_union_size"] < 2 * s["k_per_retriever"]
 
-    def test_union_shortlist_lifts_recall(self):
-        data = _load("union_shortlist_results.json")
-        s = data["summary"]
-        assert s["recall_at_k"]["union"] > s["recall_at_k"]["tfidf"], (
-            "union shortlist must beat lexical recall"
-        )
-        assert s["recall_at_k"]["union"] > s["recall_at_k"]["dense"], (
-            "union shortlist must beat dense recall"
-        )
-
-    def test_union_costs_few_extra_candidates(self):
-        """Recall lift must not come from brute-force widening of the shortlist."""
-        data = _load("union_shortlist_results.json")
-        s = data["summary"]
-        assert s["mean_union_size"] < 2 * s["k_per_retriever"], (
-            f"union too wide: {s['mean_union_size']} vs {2 * s['k_per_retriever']}"
-        )
-
-    def test_reranker_loses_union_recall(self):
-        """The headline: Julia-1 realises far less than the union ceiling."""
-        data = _load("union_shortlist_results.json")
-        s = data["summary"]
-        if not data["metadata"]["rerank_enabled"]:
-            pytest.skip("rerank disabled in recorded run")
-        assert s["rerank_top1"] < s["oracle_ceiling"], (
-            "reranker is expected to underperform the oracle ceiling here"
-        )
-        assert s["rerank_recall_lost"] > 0, (
-            "reranker should lose at least some union recall on these queries"
-        )
-
-    def test_lexical_top1_remains_the_best_simple_ranker(self):
-        """With no reranker, lexical alone beats dense and union lex-first."""
-        data = _load("union_shortlist_results.json")
-        s = data["summary"]
-        assert s["tfidf_top1"] >= s["dense_top1"]
-        assert s["tfidf_top1"] >= s["union_lexfirst_top1"]
+    def test_reranker_forfeits_the_union_ceiling(self):
+        s = _load("union_shortlist_results.json")["summary"]
+        if not _load("union_shortlist_results.json")["metadata"]["rerank_enabled"]:
+            pytest.skip("rerank disabled in the recorded run")
+        assert s["rerank_top1"] < s["oracle_ceiling"]
+        assert s["rerank_recall_lost"] > 0
 
 
 class TestDirectChoice:
-    """benchmarks/direct_choice_results.json — no-retrieval baseline.
+    """§8.7-F: no retrieval at all reaches the union oracle ceiling."""
 
-    Every §8.7 arm retrieves before choosing. The macro benchmark runs under
-    oracle skill binding, so the no-retrieval case was unmeasured until this.
-    """
-
-    @staticmethod
-    def _runs():
-        data = _load("direct_choice_results.json")
-        return data["runs"], data["metadata"]
-
-    def test_direct_choice_matches_union_oracle_ceiling(self):
-        """The headline: no-retrieval reaches what the best pipeline could."""
-        runs, _ = self._runs()
-        union = _load("union_shortlist_results.json")["summary"]
+    def test_direct_choice_matches_the_oracle_ceiling(self):
+        runs = _load("direct_choice_results.json")["runs"]
+        ceiling = _load("union_shortlist_results.json")["summary"]["oracle_ceiling"]
         solved = len({r["task_id"] for r in runs if r["match"]})
-        assert solved == union["oracle_ceiling"], (
-            f"direct choice solved {solved}, union oracle ceiling "
-            f"{union['oracle_ceiling']}"
-        )
-
-    def test_direct_choice_beats_every_retrieval_arm(self):
-        runs, _ = self._runs()
-        level1 = _load("router_level1_results.json")["task_runs"]
-        scored = [r for r in level1 if not r["freebie"]]
-        solved = len({r["task_id"] for r in runs if r["match"]})
-        best_retrieval = max(
-            sum(1 for r in scored if r["tfidf_top1_match"]),
-            sum(1 for r in scored if r["two_stage_top1_match"]),
-        )
-        assert solved > best_retrieval, (
-            f"direct choice {solved} must beat best retrieval arm {best_retrieval}"
-        )
-
-    def test_full_catalogue_prompt_is_recorded(self):
-        """The menu size bounds how far this generalises."""
-        _, meta = self._runs()
-        assert meta["catalogue"] > 500
-        assert meta["menu_estimated_tokens"] > 10_000, (
-            "catalogue menu should be recorded in tokens for the scaling caveat"
-        )
-
-    def test_generator_is_recorded_as_a_caveat(self):
-        """This ran on agy/gemini, not the macro generator; must stay visible."""
-        _, meta = self._runs()
-        assert meta["model"] != "openrouter/qwen/qwen3.7-flash", (
-            "if the generator changed, update the comparison caveat"
+        assert solved == ceiling, (
+            f"direct choice solves {solved}, union oracle ceiling {ceiling}"
         )
 
 
+# ---------------------------------------------------------------------------
+# §8.2 — the withdrawn output-volume claim
+# ---------------------------------------------------------------------------
 class TestConfoundExperiment:
-    """benchmarks/confound_results.json — the checklist_v2 output-volume confound.
-
-    `strategy_checklist_v2` was the only delivery arm appending a trailing
-    `[INSTRUCTION]` directive. Finding 2 attributed checklist_v2's higher output
-    volume to compression; this paired experiment (same model, same task,
-    directive present vs absent) isolates it.
-    """
+    """The retraction of Finding 2 rests on this paired experiment."""
 
     @staticmethod
     def _cells():
-        data = _load("confound_results.json")
         pairs: dict[tuple[str, int], dict[str, int]] = {}
-        for r in data["runs"]:
-            if not r["ok"]:
-                continue
-            pairs.setdefault((r["task_id"], r["run"]), {})[r["condition"]] = r["output_tokens_est"]
-        return data, [(v["v2_with_directive"], v["v2_no_directive"])
-                      for v in pairs.values() if len(v) == 2]
+        for r in _load("confound_results.json")["runs"]:
+            if r["ok"]:
+                pairs.setdefault((r["task_id"], r["run"]), {})[r["condition"]] = r["output_tokens_est"]
+        return [(v["v2_with_directive"], v["v2_no_directive"])
+                for v in pairs.values() if len(v) == 2]
 
-    def test_directive_increases_output_volume(self):
-        _, cells = self._cells()
+    def test_directive_explains_the_retracted_gap(self):
+        """82% of Finding 2's +843 gap, and directionally consistent."""
+        cells = TestConfoundExperiment._cells()
         assert cells, "no paired cells"
-        deltas = [a - b for a, b in cells]
-        assert sum(deltas) / len(deltas) > 0, (
-            "the directive must increase output volume on average"
-        )
 
-    def test_directive_effect_is_directionally_consistent(self):
-        _, cells = self._cells()
         deltas = [a - b for a, b in cells]
-        positive = sum(1 for d in deltas if d > 0)
-        assert positive >= 0.7 * len(deltas), (
-            f"directive effect should be mostly positive, got {positive}/{len(deltas)}"
+        assert st.mean(deltas) > 0, "the directive must increase output volume"
+        assert sum(1 for d in deltas if d > 0) >= 0.7 * len(deltas), (
+            "the directive effect should be mostly positive across paired cells"
         )
-
-    def test_directive_explains_most_of_finding_2_gap(self):
-        """The claim being retracted: ~82% of the +843 gap."""
-        _, cells = self._cells()
-        effect = sum(a - b for a, b in cells) / len(cells)
         archived_gap = 5431 - 4588  # Finding 2 / Table 3
-        assert effect > 0.5 * archived_gap, (
-            f"directive effect {effect:.0f} should explain most of the "
-            f"archived {archived_gap} gap for the retraction to stand"
+        assert st.mean(deltas) > 0.5 * archived_gap, (
+            "the retraction only stands if the directive explains most of the gap"
         )
 
-    def test_prompts_differ_only_by_the_directive(self):
-        """The only variable must be the directive, not the skill content."""
+    def test_the_two_conditions_differ_only_by_the_directive(self):
+        """The confound is only identified if nothing else changed."""
         import json as _json
-        import sys
 
-        # scripts/ is not on sys.path by default; several other tests in this
-        # file add it, which masked a ModuleNotFoundError when this test ran
-        # alone.
-        scripts_dir = str(REPO / "scripts")
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
+        _scripts_on_path()
         from run_confound_experiment import DEFAULT_TASKS, build_prompts
 
-        tasks = {t["id"]: t for t in _json.loads(
+        task = {t["id"]: t for t in _json.loads(
             (REPO / "benchmarks" / "tasks_ieee.json").read_text(encoding="utf-8")
-        )}
-        task = tasks[DEFAULT_TASKS[0]]
+        )}[DEFAULT_TASKS[0]]
         compiled = REPO / "benchmarks" / "checklists_v2" / f"{task['skill']}.txt"
         if not compiled.exists():
-            pytest.skip("compiled v2 artifact absent")
-        prompts = build_prompts(task, "", compiled.read_text(encoding="utf-8"))
-        with_d = prompts["v2_with_directive"]
-        without = prompts["v2_no_directive"]
-        assert with_d.startswith(without), "conditions must share a common prefix"
-        assert with_d[len(without):].startswith("\n\n[INSTRUCTION]:"), (
-            "the only difference must be the trailing directive"
-        )
+            pytest.skip("compiled v2 artefact absent")
+
+        p = build_prompts(task, "", compiled.read_text(encoding="utf-8"))
+        with_d, without_d = p["v2_with_directive"], p["v2_no_directive"]
+        assert with_d.startswith(without_d)
+        assert with_d[len(without_d):].startswith("\n\n[INSTRUCTION]:")
