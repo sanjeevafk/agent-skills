@@ -154,6 +154,61 @@ def load_reference(task: dict) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 # Execution backends
 # --------------------------------------------------------------------------
+def parse_agy_json(stream: str) -> tuple[dict | None, str]:
+    """Extract response text and real token usage from agy's --output-format json."""
+    try:
+        data = json.loads((stream or "").strip())
+    except json.JSONDecodeError:
+        return None, ""
+    u = data.get("usage") or {}
+    usage = {
+        "input": u.get("input_tokens"),
+        "output": u.get("output_tokens"),
+        "reasoning": u.get("thinking_tokens"),
+        "cache_read": u.get("cache_read_tokens"),
+        "cost": None,
+    }
+    return usage, (data.get("response") or "").strip()
+
+
+def run_agy(prompt: str, model: str, timeout: int, retries: int = 2) -> dict:
+    """Execute via the agy CLI. Bills independently of OpenRouter.
+
+    stdin's state does not matter here: agy takes the prompt as a `-p`
+    argument, so there is no inherited-stream blocking to work around.
+    """
+    cmd = ["agy", "--dangerously-skip-permissions", "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    cmd += ["-p", prompt]
+
+    result = None
+    for attempt in range(retries + 1):
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            rc, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired:
+            rc, out, err = 124, "", f"TIMEOUT after {timeout}s"
+        except Exception as exc:  # noqa: BLE001
+            rc, out, err = 1, "", f"Exception: {exc}"
+        elapsed = time.perf_counter() - start
+
+        usage, text = parse_agy_json(out)
+        result = {
+            "rc": rc, "stderr": err[-400:], "latency_s": round(elapsed, 2),
+            "output": text, "usage": usage, "raw_stream": "",
+        }
+        result["attempts"] = attempt + 1
+
+        if rc == 0 and text.strip():
+            return result
+        if attempt < retries:
+            time.sleep(5 * (attempt + 1))
+
+    return result
+
+
 def run_opencode(prompt: str, model: str, timeout: int, retries: int = 2) -> dict:
     """Execute via the opencode CLI, capturing real token usage.
 
@@ -252,9 +307,10 @@ def _parse_opencode_json(stream: str) -> tuple[dict | None, str]:
 # --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--backend", choices=["opencode", "cmd"], default="opencode")
+    ap.add_argument("--backend", choices=["agy", "opencode", "cmd"], default="agy",
+                    help="agy bills independently of OpenRouter and carries Gemini/Claude/GPT-OSS")
     ap.add_argument("--model", default=None,
-                    help="default: openrouter/qwen/qwen3.7-flash (opencode) / qwen/qwen3.7-flash (cmd)")
+                    help="default: gemini-3.7-flash-high (agy) / openrouter/qwen/qwen3.7-flash (opencode)")
     ap.add_argument("--tasks", default=",".join(DEFAULT_TASKS),
                     help="comma-separated task ids from benchmarks/tasks_ieee.json")
     ap.add_argument("--runs", type=int, default=3, help="repeats per condition")
@@ -266,10 +322,11 @@ def main() -> int:
                     help="reuse runs already recorded in --out and only fill gaps")
     args = ap.parse_args()
 
-    model = args.model or (
-        "openrouter/qwen/qwen3.7-flash" if args.backend == "opencode"
-        else "qwen/qwen3.7-flash"
-    )
+    model = args.model or {
+        "agy": "gemini-3.7-flash-high",
+        "opencode": "openrouter/qwen/qwen3.7-flash",
+        "cmd": "qwen/qwen3.7-flash",
+    }[args.backend]
     sys.path.insert(0, str(REPO / "scripts"))
 
     all_tasks = {t["id"]: t for t in json.loads(TASKS_FILE.read_text(encoding="utf-8"))}
@@ -308,7 +365,7 @@ def main() -> int:
         print("\nDRY RUN: no network calls made, no results written.")
         return 2
 
-    runner = run_opencode if args.backend == "opencode" else run_cmd
+    runner = {"agy": run_agy, "opencode": run_opencode, "cmd": run_cmd}[args.backend]
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     # Resume support: a full run is 30 generations of 60-110s each and the CLI
@@ -397,8 +454,13 @@ def main() -> int:
     print("-" * 68)
     for cond in ("v2_with_directive", "v2_no_directive"):
         s = summary["by_condition"].get(cond, {})
-        print(f"{cond:<20}{s.get('n_real', 0):>4}{s.get('mean_output_tokens_real', 0):>21.0f}"
-              f"{s.get('mean_output_tokens_est', 0):>11.0f}")
+        real = s.get("mean_output_tokens_real")
+        est = s.get("mean_output_tokens_est")
+        real_disp = f"{real:.0f}" if real is not None else "-"
+        est_disp = f"{est:.0f}" if est is not None else "-"
+        print(f"{cond:<20}{s.get('n_real', 0):>4}{real_disp:>21}{est_disp:>11}")
+    if summary.get("failed_runs"):
+        print(f"\n{summary['failed_runs']} run(s) failed — see stderr in the results file")
     d = summary["directive_effect"]
     if d:
         print(f"\ndirective effect (with - without): {d['delta_real']:+.0f} real tokens "
