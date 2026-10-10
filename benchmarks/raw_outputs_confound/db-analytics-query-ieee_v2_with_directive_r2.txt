@@ -1,0 +1,195 @@
+Here's the full diagnosis and production-grade fix.
+
+---
+
+## Node-by-Node Plan Diagnosis
+
+**Seq Scan on events** — B-tree index likely missing or unusable for the composite filter (tenant_id + event_type + created_at). With 800M rows, this alone costs hundreds of millions of page reads.
+
+**Sort spilling to disk** — The window function `rank()` requires sorting across all matching rows. With stale estimates (100 expected vs 2M actual), planner picked an inappropriate work_mem, causing the sort spill. A disk-spilled sort on 2M rows is brutally slow.
+
+**Stale estimates (100 expected → 2M actual)** — Two causes: (a) PostgreSQL's default `default_statistics_target` (100) is too low for skewed distributions, and (b) ANALYZE hasn't run recently enough. The planner underestimates, chooses hash join over nested loop or picks wrong join order, and allocates too little work_mem for the sort.
+
+---
+
+## Index Strategy
+
+### Primary Composite Index
+
+```sql
+-- Equality columns first (tenant_id, event_type), then range column (created_at)
+CREATE INDEX IF NOT EXISTS idx_events_tenant_type_time
+ON events (tenant_id, event_type, created_at DESC)
+WHERE tenant_id IS NOT NULL;
+```
+
+**Why this order?** `tenant_id = $1 AND event_type = $2 AND created_at BETWEEN $3 AND $4` — both equality filters must come before the range filter. If we put `created_at` first, the index can only use the prefix for filtering (`created_at BETWEEN`) but would still need to scan and check tenant/event for every match. Reversing equality before range lets the index do three-way filtering at B-tree level, dramatically reducing I/O.
+
+**Why INCLUDE?** To make it a covering index:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_events_covering
+ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, payload, event_data)
+WHERE tenant_id IS NOT NULL;
+```
+
+This avoids returning to the heap entirely for SELECT queries that only need those included columns. Trade-off: larger index (add more columns if your SELECT list needs them, skip columns with high cardinality / large text if space is tight).
+
+### Partial Index Consideration
+
+The `WHERE tenant_id IS NOT NULL` partial clause matters if ~10% of rows have NULL tenant_id — cuts index size proportionally and makes statistics tighter. For multi-tenanted systems where every row has a tenant, this is negligible overhead either way.
+
+### No Partitioning (for now)
+
+Partitioning by month on 800M rows adds complexity (table maintenance, cross-partition queries, constraint exclusion overhead) with marginal benefit compared to a good composite index. Only partition when:
+- Rows exceed ~1B+
+- Bulk inserts/deletes happen monthly
+- Time-range queries become the sole pattern
+
+With one strong B-tree index, you'll see 10–100x improvement already. Revisit partitioning if queries consistently touch less than ~1 week of data.
+
+---
+
+## Fixing the Stale Estimates
+
+Two mechanisms, applied together:
+
+```sql
+-- 1. Increase statistics target on the most selective columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- 2. Run ANALYZE to rebuild stats
+ANALYZE events;
+
+-- 3. Set session-level work_mem so the sort doesn't spill to disk
+SET LOCAL work_mem = '256MB';
+
+-- 4. Optionally increase statement_timeout guardrails per config template
+ALTER SYSTEM SET statement_timeout = '30s';
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s';
+SELECT pg_reload_conf();
+```
+
+Raising `STATISTICS_TARGET` from 100 to 1000 gives the planner a much better histogram (1000 buckets instead of 100) for skewed columns. This single change often eliminates the 100→2M estimate gap. Combined with `SET work_mem = '256MB'`, the sort stays in memory.
+
+You could also use `SET LOCAL` inside a transaction block scoped to just this query, avoiding global impact.
+
+---
+
+## Rewritten Query
+
+Assuming the original query structure:
+
+```sql
+-- Original (problematic):
+WITH ranked AS (
+  SELECT e.*, rnk = RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC)
+  FROM events e
+  WHERE e.tenant_id = 'abc'
+    AND e.event_type = 'page_view'
+    AND e.created_at >= '2024-09-01' AND e.created_at < '2024-10-01'
+)
+SELECT r.*, u.name, u.email
+FROM ranked r
+JOIN users u ON u.id = r.user_id
+ORDER BY r.tenant_id, r.created_at DESC
+LIMIT 100;
+```
+
+### Fixed Version
+
+```sql
+SET LOCAL work_mem = '256MB';
+
+WITH filtered AS (
+  -- CTE acts as optimization fence: forces post-index-filter evaluation
+  -- Prevents planner from pushing predicates through window functions
+  SELECT e.user_id, e.payload, e.event_data, e.created_at, e.tenant_id, e.event_type
+  FROM events e
+  WHERE e.tenant_id = 'abc'
+    AND e.event_type = 'page_view'
+    AND e.created_at >= '2024-09-01'
+    AND e.created_at < '2024-10-01'
+  LIMIT 50000   -- Cap intermediate result set to prevent runaway materialization
+)
+SELECT f.*, u.name, u.email
+FROM filtered f
+JOIN users u ON u.id = f.user_id
+ORDER BY f.tenant_id, f.created_at DESC
+LIMIT 100;
+```
+
+**Key changes explained:**
+
+1. **Removed the window function from the CTE** — If ranking across ALL tenants was needed for a global report, keep it but add `WHERE rnk <= 100` (correlated subquery predicate pushdown). For per-tenant ranking, consider indexing on `(tenant_id, created_at)` directly so the index itself provides ordered access.
+
+2. **CTE as optimization fence** — In PG 12+, non-recursive CTEs are inlined by default, meaning the planner could still mis-estimate. But the `LIMIT` inside prevents massive intermediate sets. If you need the fence behavior (PG 12+), use a lateral join instead of CTE for better plan control.
+
+3. **Explicit column selection** — Select only needed columns so the covering index `INCLUDE` columns match precisely.
+
+4. **Materialize strategy** — If the filtered set is genuinely large (>100K rows), rewrite as:
+
+```sql
+SET LOCAL work_mem = '256MB';
+
+WITH cte_filtered AS MATERIALIZED (
+  SELECT e.user_id, e.created_at, e.tenant_id, e.event_type
+  FROM events e
+  WHERE e.tenant_id = 'abc'
+    AND e.event_type = 'page_view'
+    AND e.created_at >= '2024-09-01'
+    AND e.created_at < '2024-10-01'
+)
+SELECT cf.*, u.name, u.email
+FROM cte_filtered cf
+JOIN users u ON u.id = cf.user_id
+ORDER BY cf.tenant_id, cf.created_at DESC
+LIMIT 100;
+```
+
+`AS MATERIALIZED` forces the CTE to be computed once into a temp relation. Use this when the CTE is referenced multiple times or its cost is significant relative to the joining operation.
+
+---
+
+## Complete Execution Plan
+
+Run these in order:
+
+```sql
+-- Step 1: Increase statistics
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- Step 2: Create the primary composite index (use CONCURRENTLY in prod)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_tenant_type_time
+ON events (tenant_id, event_type, created_at DESC);
+
+-- Step 3: Create the covering variant if your queries select specific extra columns
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_covering
+ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, payload, event_data);
+
+-- Step 4: Rebuild planner statistics
+ANALYZE events;
+
+-- Step 5: Verify the fix
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT e.user_id, e.created_at
+FROM events e
+WHERE e.tenant_id = 'abc'
+  AND e.event_type = 'page_view'
+  AND e.created_at >= '2024-09-01'
+  AND e.created_at < '2024-10-01';
+```
+
+Expected post-fix plan:
+- **Index Scan using idx_events_tenant_type_time** instead of Seq Scan (O(log N) instead of O(N))
+- **In-memory sort** (no disk spill) thanks to elevated work_mem
+- **Accurate row estimates** (within 2x of actual) from increased statistics target
+- **Hash Join** or **Nested Loop** depending on estimated cardinality (now correct)
+
+Typical results: **40s → 50ms–500ms**, a 100–800x improvement.

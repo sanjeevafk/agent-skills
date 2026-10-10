@@ -1,0 +1,237 @@
+## Diagnosis Breakdown — Node by Node
+
+The `EXPLAIN ANALYZE` output describes three cascading failures:
+
+**Node 1: Seq Scan on events** (800M rows)
+- No usable index → reads every page, likely doing a parallel seq scan but still touching gigabytes of dead pages
+- **Root cause**: missing composite index matching the WHERE clause column order
+
+**Node 2: Sort spilling to disk (`work_mem exceeded`)**
+- The window function RANK needs all qualifying rows sorted; with 2M rows hitting memory, it spills to temp files
+- **Root cause**: too many rows pass the filter (stale stats), so even a decent plan can't avoid it
+
+**Node 3: Planner estimate: 100 actual: 2M**
+- Stale statistics or correlated columns where the planner doesn't understand selectivity
+- This cascades: planner picks nested loop + small buffer because it thinks 100 rows; reality crushes it
+
+---
+
+## Full Solution
+
+```sql
+-- ============================================================
+-- STEP 1: Fix stale statistics FIRST — cheapest win
+-- ============================================================
+ANALYZE events;
+ANALYZE users;
+
+-- If you're on PG 16, also check if autoanalyze kept up:
+SELECT relname, last_analyze, n_tup_ins, n_live_tup
+FROM pg_stat_user_tables
+WHERE relname IN ('events', 'users');
+
+-- If n_tup_ins >> last_analyze age shows months of change, force target-level stats:
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ANALYZE events;
+```
+
+High statistics target tells the planner to sample more rows when auto-analyzing, critical for skewed columns like `tenant_id` and `event_type`.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 2: Composite index — column ORDER matters here
+-- ============================================================
+-- tenant_id first: high-cardinality equality filter, partitions search space
+-- created_at second: equality-like range filter after tenant narrows it
+-- event_type third: additional equality predicate, sits at leaf level
+-- INCLUDE users_id: covering index avoids heap fetch for the join column
+CREATE INDEX idx_events_tenant_created_type_including
+  ON events (tenant_id, created_at, event_type)
+  INCLUDE (user_id);
+```
+
+**Why this order?** `tenant_id` is the strongest cardinality reducer (equality). `created_at` comes next because it's a range predicate, and placing it before `event_type` lets B-tree skip non-matching tenant+date slices efficiently. `event_type` could swap with `created_at` — benchmark both. If your query does `WHERE tenant_id = $1 AND event_type = $2 AND created_at BETWEEN ...`, then `(tenant_id, event_type, created_at)` may be slightly better because B-tree navigates two equality keys before encountering the range. Rule of thumb: **equality columns first, then range columns in descending selectivity**.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 3: Partial index — only for recent data (most queries)
+-- ============================================================
+-- If 95% of queries ask for the last 90 days:
+CREATE INDEX idx_events_recent
+  ON events (tenant_id, event_type, created_at)
+  INCLUDE (user_id)
+  WHERE created_at >= CURRENT_DATE - INTERVAL '90 days';
+-- Smaller index, fits in RAM, planner prefers it for recent ranges.
+-- The WHERE clause makes it a partial index — pg decides automatically.
+```
+
+For older data, PostgreSQL will fall back to the full index from Step 2. Partial indexes are justified when access patterns are time-biased, which almost all reporting queries are.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 4: BRIN index for time-series scans on old partition data
+-- ============================================================
+-- If the table has no partitioning yet and you don't want to add it:
+CREATE INDEX idx_events_brin_created
+  ON events USING brin (created_at)
+  WITH (pages_per_range = 128);
+BRIN indexes store min/max per block group. With sequential inserts on
+created_at, most queries scan < 1% of blocks. KeepsSeqScans cheap for
+range-only queries where tenant filtering isn't selective enough for B-tree.
+```
+
+Do NOT use BRIN alone — it's an accelerator, not a primary index. Combined with the composite B-tree, it handles broad date-range queries faster.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 5: Partitioning by month? Decide based on query shape.
+-- ============================================================
+-- YES, partition if ALL of these are true:
+--   a) You consistently filter by created_at range
+--   b) Data retention > 6 months (800M grows fast)
+--   c) Queries skip entire months ("not about Jan data")
+--   d) Your app already has a "drop old partitions" job
+--
+-- NO if queries span the whole table, or if the app writes to many
+-- tenants in a single INSERT batch (partition pruning won't help).
+--
+-- Here's the partition scheme IF you go this route:
+CREATE TABLE events_partitioned (LIKE events INCLUDING ALL) PARTITION BY RANGE (created_at);
+
+-- Monthly partitions (example pattern, run via cron):
+DO $$
+DECLARE
+  p_start DATE;
+BEGIN
+  FOR i IN 0..24 LOOP
+    p_start := DATE_TRUNC('month', CURRENT_DATE - (i || ' months')::INTERVAL)::DATE;
+    EXECUTE format(
+      'CREATE TABLE events_%s PARTITION OF events_partitioned
+       FOR FROM (%L) TO (%L)',
+      to_char(p_start, 'YYYY_MM'),
+      p_start,
+      p_start + INTERVAL '1 month'
+    );
+  END LOOP;
+END $$;
+```
+
+Partition pruning eliminates scanning months that don't match the `created_at` range. On an 800M-row table, this alone can cut I/O by 80–90% if queries typically look at 1–3 months. But it adds complexity: you need partition management scripts, and joins between partitions cost more. For most cases, the composite index + partial index approach (Steps 2-3) solves it without partitioning. **Recommendation: try Steps 1-4 first, measure, then partition only if average query time is still > 5s.**
+
+---
+
+```sql
+-- ============================================================
+-- STEP 6: Rewrite the query — CTE materialization + cursor pagination
+-- ============================================================
+-- Original (hypothetical) slow query:
+-- SELECT u.name, e.event_type,
+--        RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rnk
+-- FROM events e
+-- JOIN users u ON u.id = e.user_id
+-- WHERE e.tenant_id = $1
+--   AND e.event_type = ANY($2)
+--   AND e.created_at BETWEEN $3 AND $4;
+
+-- Rewritten with CTE materialization and explicit plan hints:
+WITH filtered_events AS MATERIALIZED (
+    -- CTE is MATERIALIZED (PG 12+) — forces executor to compute and cache
+    -- results instead of inlining. Crucial when the window function runs
+    -- against 2M rows. Without MATERIALIZED, PG might try to push down
+    -- the join into the CTE and re-scan.
+    SELECT
+        e.user_id,
+        e.event_type,
+        e.created_at,
+        e.tenant_id
+    FROM events e
+    WHERE e.tenant_id = $1
+      AND e.event_type = ANY($2)
+      AND e.created_at BETWEEN $3 AND $4
+)
+SELECT
+    u.name,
+    fe.event_type,
+    RANK() OVER (
+        PARTITION BY fe.tenant_id
+        ORDER BY fe.created_at DESC
+    ) AS rnk
+FROM filtered_events fe
+JOIN users u ON u.id = fe.user_id
+ORDER BY fe.tenant_id, fe.created_at DESC
+OFFSET 0 LIMIT 20;
+```
+
+**CTE / Materialization rationale:**
+- `AS MATERIALIZED` forces the planner to execute the filter step independently and hold the result set. Without it, the optimizer sometimes tries to merge the CTE with the window function scan, causing repeated work.
+- With 2M matching rows, this keeps the window-function input bounded and allows the sort to happen against a known-size intermediate result rather than streaming through a join.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 7: Increase work_mem for this session (or permanently)
+-- ============================================================
+-- Per-session override (no restart needed):
+SET work_mem = '256MB';
+
+-- Or permanent default (rebalance based on max_connections):
+ALTER SYSTEM SET work_mem = '64MB';
+-- With 100 connections: 100 × 64MB = 6.4GB RAM dedicated to sort buffers.
+-- Adjust formula: work_mem = (total_RAM × 0.3) / max_connections
+```
+
+This is the key lever for eliminating the "sort spilling to disk" node. At 256MB, the window-function sort for millions of rows stays entirely in RAM. A 2M-row sort of 3 columns × 8 bytes ≈ 48MB — well within 256MB.
+
+---
+
+```sql
+-- ============================================================
+-- STEP 8: Vacuum and analyze schedule
+-- ============================================================
+-- Ensure autovacuum is healthy — dead tuples cause stale estimates:
+SHOW autovacuum_vacuum_scale_factor;
+-- Default is 0.2 (20%) — for tables with 800M rows, that means
+-- autovacuum triggers at 160M dead tuples. That's usually fine.
+
+-- However, verify it actually ran recently:
+SELECT
+    relname,
+    last_autovacuum,
+    n_dead_tup,
+    n_live_tup,
+    round(100.0 * n_dead_tup / NULLIF(n_live_tup, 0), 2) AS dead_pct
+FROM pg_stat_user_tables
+WHERE relname = 'events';
+
+-- If dead_pct > 5%, consider tuning:
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+-- And run a manual vacuum:
+VACUUM (VERBOSE, ANALYZE) events;
+```
+
+Stale planner estimates come from two sources: outdated auto-vacuum (dead tuple count misleads selectivity math) and low statistics target on skewed columns. Fixing both is mandatory.
+
+---
+
+## Expected Outcome Summary
+
+| Change | Impact |
+|--------|--------|
+| `ANALYZE` + high stats target | Planner estimates move from 100 → ~2M correctly; chooses right join strategy |
+| Composite B-tree index | Seq scan eliminated; direct index scan for tenant+date+type |
+| Partial index (recent 90d) | Index fits in RAM; fastest path for typical reporting queries |
+| `SET work_mem = '256MB'` | Sort stays in memory, no temp file spill |
+| `MATERIALIZED` CTE | Window function gets pre-filtered, bounded input |
+| BRIN on created_at (optional) | Accelerates date-range queries across full table history |
+
+**Combined, this goes from 40s to sub-second for typical queries.** Measure with `EXPLAIN ANALYZE` after each step to confirm the bottleneck moves downstream.

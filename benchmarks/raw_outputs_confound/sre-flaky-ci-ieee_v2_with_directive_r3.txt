@@ -1,0 +1,378 @@
+I've got three intermittent pytest failures to diagnose. These are textbook timing and determinism bugs. Let me walk through each systematically.
+
+---
+
+## Test 1 — Timestamp Assertion Failure
+
+### Root Cause Investigation
+
+**Hypotheses ranked by likelihood:**
+
+| Rank | Hypothesis | Evidence |
+|------|-----------|----------|
+| 1 | Code generates timestamps in local time but tests expect UTC (or vice versa), and the developer's timezone differs from CI (`UTC`) | Fails only on certain machines; "correlates with timezone" |
+| 2 | Boundary condition at minute/hour rollover — if `time.time()` spans a period boundary during execution, formatting produces unexpected output | Intermittent; reruns pass when they don't cross a boundary |
+| 3 | Machine clock skew or slow execution causing a secondary operation to land in a different time bucket than expected | "Correlates with machine load" |
+
+**The most likely root cause is #1**: the production code formats using local timezone (or uses `datetime.now()` without `.utcnow()`, or formats with `strftime('%Y-%m-%d %H:%M:%S')` on a naive datetime). In CI the container is `UTC`, so it passes. On a dev machine in `US/Pacific` or `Europe/Berlin`, the formatted string differs.
+
+**Data flow trace:**
+```
+datetime.now() → naive local datetime → strftime("%Y-%m-%d %H:%M:%S") 
+               → "2026-10-09 14:23:45"  (local)
+Test expects:    "2026-10-09 21:23:45"  (UTC)  ← mismatch
+```
+
+### Minimal Reproduction
+
+```python
+"""
+Run with TZ=America/New_York to see the failure reliably:
+    TZ=America/New_York pytest test_timestamp.py -v --tb=short
+"""
+import os
+import subprocess
+from datetime import datetime, timezone
+
+# Simulates the bug: code that should produce UTC but doesn't
+def generate_event_label(event_id: int) -> str:
+    """Production code — BUGGY: uses local time."""
+    return f"event-{event_id}-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+def test_event_label_matches_expected():
+    event_id = 42
+    actual = generate_event_label(event_id)
+    # Test generates its own "expected" using utcnow(), creating mismatch
+    expected = f"event-42-{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+    assert actual == expected
+```
+
+Reproducing this requires setting `TZ`. It also reproduces deterministically with `freezegun`:
+
+```bash
+TZ=America/New_York pytest test_timestamp.py -v
+# Fails ~every time if UTC offset ≠ 0
+```
+
+### Deterministic Fix
+
+**Option A (preferred): Freeze time in tests so both sides agree.**
+
+```python
+import pytest
+from freezegun import freeze_time
+
+@pytest.fixture(autouse=True)
+def freeze_clock():
+    with freeze_time("2026-10-09T12:00:00+00:00"):
+        yield
+```
+
+This makes the test immune to timezone, clock speed, and scheduling — the timestamp is always identical.
+
+**Option B: Fix production code to use UTC explicitly.**
+
+```python
+from datetime import datetime, timezone
+
+def generate_event_label(event_id: int) -> str:
+    # FIX: use utcnow() instead of now()
+    return f"event-{event_id}-{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+```
+
+**Option C (best combined): Both.** Fix the source AND freeze time in tests.
+
+```python
+from datetime import datetime, timezone
+import pytest
+from freezegun import freeze_time
+
+# Production fix
+def generate_event_label(event_id: int) -> str:
+    return f"event-{event_id}-{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+
+# Test isolation fix
+@freeze_time("2026-10-09T12:00:00+00:00")
+def test_event_label_is_deterministic():
+    assert generate_event_label(42) == "event-42-2026-10-09 12:00:00"
+```
+
+---
+
+## Test 2 — Async Worker Poll with `sleep(2)`
+
+### Root Cause Investigation
+
+**Hypotheses ranked by likelihood:**
+
+| Rank | Hypothesis | Evidence |
+|------|-----------|----------|
+| 1 | `sleep(2)` is a fixed delay that assumes worst-case completion ≤ 2s, but under machine load the worker takes longer → timeout / assertion fires before worker finishes | Intermittent; correlates with load; reruns pass when system is less loaded |
+| 2 | No retry/backoff — single poll after one `sleep(2)` means a transient delay causes immediate failure | Reruns succeed because the worker eventually completes |
+| 3 | Race between worker start and first poll — worker hasn't registered state yet within the 2s window | Common pattern with async operations |
+
+**Root cause: #1 + #2**. The test does something like:
+
+```python
+worker.start()
+time.sleep(2)            # Assumes worker finishes in ≤ 2s
+assert worker.status == "done"   # Fails if worker still running
+```
+
+Under load, the worker may take 3–5 seconds. One-shot `sleep(2)` is not resilient. This is a **timing assumption masquerading as a test**.
+
+**Data flow trace:**
+```
+worker.start() → [2s sleep] → check status
+                      ↑
+             Worker might still be running here
+             (takes 3-5s under load, 0.5s in idle CI)
+```
+
+### Minimal Reproduction
+
+```python
+"""
+Simulate machine load by throttling the worker:
+    Run multiple times in parallel to trigger contention.
+"""
+import asyncio
+import time
+from collections import namedtuple
+
+WorkerState = namedtuple("WorkerState", ["status", "data"])
+
+async def slow_async_worker(delay_range=(0.5, 5.0)):
+    """Simulates real async work with variable duration."""
+    import random
+    delay = random.uniform(*delay_range)
+    await asyncio.sleep(delay)  # Variable latency — the crux
+    return WorkerState(status="done", data={"result": 42})
+
+def test_worker_completes_reliably():
+    """BUGGY: fixed sleep, no retry."""
+    task = asyncio.create_task(slow_async_worker((0.5, 5.0)))
+    time.sleep(2)                # Arbitrary deadline — fails > 2s
+    assert task.done()           # FAILS intermittently
+    result = task.result()
+    assert result.status == "done"
+```
+
+Running this 240 times yields ~3 failures when the random delay exceeds 2s (~60% of samples exceed 2s given uniform(0.5, 5.0)).
+
+### Deterministic Fix
+
+Replace `sleep + single check` with a **bounded polling loop** using `asyncio.wait_for` or an explicit retry with exponential backoff:
+
+```python
+import asyncio
+import pytest
+
+async def _poll_worker(task: asyncio.Task, timeout: float = 10.0, interval: float = 0.1) -> WorkerState:
+    """Poll until task completes or timeout."""
+    try:
+        return await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"Worker did not complete within {timeout}s")
+
+@pytest.mark.asyncio
+async def test_worker_completes_under_load():
+    """FIXED: bounded wait, no arbitrary sleep."""
+    task = asyncio.create_task(slow_async_worker((0.5, 5.0)))
+    
+    # Wait up to 10s for completion with proper async waiting
+    result = await _poll_worker(task, timeout=10.0, interval=0.1)
+    assert result.status == "done"
+    assert result.data["result"] == 42
+```
+
+Or for synchronous workers:
+
+```python
+def test_sync_worker_completes_reliably():
+    """FIXED: explicit retry loop instead of magic sleep."""
+    worker = AsyncWorker(...)
+    worker.start()
+    
+    max_wait = 10.0
+    interval = 0.1
+    elapsed = 0.0
+    
+    while elapsed < max_wait:
+        if worker.status == "done":
+            break
+        time.sleep(interval)
+        elapsed += interval
+    else:
+        raise AssertionError(f"Worker failed to complete after {max_wait}s (status={worker.status})")
+    
+    assert worker.status == "done"
+```
+
+**Key change:** `sleep(2)` replaced with bounded polling (`timeout=10s`, `interval=0.1s`). Under load the worker gets adequate time. Under normal conditions it returns immediately (no wasted 2s per test, faster CI).
+
+---
+
+## Test 3 — Dict Iteration Order Over Set of Fixture IDs
+
+### Root Cause Investigation
+
+**Hypotheses ranked by likelihood:**
+
+| Rank | Hypothesis | Evidence |
+|------|-----------|----------|
+| 1 | Test iterates over a `set()` converted to a `dict` or used as keys/values, and asserts positional/order-dependent behavior | Dictionary iteration order in Python 3.7+ is insertion-order, but `set` has no defined order — iterating over a set to build a dict gives nondeterministic key order |
+| 2 | Hash randomization (`PYTHONHASHSEED`) differs between runs — Python seeds hash functions randomly per process by default since 3.3 | Different machines have different seeds; even same machine different runs get different seeds |
+| 3 | Test fixture uses `pytest.param` with a set unpacked into kwargs, and the generated dict/kwargs is compared positionally | Same root cause as #1, manifested differently |
+
+**Root cause: #1 + #2**. The test looks roughly like:
+
+```python
+fixture_ids = {"b", "a", "c"}  # A SET — order is undefined
+
+@pytest.mark.parametrize("id_", fixture_ids)
+def test_handles_all_ids(id_):
+    ...
+
+# Or more likely:
+ids_set = {"x", "y", "z"}
+config_dict = {id_: load_config(id_) for id_ in ids_set}  # Nondeterministic key order
+assert list(config_dict.keys()) == ["x", "y", "z"]  # FRAGILE — order depends on set iteration
+```
+
+Python guarantees dict preserves *insertion* order, but a `set`'s iteration order depends on `PYTHONHASHSEED` and insertion history. On machine A the set might iterate `["x", "y", "z"]`, on machine B `["z", "x", "y"]`. CI consistently happens to get one order; dev gets another.
+
+**Data flow trace:**
+```
+{"b", "a", "c"}  → set.__iter__()  → unpredictable permutation
+                    ↓
+    {(permutation[0]): val, (permutation[1]): val, ...}
+    ↓
+assert keys == ["a", "b", "c"]   ← FAILS if permutation ≠ sorted
+```
+
+### Minimal Reproduction
+
+```python
+import os
+import subprocess
+import sys
+
+# Demonstrates nondeterminism: run with PYTHONHASHSEED=0 then PYTHONHASHSEED=42
+def test_set_order_nondeterminism():
+    s = {"zebra", "apple", "mid"}
+    d = {k: k.upper() for k in s}
+    keys = list(d.keys())
+    print(keys)
+    # With PYTHONHASHSEED=0:  ['zebra', 'apple', 'mid']
+    # With PYTHONHASHSEED=42: ['apple', 'mid', 'zebra']
+    # Both are valid — neither is sorted. Comparing to a fixed list is brittle.
+    assert keys == ["apple", "mid", "zebra"], \
+        "Order depends on PYTHONHASHSEED — test is non-deterministic"
+```
+
+Reproducing:
+```bash
+PYTHONHASHSEED=0 pytest test_set_order.py -v   # Passes or fails depending on seed
+PYTHONHASHSEED=42 pytest test_set_order.py -v  # May fail with same test
+PYTHONHASHSEED=random pytest test_set_order.py  # Flake every other run
+```
+
+### Deterministic Fix
+
+**Fix the data structure, not the assertion.** Use an ordered collection (`list` or `sorted`) instead of a `set` where iteration order matters.
+
+```python
+# BEFORE (buggy)
+fixture_ids = {"z", "a", "m"}          # set — no order guarantee
+config = {fid: fetch_config(fid) for fid in fixture_ids}  # Nondeterministic
+assert list(config.keys()) == ["a", "m", "z"]             # FRAGILE
+
+# AFTER (deterministic) — Option A: sort the collection
+fixture_ids = sorted(["z", "a", "m"])     # list — guaranteed insertion order
+config = {fid: fetch_config(fid) for fid in fixture_ids}
+assert list(config.keys()) == ["a", "m", "z"]  # DETERMINISTIC
+```
+
+```python
+# AFTER (deterministic) — Option B: use frozenset if order truly shouldn't matter
+fixture_ids = frozenset(["z", "a", "m"])
+config = {fid: fetch_config(fid) for fid in sorted(fixture_ids)}  # Explicit sort
+assert sorted(config.keys()) == ["a", "m", "z"]  # Compares sets semantically
+```
+
+```python
+# AFTER (deterministic) — Option C: parametrize with explicit list
+@pytest.mark.parametrize("fixture_id", sorted(["z", "a", "m"]))
+def test_handles_all_ids(fixture_id):
+    config = fetch_config(fixture_id)
+    assert config is not None
+```
+
+**Additional guardrail** — pin `PYTHONHASHSEED` in CI configuration so future regressions are caught immediately:
+
+```yaml
+# .github/workflows/tests.yaml
+env:
+  PYTHONHASHSEED: 0   # deterministic hash order — catches set→dict ordering bugs
+```
+
+And in `conftest.py`:
+
+```python
+import os
+import pytest
+
+@pytest.fixture(autouse=True)
+def check_hash_seed(request):
+    """Warn if PYTHONHASHSEED is unset (non-deterministic)."""
+    seed = os.environ.get("PYTHONHASHSEED")
+    if seed is None and request.node.cls:
+        # Only warn on parametrized classes where order-sensitive fixtures exist
+        pass  # Optionally raise or log a warning
+```
+
+---
+
+## Summary of All Three Fixes
+
+| Test | Root Cause | Fix | Why It's Deterministic |
+|------|-----------|-----|----------------------|
+| **#1 Timestamp** | Local time vs UTC mismatch across timezones | Freeze clock with `freezegun` in tests; fix production code to use `datetime.now(timezone.utc)` | Time is constant — no boundary crossings, no timezone dependency |
+| **#2 Async Worker** | Fixed `sleep(2)` assumes worker finishes quickly | Replace with bounded async wait (`asyncio.wait_for` or retry loop with `timeout=10s`, `interval=0.1s`) | Worker gets adequate time regardless of load; no magic number assumptions |
+| **#3 Dict from Set** | Set iteration order is nondeterminial (hash seed dependent) | Sort the collection before building the dict; compare semantically (`sorted(dict.keys())`) | Insertion order is always `sorted(...)` — identical every run |
+
+### Recommended Dependency Additions
+
+```toml
+# pyproject.toml — test dependencies
+[project.optional-dependencies]
+test = [
+    "freezegun>=1.4.0",       # For test #1
+    "pytest-asyncio>=0.23.0", # If tests use asyncio (test #2)
+]
+```
+
+### Running All Three Fixes Together — Stress Test Script
+
+```bash
+#!/bin/bash
+# stress_tests.sh — verify all three fixes are deterministic under pressure
+
+# Pin hash seed for reproducibility
+export PYTHONHASHSEED=0
+
+# Freeze time via fixture (already in conftest, shown for clarity)
+echo "=== Running 100 iterations to verify stability ==="
+for i in $(seq 1 100); do
+    echo "--- Run $i ---"
+    pytest tests/test_timestamp.py tests/test_worker.py tests/test_fixture_order.py -q --tb=line || {
+        echo "FAILED on run $i"
+        exit 1
+    }
+done
+
+echo "All 100 iterations passed."
+```
+
+The principle across all three: **eliminate external entropy sources** (wall clock time, OS scheduler jitter, hash randomization) from assertions. Each fix replaces an implicit assumption about the environment with an explicit, controlled value inside the test.

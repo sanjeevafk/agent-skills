@@ -248,3 +248,42 @@ recoverable tasks. This localises the bottleneck to Stage 2: retrieval surfaces
 the right skill; the reranker cannot retain it. Added as §8.7-D, with Finding 6
 updated to reflect that reranking is a net loss at every measured operating
 point.
+
+## H. Finding 2 confound resolved: the directive explains ~82% of it (2026-10-10)
+
+`checklist_v2` was the only delivery arm carrying a trailing
+`[INSTRUCTION]: ... Output your complete, production-grade code implementation`
+directive (`skill_delivery_experiment.py:236`). Finding 2 attributed its +843
+token output-volume gap to structure-preserving compression. A paired
+experiment isolates it: the same task, same skill, same model
+(`qwen/qwen3.7-flash` via `cmd`), 5 tasks x 3 runs x 2 conditions, 30/30
+generations succeeded.
+
+| condition | mean output tokens |
+|---|---:|
+| `checklist_v2` **with** directive | 4,225 |
+| `checklist_v2` **without** directive | 3,535 |
+| **directive effect** | **+690 (+16.3%)** |
+
+The archived Finding 2 gap was **+843 tokens (+18.4%)**. The directive alone
+accounts for **82% of it**. The direction holds in **12 of 15** paired cells,
+with the largest single effect on the TDD task (+2,119 tokens).
+
+**Statistics, stated honestly:** paired *t* = +1.628, *p* = 0.126; Wilcoxon
+*W* = 29.0, *p* = 0.083. Neither reaches *p* < 0.05 at n = 15 paired
+observations (sd = 1,641, driven by the TDD cell). So this is a large,
+directionally consistent effect that this design is underpowered to confirm at
+conventional significance — not a null, and not a clean significance claim
+either.
+
+**Consequence.** Finding 2's causal reading is withdrawn. The ~30% *prompt*
+token saving is unaffected (that is a measurement of the prompt, and the
+directive adds ~30 tokens to a 1,590-token prompt). What is withdrawn is the
+claim that `checklist_v2` elicits unusually long output *because of
+compression*; the measured evidence says the longer output came mostly from an
+instruction that told the model to produce more.
+
+**Measurement caveat:** both this experiment and the archived Finding 2 used the
+same `len(text) // 4` character estimator for output tokens, so the comparison
+is consistent between them. The `cmd` backend does not report per-call token
+usage, so no real-tokenizer numbers are available for either side.

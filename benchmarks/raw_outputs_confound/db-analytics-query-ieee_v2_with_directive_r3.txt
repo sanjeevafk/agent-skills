@@ -1,0 +1,371 @@
+# PostgreSQL Reporting Query Diagnosis & Fix — 800M Row Events Table
+
+## Problem Summary
+
+| Symptom | Root Cause | Impact |
+|---------|-----------|--------|
+| Seq Scan on 800M rows | Missing or misordered composite index on `(tenant_id, event_type, created_at)` | Full table scan per filter |
+| Sort spilling to disk (`work_mem` exceeded) | Large intermediate result set from bad estimates + window function | Disk I/O → ~30s of that 40s |
+| Planner expects 100 rows, gets 2M | Stale stats OR skewed data distribution (tenant_id skew) | Wrong join method (hash→nested loop), wrong sort order |
+
+---
+
+## Step 1: Node-by-Node Plan Diagnosis
+
+```
+-- Hypothetical current EXPLAIN ANALYZE output (what we'd see):
+
+Seq Scan on events e  (actual=2M rows, filtered=0, cost=0..45M)
+  Filter: (tenant_id = 'abc' AND event_type = 'click' AND created_at >= '2024-01-01')
+  Rows Removed by Filter: 798M          ← scanning entire table
+
+Sort  (actual=2M rows, sort_method=external merge, disk=520MB)
+  Sort Key: rank() over (...)           ← window function forces full materialization
+  Work_mem: 4MB (insufficient for 2M rows)
+
+Hash Join  (actual=2M rows)
+  Hash Cond: (e.user_id = u.id)
+  -> Hash                            ← built from 2M-row users table, not tiny
+
+Planning Time: 2.1 ms
+Execution Time: 40123 ms              ← 40s total
+```
+
+**Diagnosis per node:**
+
+1. **Seq Scan** — No index starts with `tenant_id`. The planner can't do an Index Scan or even a Bitmap Heap Scan because there's no B-tree covering the leading filter column.
+2. **Sort spill** — With 2M actual rows but planner expecting 100, it allocated `4MB work_mem` (default). A 2M-row sort needs ~1GB+, so it spills to disk via `external merge`.
+3. **Stale estimates** — Either `ANALYZE` hasn't run since a major load, or the column statistics are insufficient for skewed distributions. The planner chose a nested loop or small hash build because it thought 100 rows were coming.
+
+---
+
+## Step 2: Index Strategy
+
+### Primary Fix: Composite B-tree Index
+
+The filter pattern is:
+
+```sql
+WHERE tenant_id = $1        -- equality
+  AND event_type = $2       -- equality  
+  AND created_at >= $3      -- range
+```
+
+This maps directly to the composite index rule from the standards: **equality columns first, then range**.
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_created
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Why this column order?**
+- `tenant_id` (equality) — partitions the B-tree into one subtree per tenant
+- `event_type` (equality) — further narrows within each tenant
+- `created_at DESC` (range) — B-tree stores sorted, so `>=` walks contiguous leaf pages
+
+**DESC matters** when you also have `ORDER BY created_at DESC` in the query — it lets the index serve both filtering and sorting, eliminating the sort node entirely.
+
+### Secondary Fix: Covering Index (if SELECT only uses indexed columns)
+
+If the query selects only columns already in the index (or can be satisfied from it), add `INCLUDE`:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, some_other_col);
+  -- INCLUDE columns don't affect index ordering but avoid table lookups
+```
+
+This converts index scans to **Index Only Scans**, removing heap access. Trade-off: larger index but eliminates random I/O. Worth it if the query reads many wide columns and you have enough RAM for the index cache.
+
+### Partial Index (conditional optimization)
+
+If 90% of queries target a single event_type (e.g., `'click'`), a partial index saves space and improves selectivity:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_click_only
+  ON events (tenant_id, created_at DESC)
+  WHERE event_type = 'click';
+```
+
+This is smaller than the composite index and more selective for that specific query. But don't use it if you query multiple event_types equally.
+
+### What NOT to do here
+
+A GIN index on `tenant_id` would be wrong — GIN is for containment (`@>`) or full-text, not equality scans. A BRIN index could work for time-only queries (`WHERE created_at BETWEEN ...` with natural file order), but not for multi-column filters.
+
+---
+
+## Step 3: Partitioning Decision
+
+**Rule of thumb**: Partition when each partition is queried independently or you need `DROP PARTITION` for data retention. For a reporting query that always filters `tenant_id`, partitioning adds complexity without solving the core problem.
+
+**Verdict: DO NOT partition.** Reasons:
+- You're already filtering by `tenant_id` (the dominant cardinality driver), so a composite index gives O(1) navigation regardless of table size
+- Partition pruning helps `created_at` ranges, but the B-tree on `(tenant_id, event_type, created_at)` is faster than scan-prune-partition + seq-scan-per-partition for multi-condition filters
+- 800M rows at say 200 bytes = ~160GB. That fits in modern cloud RAM or with decent SSD caching. The issue was missing index + bad plans, not raw size
+- Maintenance cost (partition splits, cross-partition aggregates) outweighs marginal gains
+
+Partition only if you need monthly data drops (retention policies) or if individual partitions exceed 500M rows and you can prove parallel partition-wise aggregation helps.
+
+---
+
+## Step 4: Fix the Estimate Problem
+
+Two layers:
+
+### Layer 1: Refresh statistics
+
+```sql
+ANALYZE events;
+ANALYZE users;
+```
+
+### Layer 2: Increase statistics target for skewed columns
+
+The default `STATISTICS` is 100 which uses ~100 histogram buckets. If `tenant_id` has hot tenants (one tenant = 500M rows, another = 1M), 100 buckets is useless.
+
+```sql
+-- Set higher NDV (number of distinct values) tracking for tenant_id
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ANALYZE events;
+```
+
+For extreme skew, use **MCV (most common values)** targeting instead of just histograms:
+
+```sql
+-- Create extended statistics that track MCV + correlation between columns
+CREATE STATISTICS IF NOT EXISTS st_events_tenant_type
+  FROM (tenant_id, event_type), (tenant_id, created_at)
+  ON events;
+
+ANALYZE events;
+```
+
+### Layer 3: Local statistics for known-hot tenants
+
+If a single tenant dominates, PG 15+ supports local statistics on specific TOAST values:
+
+```sql
+-- Tell PG this tenant is unusually large
+UPDATE pg_statistic
+SET null_frac = 0, avg_width = ..., n_distinct = -0.5  -- negative = scale factor
+WHERE starelid = 'events'::regclass AND attname = 'tenant_id'
+  AND stainum = (SELECT attnum FROM pg_attribute WHERE attrelid = 'events'::regclass AND attname = 'tenant_id');
+```
+
+...but in practice, `SET STATISTICS 1000` + `ANALYZE` solves 99% of cases. Avoid manual `pg_statistic` edits unless you have a support case open with PG vendors.
+
+---
+
+## Step 5: Rewritten Query
+
+Below is the production-grade rewrite. Each change is annotated.
+
+```sql
+-- ============================================================
+-- REWRITTEN QUERY — optimized for 800M-row events table
+-- ============================================================
+
+WITH ranked AS (
+    SELECT
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        e.user_id,
+        RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS event_rank
+        -- Use RANK() or ROW_NUMBER() depending on dedup semantics
+        -- ROW_NUMBER() is cheaper if ties don't matter
+    FROM events e
+    WHERE e.tenant_id = 'target-tenant-id'
+      AND e.event_type = 'click'
+      AND e.created_at >= '2024-01-01'
+      AND e.created_at <  '2025-01-01'   -- exclusive upper bound (standard convention)
+)
+SELECT
+    r.tenant_id,
+    r.event_type,
+    r.created_at,
+    r.event_rank,
+    u.name        AS user_name,
+    u.email       AS user_email
+FROM ranked r
+INNER JOIN users u
+    ON u.id = r.user_id
+WHERE r.event_rank <= 1000;         -- push limit below window function
+
+-- ============================================================
+-- WHY THIS STRUCTURE WORKS
+-- ============================================================
+
+-- 1. CTE boundary: The CTE isolates the expensive window-function portion.
+--    In PG 12+, CTEs are INLINABLE by default unless referenced >1x,
+--    so this doesn't force a materialization barrier. The planner still
+--    sees through to the WHERE + JOIN.
+
+-- 2. Pushed predicate (event_rank <= 1000): By placing the LIMIT/offset
+--    condition AFTER the window function, PG can stop early if it uses
+--    a top-N heapsort strategy. Even if it computes all ranks, the final
+--    FILTER discards 99.9% of rows before the join.
+
+-- 3. INNER JOIN (not LEFT): Eliminates NULL-bearing joins. If you need
+--    dangling events, switch to LEFT but expect a larger build side.
+
+-- 4. Exclusive upper bound on created_at: Prevents off-by-one errors
+--    and ensures index range scans are tight.
+
+-- 5. ORDER BY created_at DESC matches the index order, enabling an
+--    Index Scan that satisfies both filtering and sorting.
+```
+
+### CTE Materialization Choice
+
+| Approach | When to Use | Impact Here |
+|----------|------------|-------------|
+| Inline (default) | Small-to-medium CTEs, single reference | ✅ Current: PG 12+ inlines automatically |
+| `MATERIALIZED` | CTE produces many rows, outer query applies tight filter | ⚠️ Consider if `event_rank <= 1000` prunes badly after inline expansion |
+| `NOT MATERIALIZED` | Force inline even if referenced multiple times | N/A here |
+
+**Decision**: Start without `MATERIALIZED`. If EXPLAIN shows the planner expanding the window function across the outer `WHERE` and re-scanning fully, then add `/*+ MATERIALIZED */` (comment hint) isn't supported in PG — instead, add the keyword:
+
+```sql
+WITH ranked AS MATERIALIZED (
+    ...
+)
+```
+
+This forces PG to compute the CTE once into a temp relation, then apply `WHERE event_rank <= 1000` as a simple filter. Trade-off: you lose any ability for the outer filter to drive the inner scan, but with 2M rows and a 1000-row final result, materializing saves the sort-from-disk entirely.
+
+---
+
+## Step 6: Complete DDL Script
+
+```sql
+-- ============================================================
+-- FULL PRODUCTION DEPLOYMENT SCRIPT
+-- Run in this exact order during a maintenance window
+-- ============================================================
+
+BEGIN;
+
+-- 1. Drop old indexes if they exist (CONCURRENTLY outside transaction)
+-- NOTE: DROP INDEX is not allowed inside BEGIN/COMMIT with CONCURRENTLY,
+-- so run these separately before the main transaction:
+-- DROP INDEX IF EXISTS idx_events_old_style;
+-- DROP INDEX IF EXISTS idx_events_tenant_created;
+
+-- 2. Increase statistics targets for skewed columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+
+-- 3. Create extended statistics (PG 15+)
+CREATE STATISTICS IF NOT EXISTS st_events_tenant_type_created
+  FROM (tenant_id, event_type), (tenant_id, created_at)
+  ON events;
+
+-- 4. Create the composite index CONCURRENTLY (outside transaction!)
+-- Run this SEPARATELY: CREATE INDEX CONCURRENTLY ...
+-- Then continue the transaction after it completes:
+
+-- 5. Refresh statistics
+ANALYZE events;
+ANALYZE users;
+
+-- 6. Verify the index was created and stats are fresh
+SELECT
+    schemaname, tablename, indexname,
+    idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE tablename = 'events' AND indexname LIKE 'idx_events%';
+
+-- Check last ANALYZE timestamp
+SELECT relname, last_analyze, last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname IN ('events', 'users');
+
+COMMIT;
+```
+
+**Important**: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block. The deployment pattern is:
+
+```bash
+# Step 1: Create index (no lock, runs in background)
+psql -c "CREATE INDEX CONCURRENTLY idx_events_tenant_type_created
+         ON events (tenant_id, event_type, created_at DESC);"
+
+# Step 2: Update stats, create extended stats (inside transaction)
+psql -c "BEGIN;
+  ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+  CREATE STATISTICS IF NOT EXISTS st_events_tenant_type_created
+    FROM (tenant_id, event_type), (tenant_id, created_at) ON events;
+  ANALYZE events;
+  ANALYZE users;
+  COMMIT;"
+```
+
+---
+
+## Step 7: Work Memory Tuning
+
+The sort spill happened because the default `work_mem = 4MB` is far too small for a 2M-row intermediate result.
+
+```sql
+-- Per-session setting (preferred, don't alter system-wide):
+SET work_mem = '256MB';
+
+-- Or in postgresql.conf / session startup:
+-- ALTER USER reporting_user SET work_mem = '256MB';
+```
+
+**Why not change `ALTER SYSTEM`?** Increasing `work_mem` globally causes every query to allocate that much memory per sort/hash node. A runaway query can OOM the server. Setting it per-session via `SET work_mem` or user-level defaults confines the risk to the reporting role.
+
+Verify it took effect:
+
+```sql
+SHOW work_mem;
+-- Should return: 256MB
+```
+
+---
+
+## Step 8: Verification — Expected EXPLAIN ANALYZE After Fix
+
+```
+CTE Scan on ranked  (cost=... rows=1000 width=...)
+  CTE Materials: ranked            ← forced materialization keeps execution stable
+  Actual Rows: 1000
+
+  -> Sort  (cost=..., rows=1000, width=...)
+       Sort Method: top-N heapsort  ← NO external merge! Memory-based!
+       Work_mem: 256MB              ← sufficient for top-1000
+
+       -> WindowAgg  (cost=..., rows=2M, width=...)
+            -> Index Scan using idx_events_tenant_type_created on events e
+                 Index Cond: ((tenant_id = 'target-tenant-id')
+                           AND (event_type = 'click')
+                           AND (created_at >= '2024-01-01')
+                           AND (created_at <  '2025-01-01'))
+                 Actual Rows: ~2M       ← index serves all filters exactly
+
+    -> Index Scan on users u using users_pkey  (Actual Rows: 1000)
+         Index Cond: (id = r.user_id)     ← unique PK index, O(log n) lookup
+
+Planning Time: 1.5 ms
+Execution Time: ~150 ms                 ← down from 40,000 ms (267x faster)
+```
+
+---
+
+## Final Checklist
+
+| Action | Command | Priority |
+|--------|---------|----------|
+| Create composite B-tree index | `CREATE INDEX CONCURRENTLY` on `(tenant_id, event_type, created_at DESC)` | 🔴 Critical |
+| Increase stat targets | `ALTER TABLE ... SET STATISTICS 1000` + `ANALYZE` | 🔴 Critical |
+| Create extended statistics | `CREATE STATISTICS ... FROM (tenant_id, event_type), (tenant_id, created_at)` | 🟡 High |
+| Set per-session work_mem | `SET work_mem = '256MB'` for reporting role | 🟡 High |
+| Rewrite query with pushed limit | Move `event_rank <= N` below window function | 🟡 High |
+| Consider MATERIALIZED CTE | Add `AS MATERIALIZED` if top-N pruning fails | 🟢 Optional (monitor first) |
+| Skip partitioning | Not justified for multi-condition filters | ⬜ Deferred |
+| Monitor with pg_stat_statements | Track post-fix execution time | 🟢 Follow-up |

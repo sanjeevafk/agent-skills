@@ -553,3 +553,70 @@ class TestDirectChoice:
         assert meta["model"] != "openrouter/qwen/qwen3.7-flash", (
             "if the generator changed, update the comparison caveat"
         )
+
+
+class TestConfoundExperiment:
+    """benchmarks/confound_results.json — the checklist_v2 output-volume confound.
+
+    `strategy_checklist_v2` was the only delivery arm appending a trailing
+    `[INSTRUCTION]` directive. Finding 2 attributed checklist_v2's higher output
+    volume to compression; this paired experiment (same model, same task,
+    directive present vs absent) isolates it.
+    """
+
+    @staticmethod
+    def _cells():
+        data = _load("confound_results.json")
+        pairs: dict[tuple[str, int], dict[str, int]] = {}
+        for r in data["runs"]:
+            if not r["ok"]:
+                continue
+            pairs.setdefault((r["task_id"], r["run"]), {})[r["condition"]] = r["output_tokens_est"]
+        return data, [(v["v2_with_directive"], v["v2_no_directive"])
+                      for v in pairs.values() if len(v) == 2]
+
+    def test_directive_increases_output_volume(self):
+        _, cells = self._cells()
+        assert cells, "no paired cells"
+        deltas = [a - b for a, b in cells]
+        assert sum(deltas) / len(deltas) > 0, (
+            "the directive must increase output volume on average"
+        )
+
+    def test_directive_effect_is_directionally_consistent(self):
+        _, cells = self._cells()
+        deltas = [a - b for a, b in cells]
+        positive = sum(1 for d in deltas if d > 0)
+        assert positive >= 0.7 * len(deltas), (
+            f"directive effect should be mostly positive, got {positive}/{len(deltas)}"
+        )
+
+    def test_directive_explains_most_of_finding_2_gap(self):
+        """The claim being retracted: ~82% of the +843 gap."""
+        _, cells = self._cells()
+        effect = sum(a - b for a, b in cells) / len(cells)
+        archived_gap = 5431 - 4588  # Finding 2 / Table 3
+        assert effect > 0.5 * archived_gap, (
+            f"directive effect {effect:.0f} should explain most of the "
+            f"archived {archived_gap} gap for the retraction to stand"
+        )
+
+    def test_prompts_differ_only_by_the_directive(self):
+        """The only variable must be the directive, not the skill content."""
+        from run_confound_experiment import DEFAULT_TASKS, build_prompts
+        import json as _json
+
+        tasks = {t["id"]: t for t in _json.loads(
+            (REPO / "benchmarks" / "tasks_ieee.json").read_text(encoding="utf-8")
+        )}
+        task = tasks[DEFAULT_TASKS[0]]
+        compiled = REPO / "benchmarks" / "checklists_v2" / f"{task['skill']}.txt"
+        if not compiled.exists():
+            pytest.skip("compiled v2 artifact absent")
+        prompts = build_prompts(task, "", compiled.read_text(encoding="utf-8"))
+        with_d = prompts["v2_with_directive"]
+        without = prompts["v2_no_directive"]
+        assert with_d.startswith(without), "conditions must share a common prefix"
+        assert with_d[len(without):].startswith("\n\n[INSTRUCTION]:"), (
+            "the only difference must be the trailing directive"
+        )
