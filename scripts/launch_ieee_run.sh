@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# One-shot launcher for the IEEE 360-run benchmark.
+# One-shot launcher for the IEEE benchmark run.
+#
 # Usage: bash scripts/launch_ieee_run.sh [backend] [judge_model]
-#   Defaults: agy claude-sonnet-4-6   (cross-vendor judge via the agy CLI, $0)
-#   OrcaRouter path: bash scripts/launch_ieee_run.sh openai anthropic/claude-sonnet-4.6
+#   Defaults: cmd deepseek/deepseek-v4-pro  (executor + judge via the cmd CLI)
+#   agy cross-vendor judge: bash scripts/launch_ieee_run.sh agy claude-sonnet-4-6
+#   OpenAI-compatible judge: bash scripts/launch_ieee_run.sh openai <model>
+#     and export JUDGE_API_KEY (and JUDGE_BASE_URL if not OpenRouter-compatible).
+#
+# Credentials are read from the environment, never from a file in the repository.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-source paper/.orca_env 2>/dev/null || true
 EXEC_BACKEND="${EXECUTOR_BACKEND:-cmd}"
 EXEC_MODEL="${EXECUTOR_MODEL:-qwen/qwen3.7-flash}"
 BACKEND="${1:-${JUDGE_BACKEND:-cmd}}"
@@ -31,8 +35,12 @@ elif [ "${BACKEND}" = "agy" ]; then
     exit 1
   fi
 else
-  source paper/.orca_env
   echo "🔎 OpenAI-judge preflight runs inside the runner."
+  if [ -z "${JUDGE_API_KEY:-}" ]; then
+    echo "❌ JUDGE_API_KEY is not set. Export it before launching (credentials are"
+    echo "   never read from a repository file)."
+    exit 1
+  fi
 fi
 
 mkdir -p benchmarks
