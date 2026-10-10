@@ -38,7 +38,13 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
-INDEX_FILE = REPO_ROOT / "skills.json"
+# The routable catalogue is the de-duplicated subset produced by
+# scripts/dedupe_catalogue.py. skills.json holds the full catalogue and is
+# deliberately larger: 9 near-duplicate pairs (7 byte-identical) remain there
+# for tooling that needs them, but they are excluded from routing because two
+# entries carrying identical text cannot be ranked against each other.
+INDEX_FILE = REPO_ROOT / "skills_canonical.json"
+FULL_INDEX_FILE = REPO_ROOT / "skills.json"
 NPY_FILE = REPO_ROOT / "skills_embeddings.npy"
 MANIFEST_FILE = REPO_ROOT / "skills_manifest.json"
 
@@ -126,8 +132,17 @@ class JuliaSkillRouter:
         if not n_vec == n_manifest == n_index:
             raise RuntimeError(
                 "stale embedding cache: "
-                f"{n_vec} vectors != {n_manifest} manifest entries != {n_index} indexed skills. "
-                "Run scripts/build_skill_embeddings.py to rebuild from skills.json."
+                f"{n_vec} vectors != {n_manifest} manifest entries != {n_index} routable skills. "
+                "Run scripts/dedupe_catalogue.py then scripts/build_skill_embeddings.py."
+            )
+        # Absorbed duplicates must not be routable, or they re-enter the shortlist.
+        collapsed = set(self.index.get("collapsed", {}))
+        routable_names = {s["name"] for s in self.skills}
+        overlap = collapsed & routable_names
+        if overlap:
+            raise RuntimeError(
+                f"duplicate entries present in the routable catalogue: {sorted(overlap)[:5]}. "
+                "Re-run scripts/dedupe_catalogue.py and rebuild embeddings."
             )
         self.n_skills = n_vec
 

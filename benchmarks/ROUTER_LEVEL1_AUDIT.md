@@ -54,8 +54,11 @@ defect the first regeneration exposed. **The headline conclusion reversed twice.
 
 Latency: TF-IDF p50 1.75 ms; two-stage p50 401 ms (Julia-1 dominates).
 
-Catalogue: **531 skills** (530 + the recovered `debugging-code`; see
-`skills/RECOVERY.md`).
+Catalogue: **531 indexed skills, 522 routable.** The 9 near-duplicate pairs
+(7 byte-identical) are collapsed into the routable set by
+`scripts/dedupe_catalogue.py`; all 531 remain in `skills.json`. Max
+off-diagonal cosine among routable entries fell from 1.0000 to 0.9353. See
+`benchmarks/dedup_report.json` and `skills/RECOVERY.md`.
 
 ## Truncation fix (task #4) and its effect
 
@@ -125,6 +128,36 @@ The section should now be framed as a *negative* result with a diagnosed cause:
 at this catalogue size, cross-encoder reranking is a net loss against a
 well-tuned lexical baseline, and the binding constraint is shortlist recall.
 
+
+## Catalogue de-duplication
+
+Nine pairs of catalogue entries embed to cosine ≥ 0.95, seven of them at exactly
+1.000 (byte-identical descriptions). All nine are accidental aliases: one skill
+registered under a short name and a `huggingface-` prefixed name. Two entries
+carrying identical text cannot be ranked against each other, so every shortlist
+containing one contained both.
+
+`scripts/dedupe_catalogue.py` collapses each group to a single routable
+representative, chosen deterministically (canonical-tier member first, else
+shorter name, else lexicographic). Nothing is deleted: the absorbed name stays in
+`skills.json` and is registered in the index's existing `aliases` map, so
+`huggingface-mem` still resolves to `hf-mem`. Full catalogue 531 → 522 routable,
+and no benchmark skill is affected (verified against all 18 task bindings).
+
+**Effect on the reported numbers: none.** Level 1 results are identical before
+and after de-duplication (TF-IDF 8/17, Stage 1 7/17, +Julia-1 5/17, Top-5 11/17
+throughout). The duplicates were all Hugging Face tooling skills unrelated to
+the 18 benchmark tasks, so removing them fixes catalogue hygiene without moving
+the measurement. We report this explicitly rather than implying the cleanup
+improved the result.
+
+De-duplication also does **not** resolve the dominant residual failure.
+`e2e-testing` and `playwright` remain a genuine semantic near-duplicate at
+cosine 0.87, correctly left alone by a 0.95 threshold, and Julia-1 still
+selects `playwright` for the checkout E2E task. Collapsing semantically related
+but functionally distinct skills would need a task-level evaluation we have not
+run, so we did not attempt it.
+
 ## What this does and does not establish
 
 - Retrieval recall (Top-5) is unchanged at 11/17 across all three methods, so the
@@ -142,10 +175,16 @@ well-tuned lexical baseline, and the binding constraint is shortlist recall.
    withdrawn router and cannot be kept. Re-running would test a pipeline now
    shown to be *worse* than both its own Stage 1 and the lexical baseline, so it
    should be dropped rather than re-run.
-2. **De-duplicate the catalogue.** `e2e-testing`/`playwright` and
-   `hf-cloud-python-env-setup`/`huggingface-cloud-python-env-setup` (identical
-   descriptions, cosine 1.000) are unresolvable by any router.
+2. **Resolve semantic near-duplicates.** The 9 byte-identical alias pairs are
+   now collapsed (see above), but `e2e-testing`/`playwright` (cosine 0.87) is
+   still ambiguous and remains the top residual failure. Separating these needs
+   a task-level notion of which skills are interchangeable, not a similarity
+   threshold.
 3. **Raise shortlist recall**, which is the actual bottleneck: 6 of 17 queries
-   never place the gold skill in the top 5.
+   never place the gold skill in the top 5, identically for all three methods.
+   A hybrid shortlist is the obvious next attempt: the lexical and dense
+   retrievers agree on only **4 of 17** top-1 answers (TF-IDF wins 8, dense
+   wins 7, shared 4), so their failures are largely complementary and a union
+   shortlist would surface the gold skill in considerably more than 11 cases.
 4. **Julia-1 routing remains available** as a baseline for a held-out study with
    ~200 non-benchmark queries, once the catalogue is de-duplicated.

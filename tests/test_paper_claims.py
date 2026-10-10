@@ -388,15 +388,48 @@ class TestRouterLevel1:
 
     def test_catalogue_counts_agree(self):
         _require_router_cache()
-        """Stale-cache guard: vectors, manifest, and index must be in lockstep."""
+        """Stale-cache guard: vectors, manifest, and routable catalogue lockstep."""
         import numpy as np
 
         vectors = np.load(REPO / "skills_embeddings.npy")
         manifest = json.loads(
             (REPO / "skills_manifest.json").read_text(encoding="utf-8")
         )
+        canonical = json.loads(
+            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
+        )
+        assert vectors.shape[0] == len(manifest["skills"]) == len(canonical["skills"])
+
+    def test_collapsed_duplicates_are_not_routable(self):
+        _require_router_cache()
+        """Near-duplicates must never re-enter a shortlist."""
+        canonical = json.loads(
+            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
+        )
+        collapsed = set(canonical["collapsed"])
+        routable = set(canonical["skills"])
+        assert collapsed, "expected duplicate groups"
+        assert not (collapsed & routable), (
+            f"collapsed duplicates routable again: {sorted(collapsed & routable)[:5]}"
+        )
         index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))
-        assert vectors.shape[0] == len(manifest["skills"]) == len(index["skills"])
+        missing = [a for a in collapsed if index["aliases"].get(a) not in routable]
+        assert not missing, f"absorbed names not aliased to a routable skill: {missing[:5]}"
+
+    def test_routable_catalogue_has_no_identical_embeddings(self):
+        _require_router_cache()
+        """The point of de-duplication: no two routable entries are identical."""
+        import numpy as np
+
+        vectors = np.load(REPO / "skills_embeddings.npy")
+        canonical = json.loads(
+            (REPO / "skills_canonical.json").read_text(encoding="utf-8")
+        )
+        sims = vectors @ vectors.T
+        np.fill_diagonal(sims, -1.0)
+        assert float(sims.max()) < 0.99, (
+            f"identical routable entries remain: {list(canonical['skills'])[int(np.argmax(sims))]}"
+        )
 
     def test_embedded_documents_do_not_leak_skill_names(self):
         _require_router_cache()
@@ -413,11 +446,12 @@ class TestRouterLevel1:
 def _require_router_cache() -> None:
     """Skip router assertions when the generated embedding cache is absent.
 
-    skills_embeddings.npy, skills_manifest.json, and skills.json are generated
-    artifacts and are git-ignored, so a fresh CI checkout has none of them.
-    The invariants are still checked whenever a developer has built the cache,
-    and by the router-integrity CI job when it builds one.
+    skills_embeddings.npy, skills_manifest.json, skills.json and
+    skills_canonical.json are generated artifacts and are git-ignored, so a
+    fresh CI checkout has none of them. The invariants are still checked whenever
+    a developer has built the cache, and by the router-integrity CI job when it
+    builds one.
     """
-    for rel in ("skills_embeddings.npy", "skills_manifest.json", "skills.json"):
+    for rel in ("skills_embeddings.npy", "skills_manifest.json", "skills_canonical.json"):
         if not (REPO / rel).exists():
             pytest.skip(f"router cache not built ({rel} missing); run scripts/build_index.py")

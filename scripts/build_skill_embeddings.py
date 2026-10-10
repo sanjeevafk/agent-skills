@@ -24,11 +24,25 @@ def build_embeddings(model_id: str = "BAAI/bge-small-en-v1.5", batch_size: int =
         print(f"Error: {INDEX_FILE} not found. Run scripts/build_index.py first.")
         sys.exit(1)
 
-    print(f"Loading skills metadata from {INDEX_FILE}...")
-    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    skills_dict = data['skills']
+    # Route over the de-duplicated catalogue when it exists. Near-duplicate
+    # entries (9 pairs, seven byte-identical) cannot be ranked against each
+    # other, so embedding them would put two indistinguishable candidates in
+    # every shortlist. The full catalogue stays in skills.json for callers that
+    # need it; scripts/dedupe_catalogue.py produces the canonical subset.
+    canonical_file = REPO_ROOT / 'skills_canonical.json'
+    if canonical_file.exists():
+        print(f"Loading de-duplicated catalogue from {canonical_file.name} "
+              f"({canonical_file.stat().st_size} bytes)...")
+        payload = json.loads(canonical_file.read_text(encoding='utf-8'))
+        skills_dict = payload['skills']
+        print(f"Routable catalogue: {len(skills_dict)} skills "
+              f"({payload['routable_count']} of {payload['total_in_index']}; "
+              f"{len(payload['collapsed'])} duplicates collapsed).")
+    else:
+        print(f"Loading skills metadata from {INDEX_FILE}...")
+        data = json.loads(INDEX_FILE.read_text(encoding='utf-8'))
+        skills_dict = data['skills']
+        print("Note: skills_canonical.json absent; embedding the full catalogue.")
     skill_names = list(skills_dict.keys())
     print(f"Found {len(skill_names)} skills across repository.")
 

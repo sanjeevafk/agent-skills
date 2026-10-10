@@ -44,7 +44,9 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 TASKS_FILE = REPO_ROOT / "benchmarks" / "tasks_ieee.json"
-INDEX_FILE = REPO_ROOT / "skills.json"
+# Both methods must search an identical catalogue, so both read the
+# de-duplicated routable subset. skills.json holds the full 531-skill catalogue.
+INDEX_FILE = REPO_ROOT / "skills_canonical.json"
 OUT_FILE = REPO_ROOT / "benchmarks" / "router_level1_results.json"
 
 # Tasks whose benchmark-bound skill is the wrong label for retrieval purposes.

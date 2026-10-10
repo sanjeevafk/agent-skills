@@ -199,3 +199,31 @@ With `debugging-code` restored, `scripts/verify_compiled_artifacts.py` reports
 **17 of 18 artifacts reproduce** (previously 16, with one skill absent). The
 single remaining exception is `tdd`, whose recorded pre-run source no longer
 exists.
+
+## F. Catalogue de-duplication (2026-10-10)
+
+Nine near-duplicate catalogue pairs (seven byte-identical, cosine 1.000) were
+found and collapsed into a 522-skill routable set from a 531-skill index. Each
+pair is one skill registered under both a short and a `huggingface-` prefixed
+name. `scripts/dedupe_catalogue.py` collapses them deterministically (canonical
+tier first, else shorter name, else lexicographic), registers the absorbed name
+in the index alias map, and deletes nothing. Maximum off-diagonal cosine among
+routable entries fell from 1.0000 to 0.9353.
+
+**No reported number changes.** TF-IDF 8/17, Stage 1 7/17, Stage 1 + Julia-1
+5/17 and Top-5 11/17 are identical before and after de-duplication, because all
+nine duplicates are Hugging Face tooling skills unrelated to the 18 benchmark
+tasks. Reported as a hygiene fix, not an improvement.
+
+Three tests now guard this contract: collapsed names must not be routable, each
+must resolve through the alias registry, and no two routable entries may embed
+identically. The router and benchmark both read `skills_canonical.json`, and the
+router additionally hard-fails if a collapsed name reappears in the routable set.
+
+New finding recorded in §8.7: the lexical and dense retrievers agree on only
+**4 of 17** top-1 answers (lexical 8, dense 7, shared 4), so their failure modes
+are largely complementary and a union shortlist is the most promising untested
+direction. The dominant residual failure (`e2e-testing` vs `playwright`,
+cosine 0.87) is a genuine semantic near-duplicate that a 0.95 threshold
+correctly leaves alone; separating it needs a task-level notion of
+interchangeability we have not established.
