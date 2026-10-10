@@ -32,14 +32,21 @@ def build_embeddings(model_id: str = "BAAI/bge-small-en-v1.5", batch_size: int =
     skill_names = list(skills_dict.keys())
     print(f"Found {len(skill_names)} skills across repository.")
 
-    # Format document representations for dense retrieval
+    # Document representation for dense retrieval.
+    #
+    # Description ONLY. An earlier version rendered f"{name}: {desc}", which
+    # baked the skill name into every catalogue vector and let Stage 1 act as a
+    # fuzzy name matcher rather than a semantic retriever. It also leaked the
+    # answer whenever a task prompt happened to mention the skill by name (e.g.
+    # sec-webhook-audit-ieee, whose prompt begins "Security-review a FastAPI...").
+    # The name is carried in the manifest for join purposes, never embedded.
     option_texts = []
     manifest_entries = []
     for name in skill_names:
         meta = skills_dict[name]
         desc = meta.get('description', '').strip()
         category = meta.get('category', 'uncategorized')
-        rendered_text = f"{name}: {desc}" if desc else name
+        rendered_text = desc
         option_texts.append(rendered_text)
         manifest_entries.append({
             "name": name,

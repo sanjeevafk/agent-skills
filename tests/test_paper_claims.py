@@ -319,3 +319,73 @@ class TestJudgePositionBias:
         for arm in ("full", "retrieved", "checklist", "checklist_v2"):
             _, p = stats.ttest_ind(corrected[arm], base, equal_var=False)
             assert p > 0.05, f"{arm} significantly beats control after correction (p={p:.3f})"
+
+
+class TestRouterLevel1:
+    """benchmarks/ROUTER_LEVEL1_AUDIT.md — supersedes the withdrawn §8.7 figures.
+
+    The original run reported 55.6% Top-1 for the two-stage router against a
+    0.0% "TF-IDF baseline". Both are withdrawn: the baseline was a hand-weighted
+    keyword scorer that could not score correctly by construction, and the
+    catalogue vectors embedded the skill name.
+    """
+
+    @staticmethod
+    def _rows():
+        data = _load("router_level1_results.json")
+        return data["task_runs"]
+
+    def test_freebie_task_is_excluded_from_headline(self):
+        data = _load("router_level1_results.json")
+        freebies = data["metadata"]["excluded_freebie_tasks"]
+        assert freebies == ["sec-webhook-audit-ieee"]
+        rows = {r["task_id"]: r for r in self._rows()}
+        # The exclusion must be visible per-row, not silently dropped.
+        assert rows["sec-webhook-audit-ieee"]["freebie"] is True
+        assert data["summary"]["n_excluded_freebie"] == 1
+
+    def test_gold_labels_are_canonical(self):
+        rows = {r["task_id"]: r["gold"] for r in self._rows()}
+        assert rows["sre-node-leak-ieee"] == "systematic-debugging"
+        assert rows["qa-ratelimiter-tdd-ieee"] == "tdd"
+
+    def test_gold_labels_exist_in_catalogue(self):
+        index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))["skills"]
+        missing = [r["gold"] for r in self._rows() if r["gold"] not in index]
+        assert not missing, f"unroutable gold labels: {missing}"
+
+    def test_baseline_beats_two_stage_reranking(self):
+        """The measured regression: Julia-1 rerank lowers Stage-1 Top-1."""
+        rows = [r for r in self._rows() if not r["freebie"]]
+        stage1_top1 = sum(1 for r in rows if r["two_stage_top5"][0] == r["gold"])
+        two_stage_top1 = sum(1 for r in rows if r["two_stage_top1_match"])
+        assert two_stage_top1 < stage1_top1, (
+            "if reranking now helps, ROUTER_LEVEL1_AUDIT.md needs updating"
+        )
+
+    def test_tfidf_baseline_is_not_zero(self):
+        """Guards against regressing to the rigged 0/18 baseline."""
+        rows = [r for r in self._rows() if not r["freebie"]]
+        top1 = sum(1 for r in rows if r["tfidf_top1_match"])
+        assert top1 > 0, "real TF-IDF must score above zero; a 0 result means the baseline regressed"
+
+    def test_catalogue_counts_agree(self):
+        """Stale-cache guard: vectors, manifest, and index must be in lockstep."""
+        import numpy as np
+
+        vectors = np.load(REPO / "skills_embeddings.npy")
+        manifest = json.loads(
+            (REPO / "skills_manifest.json").read_text(encoding="utf-8")
+        )
+        index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))
+        assert vectors.shape[0] == len(manifest["skills"]) == len(index["skills"])
+
+    def test_embedded_documents_do_not_leak_skill_names(self):
+        manifest = json.loads(
+            (REPO / "skills_manifest.json").read_text(encoding="utf-8")
+        )["skills"]
+        leaky = [
+            e["name"] for e in manifest
+            if e.get("rendered_text", "").startswith(e["name"] + ":")
+        ]
+        assert not leaky, f"vectors embed skill names again: {leaky[:5]}"
