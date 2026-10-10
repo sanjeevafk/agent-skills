@@ -350,6 +350,7 @@ class TestRouterLevel1:
         assert rows["qa-ratelimiter-tdd-ieee"] == "tdd"
 
     def test_gold_labels_exist_in_catalogue(self):
+        _require_router_cache()
         index = json.loads((REPO / "skills.json").read_text(encoding="utf-8"))["skills"]
         missing = [r["gold"] for r in self._rows() if r["gold"] not in index]
         assert not missing, f"unroutable gold labels: {missing}"
@@ -370,6 +371,7 @@ class TestRouterLevel1:
         assert top1 > 0, "real TF-IDF must score above zero; a 0 result means the baseline regressed"
 
     def test_catalogue_counts_agree(self):
+        _require_router_cache()
         """Stale-cache guard: vectors, manifest, and index must be in lockstep."""
         import numpy as np
 
@@ -381,6 +383,7 @@ class TestRouterLevel1:
         assert vectors.shape[0] == len(manifest["skills"]) == len(index["skills"])
 
     def test_embedded_documents_do_not_leak_skill_names(self):
+        _require_router_cache()
         manifest = json.loads(
             (REPO / "skills_manifest.json").read_text(encoding="utf-8")
         )["skills"]
@@ -389,3 +392,16 @@ class TestRouterLevel1:
             if e.get("rendered_text", "").startswith(e["name"] + ":")
         ]
         assert not leaky, f"vectors embed skill names again: {leaky[:5]}"
+
+
+def _require_router_cache() -> None:
+    """Skip router assertions when the generated embedding cache is absent.
+
+    skills_embeddings.npy, skills_manifest.json, and skills.json are generated
+    artifacts and are git-ignored, so a fresh CI checkout has none of them.
+    The invariants are still checked whenever a developer has built the cache,
+    and by the router-integrity CI job when it builds one.
+    """
+    for rel in ("skills_embeddings.npy", "skills_manifest.json", "skills.json"):
+        if not (REPO / rel).exists():
+            pytest.skip(f"router cache not built ({rel} missing); run scripts/build_index.py")
