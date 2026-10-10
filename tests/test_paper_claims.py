@@ -603,8 +603,16 @@ class TestConfoundExperiment:
 
     def test_prompts_differ_only_by_the_directive(self):
         """The only variable must be the directive, not the skill content."""
-        from run_confound_experiment import DEFAULT_TASKS, build_prompts
         import json as _json
+        import sys
+
+        # scripts/ is not on sys.path by default; several other tests in this
+        # file add it, which masked a ModuleNotFoundError when this test ran
+        # alone.
+        scripts_dir = str(REPO / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from run_confound_experiment import DEFAULT_TASKS, build_prompts
 
         tasks = {t["id"]: t for t in _json.loads(
             (REPO / "benchmarks" / "tasks_ieee.json").read_text(encoding="utf-8")
