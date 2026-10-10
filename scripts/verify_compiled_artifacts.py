@@ -37,14 +37,13 @@ MANIFEST = REPO / "benchmarks" / "checklists_v2" / "manifest.json"
 # states why, so the exception is auditable rather than a blanket waiver.
 KNOWN_EXCEPTIONS: dict[str, str] = {
     "tdd": (
-        "skills/tdd/SKILL.md was edited after the 2026-08-29 benchmark run "
-        "(recorded source sha 1d0a1439..., on disk 93ea419b...). Its recorded "
-        "16.63% token reduction no longer reproduces; the current file yields "
-        "46.00%. Restore the recorded source to clear this."
-    ),
-    "debugging-code": (
-        "skills/debugging-code/ is absent from the repository, so the sre-node-leak "
-        "task cannot be recompiled at all. Restore the skill directory to clear this."
+        "The benchmark-time source of skills/tdd/SKILL.md predates the repository's "
+        "initial commit and is not recoverable; only its compiled artifact survives. "
+        "The reconstructed benchmark-time source is kept at "
+        "skills/tdd/SKILL.benchmark-time.md and reproduces the recorded artifact "
+        "byte-for-byte, but the recorded source hash (1d0a1439...) no longer matches "
+        "any file on disk. The live skills/tdd/SKILL.md is the post-run version "
+        "(93ea419b...) that current tooling uses. See skills/RECOVERY.md."
     ),
 }
 

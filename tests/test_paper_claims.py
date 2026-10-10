@@ -355,6 +355,22 @@ class TestRouterLevel1:
         missing = [r["gold"] for r in self._rows() if r["gold"] not in index]
         assert not missing, f"unroutable gold labels: {missing}"
 
+    def test_option_truncation_is_fixed(self):
+        """After the truncation fix, options must fit Julia-1's 48-token budget.
+
+        The first corrected run word-clipped description prefixes, truncating
+        17 of 18 routes and scoring 2/17. Options now retain the leading clause
+        and are only clipped when the runtime rejects them.
+        """
+        rows = [r for r in self._rows() if r.get("latency")]
+        assert rows, "no latency stats recorded"
+        clips = [r["latency"].get("option_clip_words") for r in rows]
+        assert all(c is not None for c in clips), "option clip not recorded"
+        # Every scored route should now fit at or near the ceiling rather than
+        # falling back to the tight end of the ladder.
+        tight = [c for c in clips if c is not None and c <= 10]
+        assert not tight, f"options still collapsing to the tight ladder: {tight}"
+
     def test_baseline_beats_two_stage_reranking(self):
         """The measured regression: Julia-1 rerank lowers Stage-1 Top-1."""
         rows = [r for r in self._rows() if not r["freebie"]]

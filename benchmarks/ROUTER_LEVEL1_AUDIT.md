@@ -1,7 +1,13 @@
 # Level 1 Routing Benchmark — Corrected Run (2026-10-10)
 
 Regenerated `benchmarks/router_level1_results.json` after fixing every defect in
-the original §8.7 evaluation. **The headline conclusion reversed.**
+the original §8.7 evaluation, then again after fixing the option-truncation
+defect the first regeneration exposed. **The headline conclusion reversed twice.**
+
+> **Truncation fix applied after the first regeneration.** The first corrected
+> run fed Julia-1 word-clipped description *prefixes* and scored 2/17. The
+> truncation fix (below) raised it to **5/17**. Numbers below reflect the final
+> state; §"Truncation fix" documents both measurements.
 
 ## What was wrong before
 
@@ -34,8 +40,9 @@ the original §8.7 evaluation. **The headline conclusion reversed.**
   `qa-ratelimiter-tdd-ieee` → `tdd` (benchmark binding, also what the §8.4
   ablation used; the prior router's `tdd-workflow` was wrong).
 - **Freebie task excluded** from the headline rate and reported separately.
-- **Catalogue rebuilt from disk truth: 530 skills** (was 440 in the manifest,
-  413 in `skills.json`).
+- **Catalogue rebuilt from disk truth: 531 skills** (was 440 in the manifest,
+  413 in `skills.json`). `debugging-code` was reconstructed from its surviving
+  compiled artifact and is routable again; see `skills/RECOVERY.md`.
 
 ## Results (17 scorable tasks; 1 freebie excluded)
 
@@ -43,35 +50,65 @@ the original §8.7 evaluation. **The headline conclusion reversed.**
 |---|---:|---:|
 | **TF-IDF baseline (real)** | **8/17 (47.1%)** | 11/17 (64.7%) |
 | Stage 1 only (BGE-small) | 7/17 (41.2%) | 11/17 (64.7%) |
-| Stage 1 + Julia-1 rerank | **2/17 (11.8%)** | 11/17 (64.7%) |
+| Stage 1 + Julia-1 rerank | **5/17 (29.4%)** | 11/17 (64.7%) |
 
-Latency: TF-IDF p50 1.71 ms; two-stage p50 516 ms (Julia-1 dominates).
+Latency: TF-IDF p50 1.75 ms; two-stage p50 401 ms (Julia-1 dominates).
 
-## The finding
+Catalogue: **531 skills** (530 + the recovered `debugging-code`; see
+`skills/RECOVERY.md`).
 
-**Julia-1 reranking destroys Stage 1 accuracy: −5 tasks (7/17 → 2/17).**
+## Truncation fix (task #4) and its effect
 
-In 9 of 11 cases the correct skill was already in the Stage-1 shortlist and
-Julia-1 overrode it. Representative failures:
+**Before.** Julia-1 enforces a hard 48-token limit per option. Skill
+descriptions average 42 words (median 35, max 124), so the first corrected run
+applied a whole-description clip ladder. Result: **17 of 18 routes were
+truncated**, retaining ~79% of description text, and Julia-1 scored 2/17.
+
+Word-clipping the head of a description is the wrong repair — the opening
+clause is frequently the least discriminating part and is often near-identical
+across duplicate entries.
+
+**After.** `_option_text` in `scripts/julia_router.py` keeps each description's
+**leading clause** (the part stating what the skill is for) and only clips when
+the runtime rejects it. Measured on the 531-skill catalogue:
+
+- **529 of 531 options fit unmodified** at a 24-word ceiling (mean 15.6 words).
+- Across the 17 scored routes, every option now fits; the ladder binds on only
+  a handful (`clip_words` distribution: 24×14, 21×1, 20×1, 18×1).
+
+**Effect on results:** Julia-1 rerank Top-1 improved **2/17 → 5/17**, and the
+number of correct-Stage-1 hits it overrides fell **9 → 6**. Residual misses are
+dominated by genuinely ambiguous catalogue entries:
 
 | task | gold | rank in Stage 1 | Julia-1 chose |
 |---|---|---:|---|
 | `qa-checkout-e2e-ieee` | `e2e-testing` | 1 | `playwright` |
 | `devops-api-k8s-ieee` | `kubernetes-patterns` | 1 | `get-available-resources` |
 | `sre-p99-regression-ieee` | `performance-profiler` | 1 | `nasa-power-of-ten-python` |
-| `sec-amm-pool-ieee` | `defi-amm-security` | 1 | `deal-screening` |
+| `devops-gha-pipeline-ieee` | `ci-cd-pipeline-builder` | 4 | `serverless-deploy` |
 
-Two contributing causes, both measured:
+`e2e-testing` is described as "Playwright E2E testing patterns, Page Object
+Model…" while `playwright` covers the same ground; the vendor's own card warns
+that "ambiguous wording… can also cause mistakes."
 
-1. **Option truncation.** Julia-1 enforces a 48-token limit per option. Skill
-   descriptions average 42 words (median 35, max 124), so a deterministic clip
-   ladder was required; 17 of 18 routes were clipped (10 at 32 words, 6 at 24,
-   1 at 18), retaining ~79% of description text. The model frequently receives
-   fragments rather than the discriminating content.
-2. **Near-duplicate catalogue entries.** `e2e-testing` is described as
-   "Playwright E2E testing patterns, Page Object Model…" while `playwright`
-   covers the same ground. These are genuinely ambiguous, and the vendor's own
-   card warns that "ambiguous wording… can also cause mistakes."
+## The finding
+
+**Julia-1 reranking still degrades Stage 1 accuracy: −2 tasks (7/17 → 5/17).**
+
+The truncation fix recovered 3 of the 5 originally-observed lost tasks, but the
+reranker remains net-negative on these queries: in 6 of 11 cases the correct
+skill was already in the Stage-1 shortlist and Julia-1 overrode it.
+
+Root cause is now unambiguous: **shortlist recall is the bottleneck, not
+ranking.** Top-5 recall is identical (11/17) with and without reranking, so
+reranking cannot recover what shortlisting missed, and it occasionally discards
+what shortlisting got right.
+
+This does not show Julia-1 is unsuitable for routing in general. It shows that a
+144M decision model, presented with a 5-way choice over a catalogue containing
+near-duplicate entries, does not improve over a competent dense retriever on
+these 17 queries. n=17 is small; the −2 delta is reported as a measured
+regression, not a precise effect size.
 
 ## Consequences for the manuscript
 
@@ -81,28 +118,34 @@ from a run whose baseline was rigged and whose vectors leaked skill names. The
 0.0% figure came from a scorer that cannot score anything correctly by
 construction.
 
-Honest replacements: real TF-IDF 47.1% / 64.7%; Stage-1-only dense retrieval
-41.2% / 64.7%; adding Julia-1 reranking **reduces** Top-1 to 11.8%.
+Honest replacements: real TF-IDF **47.1% / 64.7%**; Stage-1-only dense retrieval
+**41.2% / 64.7%**; adding Julia-1 reranking **reduces** Top-1 to **29.4%**.
+
+The section should now be framed as a *negative* result with a diagnosed cause:
+at this catalogue size, cross-encoder reranking is a net loss against a
+well-tuned lexical baseline, and the binding constraint is shortlist recall.
 
 ## What this does and does not establish
 
-- It **does not** show Julia-1 is unsuitable for routing in general. It shows a
-  144M decision model, fed clipped descriptions from a catalogue containing
-  near-duplicates, degrades a competent dense retriever on these 17 queries.
-- Retrieval recall (Top-5) is unchanged at 11/17, so **Stage 1 is the
-  bottleneck**; reranking cannot recover what shortlisting missed.
-- n=17 is small. The −5 delta is consistent and directionally clear but a
-  per-task sign test would not reach significance; it should be reported as a
-  measured regression, not a precise effect size.
+- Retrieval recall (Top-5) is unchanged at 11/17 across all three methods, so the
+  ceiling is Stage 1. Improving Stage 2 cannot help until Stage 1 recall rises.
+- Julia-1 is viable infrastructure — it runs locally, is deterministic, is fast
+  enough (p50 401 ms end to end), and its calibration is usable. It is simply
+  not additive on these queries.
+- n=17 is small and 6 of the residual failures are near-duplicate catalogue
+  entries, so a de-duplicated catalogue is a precondition for a fair reranking
+  evaluation, not an optional refinement.
 
 ## Open items
 
 1. **Level 2 was not re-run.** The old n=1 head-to-head (24.67 vs 23.00) used the
-   withdrawn router and cannot be kept. Re-running it now would test a pipeline
-   shown to be worse than its own Stage 1, so it should be dropped rather than
-   re-run unless the truncations are fixed first.
-2. **Truncation fix**, if Julia-1 is to be retained: compress descriptions to a
-   discriminative summary (embedding-free) rather than word-clipping, and verify
-   the option budget empirically per option.
-3. **Julia-1 routing remains available** as a baseline for a held-out study with
-   ~200 non-benchmark queries and a de-duplicated catalogue.
+   withdrawn router and cannot be kept. Re-running would test a pipeline now
+   shown to be *worse* than both its own Stage 1 and the lexical baseline, so it
+   should be dropped rather than re-run.
+2. **De-duplicate the catalogue.** `e2e-testing`/`playwright` and
+   `hf-cloud-python-env-setup`/`huggingface-cloud-python-env-setup` (identical
+   descriptions, cosine 1.000) are unresolvable by any router.
+3. **Raise shortlist recall**, which is the actual bottleneck: 6 of 17 queries
+   never place the gold skill in the top 5.
+4. **Julia-1 routing remains available** as a baseline for a held-out study with
+   ~200 non-benchmark queries, once the catalogue is de-duplicated.

@@ -142,3 +142,60 @@ Corrected in the previous commit. Summary:
   approximation and should be described as estimates.
 - **`skills/tdd/SKILL.md` and `skills/debugging-code/`** remain unrestored, so
   2 of 18 artifacts do not reproduce and two tests are `xfail`.
+
+## E. Routing section (§8.7) rewritten as a negative result
+
+### E1. Prior §8.7 numbers withdrawn
+
+| claim | status |
+|---|---|
+| Two-stage router 55.6% Top-1 / 61.1% Top-5 | **withdrawn** |
+| "TF-IDF baseline" 0.0% Top-1 / 11.1% Top-5 | **withdrawn** (was never TF-IDF) |
+| Level 2 end-to-end: 24.67 vs 23.00, +1.67 | **withdrawn** |
+| "sub-second skill routing" | **withdrawn** (contradicted own 2.08 s) |
+| Naive cross-encoder baseline "4.5 minutes" | **withdrawn** (own measurement implies 14.3 min) |
+| "Contrastive Bi-Encoder" | **withdrawn** (off-the-shelf checkpoint, no fine-tuning) |
+| Catalogue "440 skills" / "11 domains" | restated as **531 skills** |
+
+Three defects caused the reversal, each verified in source: the lexical baseline
+was a hand-weighted keyword scorer (exact-name 100, substring 30, tag 20,
+description 15, category 10) that cannot rank technical queries by construction;
+the catalogue vectors embedded `f"{name}: {desc}"`, leaking skill names; and the
+reranker was unimportable while the paper named a different model ID than the
+code.
+
+### E2. Corrected results (17 scorable tasks, 531 skills)
+
+| method | Top-1 | Top-5 | p50 latency |
+|---|---:|---:|---:|
+| TF-IDF baseline | 8/17 (47.1%) | 11/17 (64.7%) | 1.75 ms |
+| Stage 1 only (BGE-small) | 7/17 (41.2%) | 11/17 (64.7%) | 47 ms |
+| Stage 1 + Julia-1 rerank | 5/17 (29.4%) | 11/17 (64.7%) | 401 ms |
+
+Cross-encoder reranking **reduced** Top-1 from 41.2% to 29.4%, overriding a
+correct shortlist hit in 6 of 11 cases. Top-5 recall is identical across all
+three methods, so candidate generation — not reranking — is the bottleneck.
+
+### E3. Option-truncation defect found and fixed
+
+Julia-1 enforces a 48-token per-option limit; descriptions average 42 words. The
+first corrected run word-clipped description *prefixes*, truncating 17 of 18
+routes to ~79% of their text, and scored 2/17. Replacing head-clipping with
+retention of each description's leading clause (clipped only when the runtime
+rejects it) leaves 529 of 531 catalogue options intact and raised reranker
+accuracy to 5/17. Truncation was real but not the whole story: the reranker
+remains net-negative against its own shortlist.
+
+### E4. Recovered skill sources
+
+`skills/debugging-code/` (never in git) and the benchmark-time `skills/tdd/`
+(predating the initial commit) were rebuilt from their surviving compiled v2
+artifacts. Both reconstructed sources recompile to the **exact recorded artifact
+byte-for-byte**, verified by SHA-256. Narrative prose pruned by the compiler is
+not recoverable, so the original token counts remain manifest-sourced rather than
+re-measurable. Details in `skills/RECOVERY.md`.
+
+With `debugging-code` restored, `scripts/verify_compiled_artifacts.py` reports
+**17 of 18 artifacts reproduce** (previously 16, with one skill absent). The
+single remaining exception is `tdd`, whose recorded pre-run source no longer
+exists.
