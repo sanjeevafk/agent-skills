@@ -223,3 +223,53 @@ cannot keep it. The headline "add a reranker" reflex is not merely unhelpful her
 
 Reproduce: `uv run python scripts/union_shortlist_experiment.py`
 (`--no-rerank` for the retrieval-only view; no API calls, no judge).
+## Direct choice: no retrieval at all (the decisive experiment)
+
+Every arm above *retrieves first*. The macro benchmark (§8.1–§8.5) runs under
+oracle skill binding, so the case that actually matters operationally — no
+retrieval, model picks from the whole catalogue — had never been measured.
+
+`scripts/direct_choice_experiment.py` puts all 522 routable skills (name +
+15-word description each, ~17k tokens) in one prompt and asks the model to name
+the single most relevant skill. One forward pass, no vector store.
+
+| method | top-1 |
+|---|---:|
+| **direct choice (full catalogue, one pass)** | **14/17** |
+| union shortlist oracle ceiling | 14/17 |
+| keyword TF-IDF (no model) | 8/17 |
+| dense BGE-small (no decision model) | 7/17 |
+| dense + Julia-1 rerank | 5/17 |
+
+**Direct choice matches the union oracle ceiling and beats every retrieval
+pipeline by 6–9 tasks.** Per-run accuracy is 38/51 (74.5%); 14 of 17 tasks are
+solved at least once, 11 of them in all three runs.
+
+This inverts the section's conclusion. Retrieval was never the useful part. The
+catalogue fits in context, so a single capable pass over it beats a shortlist
+plus a reranker by a wide margin — and the reranker, which we spent this section
+trying to fix, is the component making things worst.
+
+Cost of that pass: 18,251 input tokens and ~20s median latency per call. The
+input is highly cacheable across calls, but it is not free, and it grows linearly
+with catalogue size — this scales to ~522 skills, not to 5,000.
+
+### Caveats we must carry into the manuscript
+
+1. **Different generator.** This ran on `gemini-3.7-flash-high` (agy), not the
+   `qwen3.7-flash` used for the macro benchmark and §8.7. OpenRouter credits
+   were exhausted, so the model could not be held constant. A stronger model may
+   partly explain the gap, and the comparison against §8.7's 5/17 is therefore
+   not model-matched.
+2. **Per-run variance.** 74.5% per run vs 14/17 tasks-ever-solved. The
+   "14/17" is tasks solved at least once, which is the more favourable framing;
+   38/51 is the per-run figure.
+3. **Two of the three misses are debatable gold labels.** For
+   `sre-node-leak-ieee` the model chose `diagnosing-bugs` over
+   `systematic-debugging`; for `sre-p99-regression-ieee` it chose
+   `performance-optimization` over `performance-profiler`. Both picks are
+   semantically defensible, so the measured ceiling may be understated by
+   roughly 2 tasks depending on whether near-miss labels count.
+4. **Catalogue size.** At 522 skills the whole catalogue costs ~18k tokens.
+   This result does not extrapolate to much larger catalogues, and the paper
+   should not claim it does.

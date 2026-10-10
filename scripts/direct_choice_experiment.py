@@ -117,6 +117,54 @@ def extract_choice(text: str, valid: set[str]) -> tuple[str | None, str]:
     return None, raw
 
 
+def parse_agy_json(stream: str) -> tuple[dict | None, str]:
+    """Extract response text and token usage from agy's --output-format json."""
+    try:
+        data = json.loads((stream or "").strip())
+    except json.JSONDecodeError:
+        return None, ""
+    u = data.get("usage") or {}
+    usage = {
+        "input": u.get("input_tokens"),
+        "output": u.get("output_tokens"),
+        "reasoning": u.get("thinking_tokens"),
+        "cache_read": u.get("cache_read_tokens"),
+        "cost": None,  # agy does not report cost per call
+    }
+    return usage, (data.get("response") or "").strip()
+
+
+def run_agy(prompt: str, model: str, timeout: int, retries: int = 2) -> dict:
+    """Generate via the agy CLI (Antigravity), which bills independently of OpenRouter."""
+    cmd = ["agy", "--dangerously-skip-permissions", "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    cmd += ["-p", prompt]
+    result = None
+    for attempt in range(retries + 1):
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            rc, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired:
+            rc, out, err = 124, "", f"TIMEOUT after {timeout}s"
+        except Exception as exc:  # noqa: BLE001
+            rc, out, err = 1, "", f"Exception: {exc}"
+        elapsed = time.perf_counter() - start
+
+        usage, text = parse_agy_json(out)
+        result = {
+            "rc": rc, "output": text, "usage": usage,
+            "latency_s": round(elapsed, 2), "attempts": attempt + 1,
+            "stderr": err[-300:],
+        }
+        if rc == 0 and text.strip():
+            return result
+        if attempt < retries:
+            time.sleep(5 * (attempt + 1))
+    return result
+
+
 def parse_opencode_json(stream: str) -> tuple[dict | None, str]:
     """Extract final text and real token usage from the NDJSON event stream."""
     usage, chunks = None, []
@@ -180,12 +228,20 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="full_catalogue",
                     help="comma-separated: full_catalogue,union_reranked")
-    ap.add_argument("--model", default="openrouter/qwen/qwen3.7-flash")
+    ap.add_argument("--backend", choices=["agy", "opencode"], default="agy",
+                    help="agy bills independently of OpenRouter; opencode needs credits")
+    ap.add_argument("--model", default=None,
+                    help="default: gemini-3.7-flash-high (agy) / openrouter/qwen/qwen3.7-flash (opencode)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", type=pathlib.Path, default=OUT_FILE)
     args = ap.parse_args()
+
+    if args.model is None:
+        args.model = ("gemini-3.7-flash-high" if args.backend == "agy"
+                      else "openrouter/qwen/qwen3.7-flash")
+    runner = run_agy if args.backend == "agy" else run_opencode
 
     from benchmark_router import GOLD_OVERRIDES
 
@@ -198,7 +254,8 @@ def main() -> int:
     menu = build_menu(index)
     est_tokens = len(menu) // 4
     print(f"catalogue: {len(index)} routable skills | menu ~{est_tokens:,} tokens (cap {DESC_WORDS} words/desc)")
-    print(f"tasks    : {len(tasks)} (freebie excluded) | model: {args.model}")
+    print(f"tasks    : {len(tasks)} (freebie excluded)")
+    print(f"backend  : {args.backend} | model: {args.model}")
     print(f"arms     : {args.arms} | runs/cell: {args.runs}\n")
 
     if args.dry_run:
@@ -230,7 +287,7 @@ def main() -> int:
 
             picks = []
             for run_idx in range(1, args.runs + 1):
-                res = run_opencode(prompt, args.model, args.timeout)
+                res = runner(prompt, args.model, args.timeout)
                 name, raw = extract_choice(res["output"], valid)
                 cost = (res.get("usage") or {}).get("cost") or 0.0
                 total_cost += cost
@@ -264,7 +321,8 @@ def main() -> int:
     payload = {
         "metadata": {
             "experiment": "direct choice: no retrieval, model picks from full catalogue",
-            "arms": arms, "model": args.model, "runs_per_cell": args.runs,
+            "arms": arms, "backend": args.backend, "model": args.model,
+            "runs_per_cell": args.runs,
             "catalogue": len(index), "desc_word_cap": DESC_WORDS,
             "menu_estimated_tokens": est_tokens,
             "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

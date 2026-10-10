@@ -502,3 +502,54 @@ class TestUnionShortlist:
         s = data["summary"]
         assert s["tfidf_top1"] >= s["dense_top1"]
         assert s["tfidf_top1"] >= s["union_lexfirst_top1"]
+
+
+class TestDirectChoice:
+    """benchmarks/direct_choice_results.json — no-retrieval baseline.
+
+    Every §8.7 arm retrieves before choosing. The macro benchmark runs under
+    oracle skill binding, so the no-retrieval case was unmeasured until this.
+    """
+
+    @staticmethod
+    def _runs():
+        data = _load("direct_choice_results.json")
+        return data["runs"], data["metadata"]
+
+    def test_direct_choice_matches_union_oracle_ceiling(self):
+        """The headline: no-retrieval reaches what the best pipeline could."""
+        runs, _ = self._runs()
+        union = _load("union_shortlist_results.json")["summary"]
+        solved = len({r["task_id"] for r in runs if r["match"]})
+        assert solved == union["oracle_ceiling"], (
+            f"direct choice solved {solved}, union oracle ceiling "
+            f"{union['oracle_ceiling']}"
+        )
+
+    def test_direct_choice_beats_every_retrieval_arm(self):
+        runs, _ = self._runs()
+        level1 = _load("router_level1_results.json")["task_runs"]
+        scored = [r for r in level1 if not r["freebie"]]
+        solved = len({r["task_id"] for r in runs if r["match"]})
+        best_retrieval = max(
+            sum(1 for r in scored if r["tfidf_top1_match"]),
+            sum(1 for r in scored if r["two_stage_top1_match"]),
+        )
+        assert solved > best_retrieval, (
+            f"direct choice {solved} must beat best retrieval arm {best_retrieval}"
+        )
+
+    def test_full_catalogue_prompt_is_recorded(self):
+        """The menu size bounds how far this generalises."""
+        _, meta = self._runs()
+        assert meta["catalogue"] > 500
+        assert meta["menu_estimated_tokens"] > 10_000, (
+            "catalogue menu should be recorded in tokens for the scaling caveat"
+        )
+
+    def test_generator_is_recorded_as_a_caveat(self):
+        """This ran on agy/gemini, not the macro generator; must stay visible."""
+        _, meta = self._runs()
+        assert meta["model"] != "openrouter/qwen/qwen3.7-flash", (
+            "if the generator changed, update the comparison caveat"
+        )
