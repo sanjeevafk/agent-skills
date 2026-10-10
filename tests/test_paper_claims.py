@@ -455,3 +455,50 @@ def _require_router_cache() -> None:
     for rel in ("skills_embeddings.npy", "skills_manifest.json", "skills_canonical.json"):
         if not (REPO / rel).exists():
             pytest.skip(f"router cache not built ({rel} missing); run scripts/build_index.py")
+
+
+class TestUnionShortlist:
+    """benchmarks/union_shortlist_results.json — §8.7 union-shortlist follow-up.
+
+    The lexical and dense retrievers agree on few top-1 answers but reach equal
+    recall, so a union of their shortlists should recall more. It does: 11/17 to
+    14/17. But the reranker then discards most of that gain.
+    """
+
+    def test_union_shortlist_lifts_recall(self):
+        data = _load("union_shortlist_results.json")
+        s = data["summary"]
+        assert s["recall_at_k"]["union"] > s["recall_at_k"]["tfidf"], (
+            "union shortlist must beat lexical recall"
+        )
+        assert s["recall_at_k"]["union"] > s["recall_at_k"]["dense"], (
+            "union shortlist must beat dense recall"
+        )
+
+    def test_union_costs_few_extra_candidates(self):
+        """Recall lift must not come from brute-force widening of the shortlist."""
+        data = _load("union_shortlist_results.json")
+        s = data["summary"]
+        assert s["mean_union_size"] < 2 * s["k_per_retriever"], (
+            f"union too wide: {s['mean_union_size']} vs {2 * s['k_per_retriever']}"
+        )
+
+    def test_reranker_loses_union_recall(self):
+        """The headline: Julia-1 realises far less than the union ceiling."""
+        data = _load("union_shortlist_results.json")
+        s = data["summary"]
+        if not data["metadata"]["rerank_enabled"]:
+            pytest.skip("rerank disabled in recorded run")
+        assert s["rerank_top1"] < s["oracle_ceiling"], (
+            "reranker is expected to underperform the oracle ceiling here"
+        )
+        assert s["rerank_recall_lost"] > 0, (
+            "reranker should lose at least some union recall on these queries"
+        )
+
+    def test_lexical_top1_remains_the_best_simple_ranker(self):
+        """With no reranker, lexical alone beats dense and union lex-first."""
+        data = _load("union_shortlist_results.json")
+        s = data["summary"]
+        assert s["tfidf_top1"] >= s["dense_top1"]
+        assert s["tfidf_top1"] >= s["union_lexfirst_top1"]

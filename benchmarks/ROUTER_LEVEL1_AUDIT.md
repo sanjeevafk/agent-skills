@@ -188,3 +188,38 @@ run, so we did not attempt it.
    shortlist would surface the gold skill in considerably more than 11 cases.
 4. **Julia-1 routing remains available** as a baseline for a held-out study with
    ~200 non-benchmark queries, once the catalogue is de-duplicated.
+## Union shortlist follow-up: the bottleneck is reranking, not retrieval
+
+The two retrievers agree on only 4 of 17 top-1 answers (lexical wins 8, dense
+wins 7, shared 4) yet reach identical recall (11/17). That pattern says they
+fail on different tasks, so a **union shortlist** should recall more than either.
+It does:
+
+| shortlist | recall@5 | mean size |
+|---|---:|---:|
+| lexical top-5 | 11/17 | 5 |
+| dense top-5 | 11/17 | 5 |
+| **union (lex-first, deduped)** | **14/17** | **9.06** |
+
+Recall rises by 3 tasks for only ~4 extra candidates. Widening to k=10 or k=15
+per retriever buys nothing more at k=10 (14/17) and one task at k=15 (15/17) for
+27 candidates, so k=5 is the operating point.
+
+The follow-up question is whether the reranker realises that gain. It does not:
+
+| method | top-1 |
+|---|---:|
+| lexical only | 8/17 |
+| dense only | 7/17 |
+| union, lex-first | 8/17 |
+| union + Julia-1 rerank | **5/17** |
+| **oracle ceiling over union** | **14/17** |
+
+**Julia-1 loses 9 of the 14 recoverable tasks.** In 9 cases the gold skill was in
+the union shortlist and the reranker overrode it. This localises the bottleneck
+precisely: retrieval can surface the right skill; the reranker as configured
+cannot keep it. The headline "add a reranker" reflex is not merely unhelpful here
+— with the current Stage 2 it is actively destructive.
+
+Reproduce: `uv run python scripts/union_shortlist_experiment.py`
+(`--no-rerank` for the retrieval-only view; no API calls, no judge).

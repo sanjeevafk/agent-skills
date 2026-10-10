@@ -227,3 +227,24 @@ direction. The dominant residual failure (`e2e-testing` vs `playwright`,
 cosine 0.87) is a genuine semantic near-duplicate that a 0.95 threshold
 correctly leaves alone; separating it needs a task-level notion of
 interchangeability we have not established.
+
+## G. Union shortlist follow-up (2026-10-10)
+
+Follow-up to §8.7, testing whether the two retrievers' complementary failures can
+be combined. `scripts/union_shortlist_experiment.py` (no API calls, no judge):
+
+| shortlist | recall@5 | top-1 |
+|---|---:|---:|
+| lexical top-5 | 11/17 | 8/17 |
+| dense top-5 | 11/17 | 7/17 |
+| union (lex-first, deduped, mean size 9.06) | **14/17** | 8/17 |
+| union + Julia-1 rerank | 14/17 | **5/17** |
+| oracle ceiling over union | 14/17 | 14/17 |
+
+Recall lifts from 11/17 to 14/17 for ~4 extra candidates (k=5 each is the
+operating point; k=10 adds nothing, k=15 buys one task for 27 candidates). But
+the reranker overrides a correct shortlist hit 9 times, losing 9 of the 14
+recoverable tasks. This localises the bottleneck to Stage 2: retrieval surfaces
+the right skill; the reranker cannot retain it. Added as §8.7-D, with Finding 6
+updated to reflect that reranking is a net loss at every measured operating
+point.
