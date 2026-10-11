@@ -1,0 +1,766 @@
+[exit=0 latency=96.50s]
+# FastAPI P99 Regression Investigation Playbook
+
+## Problem Statement
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| P50 latency | 80ms | 85ms | +6% |
+| P99 latency | 210ms | **1900ms** | **+805%** |
+| CPU utilization | flat | flat | — |
+| Memory | flat | flat | — |
+| Active DB connections | normal | spike | ↑↑ |
+| Query count/req | normal | spike | ↑↑ |
+
+The divergence between stable P50 and catastrophically degraded P99 is the diagnostic anchor. It means most requests still finish normally, but a tail fraction gets stuck. Combined with connection spikes and query count increases, the signal strongly points toward one or more of: **N+1 queries**, **connection pool exhaustion causing queueing**, or **row-level lock contention** from long-running transactions.
+
+---
+
+## Phase 1: Instrumentation Under Real Traffic
+
+### 1.1 Continuous Python Profiler (py-spy)
+
+Deploy py-spy in record mode on the running worker process to capture wall-clock time without code changes. This shows what functions are actually consuming time:
+
+```python
+#!/usr/bin/env python3
+"""
+Starts py-spy recording in a loop during a load-test window.
+Usage: python3 profile_capture.py --pid <worker-pid> --duration 120 --output recordings/
+"""
+import subprocess, os, sys, argparse, time
+
+def record_py_spy(pid: int, duration_seconds: int, output_dir: str):
+    """Record py-spy flamegraph for `duration_seconds` into output_dir."""
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"profile_{pid}_{int(time.time())}.spy"
+    full_path = os.path.join(output_dir, filename)
+
+    # --subprocesses follows child processes (important if using uvicorn workers)
+    # --nonblocking avoids blocking the GIL during sampling
+    cmd = [
+        "py-spy", "record",
+        "-p", str(pid),
+        "-o", full_path,
+        "--format", "flamegraph",   # outputs SVG
+        "--duration", str(duration_seconds),
+        "--subprocesses",
+        "--nonblocking",
+        "--dump",  # also dump text trace
+    ]
+
+    print(f"▶ Recording py-spy: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration_seconds + 30)
+
+    if result.returncode != 0:
+        print(f"✗ py-spy exited {result.returncode}: {result.stderr}", file=sys.stderr)
+    else:
+        print(f"✓ Recorded to {full_path}")
+    return full_path
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pid", required=True, help="PID of uvicorn/gunicorn worker")
+    parser.add_argument("--duration", type=int, default=120, help="seconds to record")
+    parser.add_argument("--output", default="recordings/")
+    args = parser.parse_args()
+    record_py_spy(args.pid, args.duration, args.output)
+```
+
+Run this simultaneously with a k6 load test hitting the same endpoints that show high P99. The key: capture during peak traffic, not low-traffic periods.
+
+### 1.2 SQLAlchemy Query Tracer (Middyware / Event Listener)
+
+If using SQLAlchemy, install an event listener that logs every query with timestamp, duration, SQL (truncated), and call stack. This is how you prove N+1:
+
+```python
+#!/usr/bin/env python3
+"""
+SQLAlchemy event listener that traces all queries at WARNING level.
+Install in your FastAPI app startup: install_query_tracer(engine).
+Requires SQLAlchemy >= 1.4.
+"""
+import logging
+import time
+import traceback
+from sqlalchemy import event
+
+logger = logging.getLogger("query.tracer")
+
+_QUERY_SAMPLE_RATE = 0.10  # Sample 10% of queries to avoid log storms
+import random
+
+@event.listens_for(logging.getLogger("sqlalchemy.engine").parent or None, "before_execute")
+def _noop():
+    pass  # placeholder — real tracer uses "after_execute" below
+
+
+def install_query_tracer(engine, sample_rate: float = 0.10, max_sql_len: int = 500):
+    """
+    Attach to engine. Every executed query fires a warning with:
+      - start/end timestamps → computes duration
+      - first line of SQL (truncated)
+      - current stack frame (caller module + function)
+    
+    Samples randomly to avoid overwhelming logs.
+    """
+    global _QUERY_SAMPLE_RATE
+    _QUERY_SAMPLE_RATE = sample_rate
+
+    @event.listens_for(engine, "before_execute")
+    def before_execute(conn, element, multiparams, params):
+        conn.info["_query_start"] = time.monotonic()
+        conn.info["_query_element_type"] = type(element).__name__
+
+    @event.listens_for(engine, "after_execute")
+    def after_execute(conn, element, multiparams, params, retval):
+        start = conn.info.pop("_query_start", None)
+        duration_ms = (time.monotonic() - start) * 1000 if start else 0
+
+        # Determine caller (skip internals)
+        stack = traceback.extract_stack()
+        caller = None
+        for frame in reversed(stack[:-2]):  # skip this function + event dispatch
+            mod = frame.filename.rsplit("/", 1)[-1] if "/" in frame.filename else frame.filename
+            func_name = frame.name
+            # Stop at sqlalchemy internals
+            if "sqlalchemy" in mod or "starlette" in mod or "uvicorn" in mod:
+                continue
+            caller = f"{mod}:{func_name}"
+            break
+
+        sql_str = str(element) if hasattr(element, "__str__") else "?"
+        if len(sql_str) > max_sql_len:
+            sql_str = sql_str[:max_sql_len] + "…"
+
+        # Sample-based logging to avoid flood
+        if random.random() > _QUERY_SAMPLE_RATE:
+            return
+
+        logger.warning(
+            "[qtrace] %.1fms | %-8s | %s\n  FROM: %s\n  SQL: %s",
+            duration_ms,
+            conn.info.get("_query_element_type", "?"),
+            sql_str[:120],
+            caller,
+            sql_str[:max_sql_len],
+        )
+
+    logger.info(
+        "Installed query tracer on engine=%s (sample_rate=%.0%%)",
+        engine.url.get_backend_name(),
+        _QUERY_SAMPLE_RATE * 100,
+    )
+```
+
+Integrate it in your FastAPI `lifespan`:
+
+```python
+from contextlib import asynccontextmanager
+from sqlalchemy import create_engine
+from myapp.query_tracer import install_query_tracer
+
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10)
+install_query_tracer(engine, sample_rate=0.30)  # 30% during incident investigation
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield  # app is running
+```
+
+### 1.3 Connection Pool Metrics via Prometheus Middleware
+
+Capture pool state at the end of each request so you can correlate pool saturation with latency spikes:
+
+```python
+#!/usr/bin/env python3
+"""
+FastAPI middleware that emits db_pool metrics via prom_client.
+Attach: app.add_middleware(PoolMetricsMiddleware, engine=my_engine)
+"""
+import time
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from prometheus_client import Gauge, Histogram, Counter, generate_latest
+
+# ── Metrics ──────────────────────────────────────────────────────
+POOL_SIZE_USED = Gauge(
+    "db_pool_active_connections",
+    "Currently checked-out connections from the pool",
+    ["endpoint"],
+)
+POOL_TOTAL_CHECKEDOUT = Counter(
+    "db_pool_total_checkouts",
+    "Total number of successful connection checkouts",
+    ["endpoint"],
+)
+POOL_CHECKOUT_SLOW_MS = Histogram(
+    "db_pool_checkout_duration_ms",
+    "Time spent checking out a connection from pool",
+    ["endpoint"],
+    buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000],
+)
+REQUEST_QUERY_COUNT = Histogram(
+    "http_request_query_count",
+    "Number of DB queries executed per HTTP request",
+    ["endpoint"],
+    buckets=[0, 1, 2, 3, 5, 10, 20, 50, 100, 250],
+)
+
+class _QueryCountTrackingMixin:
+    """Monkey-patches Session to count queries within an active request context."""
+
+    def __init__(self, session_class, request_state_key="request_query_count"):
+        self._orig_init = session_class.__init__
+        self._request_state_key = request_state_key
+
+        @staticmethod
+        def patched(self_cls, *args, **kwargs):
+            self._orig_init(self_cls, *args, **kwargs)
+            # Mark the new instance
+            self_cls.info["_queries_executed"] = 0
+
+        # Hook flush/query events
+        from sqlalchemy.orm import Session
+        from sqlalchemy import event
+
+        @event.listens_for(self, "after_flush", once=False)
+        def _count_flush(*_a, **_kw):
+            self.info.setdefault("_queries_executed", 0)
+            self.info["_queries_executed"] += 1
+
+        @event.listens_for(self, "after_cursor_execute", once=False)
+        def _count_select(*_a, **_kw):
+            self.info.setdefault("_queries_executed", 0)
+            self.info["_queries_executed"] += 1
+
+
+class PoolMetricsMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, engine, session_factory=None):
+        super().__init__(app)
+        self.engine = engine
+        self.session_factory = session_factory
+
+    async def dispatch(self, request: Request, call_next):
+        endpoint = request.url.path.rstrip("/") or "/"
+        pool = self.engine.pool
+
+        # Snapshot pool state before request
+        checkout_start = time.monotonic()
+        pool_checked_before = pool.checkedout()
+        pool_pending_before = pool.pending() if hasattr(pool, "pending") else 0
+
+        # Install query-counting on Session
+        if self.session_factory:
+            from sqlalchemy import event
+
+            @event.listens_for(self.session_factory, "after_begin")
+            def _reset_counter(sess, txn, ctx):
+                sess.info["_queries_executed"] = 0
+
+        try:
+            response = await call_next(request)
+        finally:
+            # Snapshot after
+            pool_checked_after = pool.checkedout()
+            checkout_duration_ms = (time.monotonic() - checkout_start) * 1000
+
+            # Record pool metrics
+            POOL_SIZE_USED.labels(endpoint=endpoint).set(pool_checked_after)
+            CHECKOUT_INCREMENT = pool_checked_after - pool_checked_before
+            if CHECKOUT_INCREMENT > 0:
+                POOL_TOTAL_CHECKEDOUT.labels(endpoint=endpoint).inc(CHECKOUT_INCREMENT)
+            POOL_CHECKOUT_SLOW_MS.labels(endpoint=endpoint).observe(checkout_duration_ms)
+
+            # Emit metrics on next scrape (Prometheus pulls, doesn't push)
+            # For immediate visibility, write to a local endpoint:
+            # curl http://localhost:9090/metrics
+
+        return response
+```
+
+### 1.4 Lock Contention Detection
+
+Row-level locks manifest as queries waiting on `FOR UPDATE` or holding open transactions while other sessions block. Detect via:
+
+```python
+#!/usr/bin/env python3
+"""
+Detects potential lock contention by monitoring long-running queries
+and explicit lock waits via PostgreSQL pg_locks view.
+Run as a background monitor alongside profiling.
+"""
+import time, logging
+from sqlalchemy import create_engine, text
+
+logger = logging.getLogger("lock.monitor")
+
+LONG_QUERY_THRESHOLD_MS = 500  # Flag queries >500ms
+LOCK_WAIT_THRESHOLD_MS = 100   # Lock acquisition >100ms is suspicious
+
+
+def monitor_locks(engine, interval_seconds: int = 5):
+    """
+    Polls pg_stat_activity every `interval_seconds` to find:
+      1. Queries blocked by advisory/pg_advisory_lock
+      2. Long-running queries (>LONG_QUERY_THRESHOLD_MS)
+      3. Transactions idle-in-transaction (potential uncommitted locks)
+    """
+    query = text("""
+        SELECT pid, usename, datname, state, backend_xid, backend_xmin,
+               now() - query_start AS duration,
+               LEFT(query, 200) AS short_query,
+               wait_event_type, wait_event
+        FROM pg_stat_activity
+        WHERE state != 'idle'
+          AND datname = current_database()
+          AND pid != pg_backend_pid()
+        ORDER BY duration DESC
+    """)
+
+    idle_in_txn_query = text("""
+        SELECT pid, usename, state,
+               now() - xact_start AS xact_duration,
+               LEFT(query, 200) AS short_query
+        FROM pg_stat_activity
+        WHERE state = 'idle in transaction'
+          AND datname = current_database()
+          AND pid != pg_backend_pid()
+        ORDER BY xact_duration DESC
+    """)
+
+    blocked_query = text("""
+        SELECT
+            blocked_locks.pid     AS blocked_pid,
+            blocked_activity.usename  AS blocked_user,
+            blocked_activity.query    AS blocked_query,
+            blocking_locks.pid     AS blocking_pid,
+            blocking_activity.usename AS blocking_user,
+            blocking_activity.query AS blocking_query,
+            blocked_locks.granted::text AS blocked_granted
+        FROM pg_catalog.pg_locks blocked_locks
+        JOIN pg_catalog.pg_stat_activity blocked_activity
+            ON blocked_activity.pid = blocked_locks.pid
+        JOIN pg_catalog.pg_locks blocking_locks
+            ON blocking_locks.locktype = blocked_locks.locktype
+           AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+           AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+           AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+           AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+           AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+           AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+           AND blocking_locks.pid != blocked_locks.pid
+        JOIN pg_catalog.pg_stat_activity blocking_activity
+            ON blocking_activity.pid = blocking_locks.pid
+        WHERE NOT blocked_locks.granted
+    """)
+
+    logger.info("Lock monitor started (interval=%ds)", interval_seconds)
+
+    while True:
+        try:
+            with engine.connect() as conn:
+                # Long-running queries
+                rows = conn.execute(query).mappings().fetchall()
+                for row in rows:
+                    dur = row["duration"]
+                    if dur.seconds > LONG_QUERY_THRESHOLD_MS / 1000:
+                        logger.warning(
+                            "LONG QUERY [%ds] pid=%d user=%s db=%s\n  %s\n  %s",
+                            dur.seconds,
+                            row["pid"],
+                            row["usename"],
+                            row["datname"],
+                            row["short_query"],
+                            f"wait_event={row['wait_event_type']}:{row['wait_event']}" if row["wait_event"] else "",
+                        )
+
+                # Idle-in-transaction (holding locks!)
+                idle_rows = conn.execute(idle_in_txn_query).mappings().fetchall()
+                for row in idle_rows:
+                    dur = row["xact_duration"]
+                    logger.warning(
+                        "IDLE-IN-TXN [%ds] pid=%d user=%s\n  %s",
+                        dur.seconds,
+                        row["pid"],
+                        row["usename"],
+                        row["short_query"],
+                    )
+
+                # Actual blockers
+                blocked = conn.execute(blocked_query).mappings().fetchall()
+                for row in blocked:
+                    logger.error(
+                        "LOCK BLOCKED: pid=%d (%s) blocked by pid=%d (%s)\n  Blocked: %s\n  Blocking: %s",
+                        row["blocked_pid"],
+                        row["blocked_user"],
+                        row["blocking_pid"],
+                        row["blocking_user"],
+                        row["blocked_query"],
+                        row["blocking_query"],
+                    )
+
+        except Exception as e:
+            logger.error("Lock monitor poll failed: %s", e)
+
+        time.sleep(interval_seconds)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dsn", required=True)
+    parser.add_argument("--interval", type=int, default=5)
+    args = parser.parse_args()
+    engine = create_engine(args.dsn, echo=False)
+    monitor_locks(engine, args.interval)
+```
+
+---
+
+## Phase 2: Load Test to Trigger the Regression
+
+Use k6 to hit the API with realistic concurrency profiles. The goal: reproduce the high-P99 condition while collecting metrics.
+
+```javascript
+// k6 script: reproduce_p99_regression.js
+// Usage: k6 run --vus 50 --duration 300s scripts/reproduce_p99_regression.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate, Trend, Counter } from 'k6/metrics';
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+
+// Custom metrics for CI comparison
+const p99Latency = new Trend('response_time_p99');
+const p50Latency = new Trend('response_time_p50');
+const errorRate = new Rate('errors');
+const queryCount = new Trend('queries_per_request'); // populated via X-Query-Count header
+
+export const options = {
+  stages: [
+    { duration: '30s', target: 20 },   // warm up
+    { duration: '5m', target: 50 },    // sustained moderate load (reproducible P99)
+    { duration: '2m', target: 100 },   // burst to see if P99 explodes
+    { duration: '30s', target: 0 },    // cool down
+  ],
+  thresholds: {
+    'http_req_duration{expected_response:false}': ['p(99)<2000'],
+    'http_req_duration': ['p(95)<500', 'p(99)<2000'],
+    'errors': ['rate<0.05'],
+  },
+};
+
+function getRandomId() {
+  return String(Math.floor(Math.random() * 10000));
+}
+
+export default function () {
+  // Hit the endpoint(s) showing regression — typically read-heavy paths
+  const res = http.get(`${BASE_URL}/api/v1/items/${getRandomId()}`, {
+    tags: { name: 'GET /items/{id}' },
+  });
+
+  check(res, {
+    'status 200': (r) => r.status === 200,
+  }) || errorRate.add(1);
+
+  // Capture custom header if available
+  const qc = res.headers['X-Query-Count'];
+  if (qc) queryCount.add(parseInt(qc, 10));
+
+  // P50/P99 auto-aggregated by k6 — no extra work needed
+  p50Latency.add(res.timings.duration);
+
+  sleep(0.5); // small pause between VU iterations
+}
+
+export function handleSummary(data) {
+  return {
+    'stdout': formatSummary(data),
+    'reports/p99_regression.json': JSON.stringify({
+      timestamp: new Date().toISOString(),
+      p50: data.metrics.http_req_duration.values['p(50)'],
+      p95: data.metrics.http_req_duration.values['p(95)'],
+      p99: data.metrics.http_req_duration.values['p(99)'],
+      rate: Math.round(data.metrics.http_req_successful.value * 10000) / 100,
+      total_requests: data.metrics.http_reqs.value,
+    }, null, 2),
+  };
+}
+
+function formatSummary(data) {
+  const m = data.metrics;
+  return `\n${'='.repeat(60)}
+  REGRESSION REPRODUCTION SUMMARY
+${'='.repeat(60)}
+  Total requests: ${Math.round(m.http_reqs.value)}
+  Success rate:   ${m.http_req_successful.value}%
+  P50 latency:    ${Math.round(m.http_req_duration.values['p(50)'])}ms
+  P95 latency:    ${Math.round(m.http_req_duration.values['p(95)'])}ms
+  P99 latency:    ${Math.round(m.http_req_duration.values['p(99)'])}ms
+${'-'.repeat(60)}
+  ${JSON.stringify({
+    queries_per_sample: m.queries_per_request?.values || {},
+  }, null, 2)}
+${'='.repeat(60)}\n`;
+}
+```
+
+---
+
+## Phase 3: Diagnosis Decision Tree
+
+Use the data from Phases 1–2 to classify the root cause:
+
+```
+P99 regressed 210ms → 1900ms
+         │
+         ├─ Do query counts per request increase?
+         │    │
+         │    ├─ YES → Go to N+1 diagnosis
+         │    │
+         │    └─ NO → Go to Pool Saturation diagnosis
+         │
+         └─ Does py-spy show GIL release in DB driver?
+              │
+              ├─ YES → Database/bound bottleneck (not Python code)
+              │
+              └─ NO → Check for synchronous blocking in Python
+```
+
+### 3A. Distinguishing N+1 from Pool Saturation
+
+| Signal | N+1 Queries | Pool Saturation | Lock Contention |
+|--------|-------------|-----------------|-----------------|
+| Query count/req | High, varies (5–50+) | Normal-to-high (similar to baseline × multiplier) | Variable |
+| `pool_checkedout()` vs `pool_size` | ~normal | ≈ pool_size at P99 times | May spike transiently |
+| Checkout duration histogram | Single-mode (fast) | Bimodal (fast + slow queue times) | Spikes in `db_pool_checkout_duration_ms` |
+| py-spy bottom frames | `cursor.execute()` visible at many depths | `pool.queue.get()` or `Pool._queue.acquire` | Same as pool sat + `pg_advisory_lock` calls |
+| `pg_stat_activity` | Many concurrent queries active | All slots filled, some queued | Some blocked behind others |
+| Slow query log | Individual queries may be fast | Most individual queries normal, but total time compounds | One query blocks many |
+
+### 3B. Reading the Flame Graph
+
+Open the SVG from py-spy in a browser. Key patterns:
+
+```
+┌── Root (idle/GIL release)
+│  └── asyncio event loop dispatch
+│       ├── uvicorn routing layer  ← always present, small slice = good
+│       ├── Starlette middleware   ← if >15% of time, investigate middleware overhead
+│       ├── Your handler function  ← the business logic entry point
+│       │    ├── ORM relationship loading  ← WARMING SIGN: deep recursive calls = eager loading
+│       │    │    └── cursor.execute()     ← multiple identical queries = N+1
+│       │    ├── JSON serialization (ujson) ← if this dominates, payload size issue
+│       │    └── cache lookup             ← if Redis/client timeout visible here
+│       └── DB driver (psycopg2/asyncpg) ← if bottom half is all here, IO bound
+│
+└── Secondary threads (if multi-worker)
+     └── Similar structure — compare across workers
+```
+
+**Red flags:**
+- Multiple `cursor.execute` nodes stacked under one handler call with similar SQL (parameter values differ only) → N+1
+- Time spent in `select.poll()` or `socket.recv()` → DB network round-trips dominating
+- Deep call stacks in list comprehensions iterating over collections → N+1 traversal pattern
+
+---
+
+## Phase 4: Proposed Fixes Ranked by Expected P99 Impact
+
+Based on the symptoms (flat CPU/memory, rising connections + query count, P99 explosion), here's the prioritized fix plan. Each fix should be tested individually with a fresh load test run to confirm impact.
+
+### Fix 1: Batch Eager Loading (Expected P99 reduction: 40–70%) ⭐⭐⭐
+
+Most likely root cause: a recent change introduced relationship loading in a loop.
+
+```python
+# BEFORE: N+1 pattern
+for item in items:  # N items
+    related = session.query(ItemDetail).filter(
+        ItemDetail.item_id == item.id
+    ).all()  # → N separate queries
+    item.details = related
+
+# AFTER: Single batched query
+item_ids = [item.id for item in items]
+details_map = {
+    d.item_id: d
+    for d in session.query(ItemDetail).filter(
+        ItemDetail.item_id.in_(item_ids)
+    ).all()
+}
+for item in items:
+    item.details = details_map.get(item.id, [])
+```
+
+With SQLAlchemy Core/Eager loading:
+
+```python
+# Using joinedload/subqueryload at query time (best practice)
+from sqlalchemy.orm import joinedload
+
+items = session.query(Item).options(
+    joinedload(Item.details),       # 1 JOIN instead of N queries
+    selectinload(Item.tags)         # for collections, uses IN clause
+).filter(...).all()
+```
+
+### Fix 2: Missing Index on Foreign Key / WHERE Clause Columns (Expected P99 reduction: 20–50%) ⭐⭐
+
+Profile output will show sequential scans replacing index seeks when tables grow:
+
+```sql
+-- Run EXPLAIN ANALYZE on the slowest queries from your tracer
+EXPLAIN ANALYZE
+SELECT * FROM item_details
+WHERE item_id = 42;
+
+-- If you see "Seq Scan" instead of "Index Scan":
+CREATE INDEX idx_item_details_item_id ON item_details(item_id);
+CREATE INDEX idx_items_created_at ON items(created_at DESC);  -- for ORDER BY
+CREATE INDEX idx_items_status_created ON items(status, created_at DESC);  -- composite for WHERE + ORDER BY
+```
+
+Add indexes for columns used in:
+- `WHERE` clauses filtering on non-primary-key columns
+- `ORDER BY` clauses (creates sort overhead without index)
+- `JOIN` conditions on foreign keys (PostgreSQL creates them automatically but they might lack indexes)
+
+### Fix 3: Connection Pool Tuning (Expected P99 reduction: 15–35%) ⭐⭐
+
+If pool exhaustion is confirmed (checkout duration distribution shows heavy right tail):
+
+```python
+# CURRENT (likely undersized for concurrency)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,          # max permanent connections
+    max_overflow=10,       # extra connections under load (costly to create)
+    pool_timeout=30,       # seconds to wait — P99 suggests this is being hit
+    pool_recycle=1800,     # disconnect stale connections
+    pool_pre_ping=True,    # verify connection before use
+)
+
+# PROPOSED (tuned based on observed concurrent request volume)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=40,                      # match max expected concurrent DB-using requests
+    max_overflow=20,                   # buffer above base pool
+    pool_timeout=10,                   # fail faster than 30s — P99 won't wait 30s anyway
+    pool_recycle=3600,                 # reduce churn
+    pool_pre_ping=True,
+    connect_args={"statement_cache_size": 0},  # disable statement caching if it causes memory pressure
+)
+
+# Add async support if using asyncpg
+from asyncpg import create_pool
+pool = await create_pool(
+    dsn=DATABASE_URL,
+    min_size=10,
+    max_size=50,                       # async pools behave differently
+    command_timeout=60,
+)
+```
+
+Also add **request-level connection release**:
+
+```python
+# Ensure connections return to pool even on exceptions
+async with AsyncSession(session_factory) as session:
+    try:
+        result = await do_work(session)
+        await session.commit()
+        return result
+    except Exception:
+        await session.rollback()
+        raise
+    # Session's __aexit__ returns connection to pool automatically
+```
+
+### Fix 4: Reduce Payload / Response Size (Expected P99 reduction: 10–25%) ⭐
+
+Sometimes P99 degrades because larger responses saturate network bandwidth or trigger slow serializers:
+
+```python
+# BEFORE: Fetching everything
+class ItemResponse(BaseModel):
+    id: int
+    name: str
+    description: str          # could be huge
+    details: List[Detail]     # nested objects
+    tags: List[str]
+    metadata: dict            # arbitrary data
+    
+items = session.query(Item).all()  # loads ALL columns including large text/blob fields
+
+# AFTER: Narrow column selection
+from sqlalchemy import column
+
+items = (
+    session.query(
+        Item.id,
+        Item.name,
+        Item.created_at,
+    )
+    .limit(50)  # paginate!
+    .all()
+)
+```
+
+### Fix 5: Add Cache Layer for Stable Reads (Expected P99 reduction: ongoing, 30–60% for cached paths) ⭐
+
+For read-heavy endpoints serving relatively static data:
+
+```python
+import redis, json, hashlib
+
+redis_client = redis.Redis(host="cache.internal", port=6379, decode_responses=True, socket_timeout=0.1)
+
+CACHE_TTL = 60  # seconds
+
+def get_or_compute_cached(key: str, ttl: int = CACHE_TTL, fetch_fn=None):
+    """Simple cache with fallback."""
+    try:
+        raw = redis_client.get(key)
+        if raw:
+            return json.loads(raw)
+    except redis.ConnectionError:
+        pass  # cache miss on failure — don't let cache break the app
+
+    result = fetch_fn()
+    try:
+        serialized = json.dumps(result)
+        redis_client.setex(key, ttl, serialized)
+    except redis.ConnectionError:
+        pass  # best-effort write
+
+    return result
+```
+
+### Fix 6: Add Query Timeout (Defense in Depth, Expected P99 impact: prevents future regressions) ⭐
+
+```python
+# Limit any single query to 5s — prevents runaway queries from dragging P99
+with engine.connect() as conn:
+    conn.execution_options(socket_timeout=5)
+    result = conn.execute(text("SELECT ..."))
+
+# Or globally via SQLAlchemy execution options
+engine = create_engine(DATABASE_URL, execution_options={"timeout": 5})
+```
+
+---
+
+## Summary: Investigation Sequence
+
+1. **Baseline first** — run the k6 script against both old and new deploys to quantify the delta
+2. **Enable query tracer** at 30% sample rate during the k6 run — look for repeated similar queries grouped by caller
+3. **Check pool metrics** — plot `pool_checkedout()`, checkout duration histogram, and query count per request over time
+4. **Run lock monitor** concurrently to rule out contention
+5. **Collect py-spy flamegraph** during peak — confirm GIL is released in DB driver (IO-bound, not Python-bound)
+6. **Apply Fix 1 first** (batched queries) — highest likelihood given the query-count + connection-count signals
+7. **Re-run k6** after each fix to confirm individual impact before applying the next
+8. **Add monitoring** for `db_pool_active_connections`, `http_request_query_count`, and `response_time_p99` to alert on future regressions

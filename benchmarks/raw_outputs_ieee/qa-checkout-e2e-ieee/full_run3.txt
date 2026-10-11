@@ -1,0 +1,658 @@
+[exit=0 latency=45.98s]
+# Playwright E2E Suite: 4-Step Checkout Flow
+
+## Architecture Overview
+
+Reducing 15% flake requires eliminating shared mutable state, removing `waitForTimeout`, swapping real API calls for intercepted responses, and isolating worker-level fixtures. Here's the full design.
+
+---
+
+## Project Structure
+
+```
+tests/
+├── e2e/
+│   ├── checkout/
+│   │   ├── cart.spec.ts
+│   │   ├── address.spec.ts
+│   │   ├── payment.spec.ts
+│   │   └── confirmation.spec.ts
+│   └── fixtures.ts              # root fixture override
+├── fixtures/
+│   ├── checkout-fixture.ts       # chained fixture with stubs + isolation
+│   ├── auth-fixture.ts           # storageState-based pre-auth
+│   ├── api-stubs.ts              # deterministic response fixtures
+│   └── orders.json               # JSON seed data
+├── pages/
+│   ├── CartPage.ts
+│   ├── AddressPage.ts
+│   ├── PaymentPage.ts
+│   ├── ConfirmationPage.ts
+│   └── BaseCheckoutPage.ts
+├── playwright.config.ts
+└── tsconfig.json
+```
+
+---
+
+## 1. Playwright Configuration
+
+Key decisions driven by the requirements: **traces and video only on retry**, **8 workers with isolation via project-scoped storageState seeds**, **no networkidle dependency**.
+
+```typescript
+// playwright.config.ts
+import { defineConfig } from '@playwright/test'
+import { ROOT_URL, WORKERS } from './shared/constants'
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  timeout: 60_000,
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+
+  // 8 workers; CI pins to 1-per-shard to avoid resource contention
+  workers: process.env.CI_SHARD
+    ? undefined                       // shard splits workers automatically
+    : (process.env.CI ? 8 : WORKERS),
+
+  reporter: [
+    ['html', { open: 'never', outputFolder: 'playwright-report' }],
+    ['junit', { outputFile: 'playwright-results.xml' }],
+    ['json', { outputFile: 'playwright-results.json' }],
+  ],
+
+  use: {
+    baseURL: ROOT_URL,
+
+    // Only capture traces on first retry — expensive to keep always
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+
+    // Video only retained on failure (first run + retry)
+    video: 'retain-on-failure',
+    videosPath: '.tmp/artifacts/videos',
+
+    // Deterministic timeouts — no arbitrary waitForTimeout needed
+    actionTimeout: 8_000,
+    navigationTimeout: 25_000,
+  },
+
+  projects: [
+    {
+      name: 'checkout',
+      testMatch: /checkout\/.*\.spec\.ts/,
+    },
+  ],
+
+  // Spin up the app once; reuse across workers when not in CI
+  webServer: {
+    command: 'npm run dev',
+    url: ROOT_URL,
+    reuseExistingServer: !process.env.CI,
+    timeout: 90_000,
+  },
+})
+```
+
+### Worker Isolation via `globalSetup`
+
+Each worker gets its own seeded `storageState` file so tests don't share sessions or CSRF tokens.
+
+```typescript
+// global-setup.ts
+import { _electron as electron } from '@playwright/test'
+import * as fs from 'fs'
+import * as path from 'path'
+import type { FullConfig } from '@playwright/test'
+
+export default function globalSetup(config: FullConfig) {
+  const seedsDir = path.join(__dirname, '..', '.tmp', 'seeds')
+  fs.mkdirSync(seedsDir, { recursive: true })
+
+  // Produce one storageState per worker slot (up to 8)
+  const numWorkers = config.workers === 8 ? 8 : 1
+  for (let i = 0; i < numWorkers; i++) {
+    const stateFile = path.join(seedsDir, `worker-${i}.json`)
+
+    // If you already have a valid state from a login flow, clone it:
+    const template = require('./fixtures/auth-fixture').seedState(i)
+    fs.writeFileSync(stateFile, JSON.stringify(template))
+  }
+}
+```
+
+Hooks the seeds into each worker's browser context via a fixture override in `tests/e2e/fixtures.ts` (shown below).
+
+---
+
+## 2. Fixture Hierarchy
+
+Three layers: **auth** → **checkout** → **page objects**. Each extends the previous.
+
+### Layer 1 — Auth Fixture (`storageState` reuse, no per-test login)
+
+```typescript
+// tests/fixtures/auth-fixture.ts
+import { test as base } from '@playwright/test'
+import * as fs from 'fs'
+import * as path from 'path'
+
+// Deterministic seed keyed by worker index
+function getWorkerSeed(workerIndex: number) {
+  const dir = path.join(__dirname, '..', '.tmp', 'seeds')
+  const file = path.join(dir, `worker-${workerIndex % 8}.json`)
+  return JSON.parse(fs.readFileSync(file, 'utf-8'))
+}
+
+// Extend the base fixture with storageState
+export const test = base.extend<{ authContext: ReturnType<typeof base['extend']>() }>({
+  // Inject storageState into every test's browser context
+  context: async ({ }, use) => {
+    // Workers are assigned indices at runtime; we seed round-robin
+    // This call fires inside the fixture chain — use `test.info()` if available
+    const workerIdx = test.info().workerIndex ?? 0
+    const state = getWorkerSeed(workerIdx)
+    await use(state)
+  },
+})
+```
+
+**How it eliminates flake:** The test never hits the login page or waits for form submission. The browser starts with cookies/JWT already baked in, cutting setup time to zero and removing an entire class of race conditions.
+
+### Layer 2 — Checkout Fixture (API stubbing + per-worker data isolation)
+
+```typescript
+// tests/fixtures/checkout-fixture.ts
+import { expect, Request, Response } from '@playwright/test'
+import { test as authTest } from './auth-fixture'
+import { CartStub, AddressStub, PaymentStub, OrderFixture } from './api-stubs'
+
+type CheckoutFixtures = {
+  cartStub: CartStub
+  addressStub: AddressStub
+  paymentStub: PaymentStub
+  orderFixture: OrderFixture
+}
+
+// Each worker gets its own orderId suffix so confirmations are unique
+export const test = authTest.extend<CheckoutFixtures>({
+  cartStub: async ({ page }, use) => {
+    const stub = new CartStub(page)
+    await stub.install()
+    await use(stub)
+    await stub.uninstall()
+  },
+
+  addressStub: async ({ page }, use) => {
+    const stub = new AddressStub(page)
+    await stub.install()
+    await use(stub)
+    await stub.uninstall()
+  },
+
+  paymentStub: async ({ page }, use) => {
+    const stub = new PaymentStub(page)
+    await stub.install()
+    await use(stub)
+    await stub.uninstall()
+  },
+
+  orderFixture: async ({ page, cartStub, addressStub, paymentStub }, use) => {
+    // Generate a unique order reference per-worker
+    const orderId = `ORD-W${process.env.npm_config_worker_index ?? 0}-${Date.now()}`
+    const fixture = new OrderFixture(orderId)
+
+    // Pre-seed stub responses with this order ID
+    cartStub.setOrderTemplate(fixture.cartSnapshot())
+    addressStub.setSuccess(fixture.addressSnapshot())
+    paymentStub.setSuccess(fixture.paymentSnapshot())
+
+    await use(fixture)
+  },
+})
+```
+
+### Layer 3 — Root Override (glues everything together)
+
+```typescript
+// tests/e2e/fixtures.ts
+import { test as base, expect } from './fixtures/checkout-fixture'
+
+export { expect }
+export const test = base
+```
+
+Tests import from `'../fixtures'` — the single-entry-point that chains auth → checkout stubs.
+
+---
+
+## 3. API Stub Fixtures (deterministic interceptors)
+
+These classes install route handlers once at fixture setup time. Every request matching a pattern returns a canned JSON body — no timing variance.
+
+```typescript
+// tests/fixtures/api-stubs.ts
+import { BrowserContext, Route, Request, Response } from '@playwright/test'
+
+export class CartStub {
+  private context: BrowserContext | null = null
+
+  setOrderTemplate(data: Record<string, unknown>) { this._template = data }
+  cartSnapshot(): Record<string, unknown> { return this._template! }
+
+  async install(context: BrowserContext) {
+    this.context = context
+    context.route('**/api/cart/**', async (route: Route) => {
+      if (route.request().method() === 'GET') {
+        return route.fulfill({ json: this._cartResponse })
+      }
+      return route.continue()
+    })
+  }
+
+  async uninstall() { this.context = null }
+  private _template: Record<string, unknown> = {}
+  private _cartResponse: Record<string, unknown> = { items: [], total: 0 }
+}
+
+export class AddressStub {
+  private context: BrowserContext | null = null
+
+  setSuccess(data: Record<string, unknown>) { this._success = data }
+
+  async install(context: BrowserContext) {
+    this.context = context
+    context.route('**/api/shipping/address*', async (route: Route) => {
+      if (route.request().method() === 'POST') {
+        return route.fulfill({ status: 200, json: this._success })
+      }
+      return route.continue()
+    })
+  }
+
+  async uninstall() { this.context = null }
+  private _success: Record<string, unknown> = {}
+}
+
+export class PaymentStub {
+  private context: BrowserContext | null = null
+
+  setSuccess(data: Record<string, unknown>) { this._success = data }
+
+  async install(context: BrowserContext) {
+    this.context = context
+    context.route('**/api/payment/process*', async (route: Route) => {
+      if (route.request().method() === 'POST') {
+        return route.fulfill({ status: 200, json: this._success })
+      }
+      return route.continue()
+    })
+  }
+
+  async uninstall() { this.context = null }
+  private _success: Record<string, unknown> = {}
+}
+
+export class OrderFixture {
+  constructor(readonly id: string) {}
+
+  cartSnapshot() {
+    return {
+      items: [
+        { sku: 'SKU-001', name: 'Widget A', qty: 2, price: 29.99 },
+        { sku: 'SKU-042', name: 'Gadget B', qty: 1, price: 49.99 },
+      ],
+      subtotal: 109.98,
+      shipping: 5.99,
+      tax: 9.20,
+      total: 125.17,
+    }
+  }
+
+  addressSnapshot() {
+    return { street: '123 Main St', city: 'Springfield', zip: '62704', confirmed: true }
+  }
+
+  paymentSnapshot() {
+    return { method: 'visa_****4242', status: 'captured', txnId: `TXN-${this.id}` }
+  }
+
+  confirmationSnapshot() {
+    return { orderId: this.id, status: 'confirmed', estimatedDelivery: '2026-09-01' }
+  }
+}
+```
+
+**Why this kills flake:** No network calls reach the real backend. Every HTTP response is returned in < 1ms with identical bytes across runs. Race conditions from server load, DB replication lag, or rate limits simply cannot occur.
+
+---
+
+## 4. Page Object Model (typed locators, no magic strings)
+
+Base class establishes common assertion patterns; each step-page extends it.
+
+```typescript
+// tests/pages/BaseCheckoutPage.ts
+import { Page, Locator, expect } from '@playwright/test'
+
+export abstract class BaseCheckoutPage {
+  protected readonly page: Page
+
+  // --- Shared elements across all steps ---
+  protected readonly stepperLocator: Locator
+  protected readonly continueButton: Locator
+  protected readonly errorMessage: Locator
+  protected readonly progressBar: Locator
+
+  protected constructor(page: Page) {
+    this.page = page
+    this.stepperLocator   = page.locator('[data-testid="checkout-stepper"]')
+    this.continueButton   = page.locator('[data-testid="btn-continue"]:enabled')
+    this.errorMessage     = page.locator('[data-testid="error-message"]')
+    this.progressBar      = page.locator('[data-testid="progress-bar"]')
+  }
+
+  /** Navigate to this step without waiting on network — callers control timing */
+  abstract goto(stepLabel: string): Promise<void>
+
+  /** Assert current stepper highlights the expected step */
+  assertActiveStep(stepLabel: string) {
+    return expect(this.stepperLocator.locator(`[data-testid="step-${stepLabel}"]`))
+      .toHaveAttribute('data-active', 'true')
+  }
+
+  /** Click Continue using Playwright's built-in auto-wait (enables + visible + stable) */
+  clickContinue() {
+    return this.continueButton.click()
+  }
+
+  /** Assert no toast errors are present */
+  assertNoErrors() {
+    return expect(this.errorMessage).not.toBeVisible()
+  }
+
+  /** Auto-wait for the stepper itself to be actionable before proceeding */
+  waitForStableStepper() {
+    return this.stepperLocator.waitFor({ state: 'visible' })
+  }
+}
+```
+
+Individual step pages follow the same pattern — each has a `goto()`, typed `Locator` fields for inputs/buttons on that screen, and methods like `fillAddress()`, `selectPaymentMethod()`.
+
+Example — **CartPage**:
+
+```typescript
+// tests/pages/CartPage.ts
+import { Page, Locator } from '@playwright/test'
+import { BaseCheckoutPage } from './BaseCheckoutPage'
+
+export class CartPage extends BaseCheckoutPage {
+  readonly itemRows: Locator
+  readonly skuCell: Locator
+  readonly priceCell: Locator
+  readonly subtotalDisplay: Locator
+  readonly removeButton: Locator
+
+  constructor(page: Page) {
+    super(page)
+    this.itemRows        = page.locator('[data-testid="cart-item-row"]')
+    this.skuCell         = page.locator('[data-testid="sku-cell"]')
+    this.priceCell       = page.locator('[data-testid="price-cell"]')
+    this.subtotalDisplay = page.locator('[data-testid="cart-subtotal"]')
+    this.removeButton    = page.locator('[data-testid="btn-remove-item"]')
+  }
+
+  async goto() {
+    await this.page.goto('/checkout/cart')
+    await this.itemRows.first().waitFor({ state: 'attached' })  // DOM presence check, zero ms jitter
+  }
+
+  async getItemCount() {
+    return this.itemRows.count()
+  }
+
+  async removeItem(index: number) {
+    await this.itemRows.nth(index).locator(this.removeButton).click()
+    await this.itemRows.first().waitFor({ state: 'attached' }) // wait for re-render
+  }
+}
+```
+
+Repeat for `AddressPage`, `PaymentPage`, `ConfirmationPage`.
+
+---
+
+## 5. Test Specs (network-idle-free, no `waitForTimeout`)
+
+Every wait strategy uses either **auto-wait locators**, **DOM presence checks**, or **explicit expectation assertions** — nothing relies on arbitrary delays or network load states.
+
+### `cart.spec.ts`
+
+```typescript
+import { test, expect } from '../fixtures'
+import { CartPage } from '../../pages/CartPage'
+
+test.describe('Checkout Step 1 — Cart', () => {
+  let cartPage: CartPage
+
+  test.beforeEach(async ({ page }) => {
+    cartPage = new CartPage(page)
+    await cartPage.goto()
+    await cartPage.waitForStableStepper()
+  })
+
+  test('displays correct items from stubbed cart API', async () => {
+    const count = await cartPage.getItemCount()
+    expect(count).toBe(2)
+
+    const skus = await cartPage.skuCell.allTextContents()
+    expect(skus).toContain('SKU-001')
+    expect(skus).toContain('SKU-042')
+  })
+
+  test('updates subtotal after removing item', async ({ page }) => {
+    await cartPage.removeItem(1) // remove Gadget B
+    expect(await cartPage.getItemCount()).toBe(1)
+    // Subtotal changes instantly because the UI reads from our stub
+    await expect(cartPage.subtotalDisplay).toHaveText(/\$29/)
+  })
+
+  test('navigates to address step when all items present', async ({ page }) => {
+    await cartPage.clickContinue()
+    // Expect DOM transition — Playwright auto-waits for the locator
+    await expect(page.locator('[data-testid="checkout-stepper-step-2"]')).toHaveAttribute('data-active', 'true')
+  })
+})
+```
+
+### `payment.spec.ts`
+
+```typescript
+import { test, expect } from '../fixtures'
+import { PaymentPage } from '../../pages/PaymentPage'
+
+test.describe('Checkout Step 3 — Payment', () => {
+  let paymentPage: PaymentPage
+
+  test.beforeEach(async ({ page }) => {
+    paymentPage = new PaymentPage(page)
+    // Skip straight here — auth + earlier steps handled by storageState + route redirects
+    await page.goto('/checkout/payment')
+    await paymentPage.waitForLoaded()
+  })
+
+  test('renders stubbed payment methods', async () => {
+    const methods = await paymentPage.methodButtons.all()
+    expect(methods.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test('shows error on invalid card number', async ({ page }) => {
+    await paymentPage.enterCardNumber('4111111111111112')  // bad checksum
+    await paymentPage.clickPay()
+    await expect(paymentPage.errorBanner).toBeVisible()
+    await expect(paymentPage.errorBanner).toContainText('card declined')
+  })
+
+  test('redirects to confirmation after successful pay', async ({ page }) => {
+    await paymentPage.enterCardNumber('4111111111111111')
+    await paymentPage.clickPay()
+    // DOM-driven transition — no waitForTimeout anywhere
+    await expect(page.locator('[data-testid="confirmation-header"]')).toBeVisible()
+  })
+})
+```
+
+### `confirmation.spec.ts`
+
+```typescript
+import { test, expect } from '../fixtures'
+import { ConfirmationPage } from '../../pages/ConfirmationPage'
+
+test.describe('Checkout Step 4 — Confirmation', () => {
+  let confirmPage: ConfirmationPage
+
+  test.beforeEach(async ({ page }) => {
+    confirmPage = new ConfirmationPage(page)
+    await page.goto('/checkout/confirmation')
+    await confirmPage.assertHeaderVisible()
+  })
+
+  test('displays generated order ID', async () => {
+    // orderFixture.id is injected from the fixture layer
+    await expect(confirmPage.orderIdBadge).toBeAttached()
+  })
+
+  test('shows payment summary snapshot', async () => {
+    // Stubbed payment data flows through to this page object
+    await expect(confirmPage.paymentMethodCell).toContainText('visa')
+    await expect(confirmPage.txnIdCell).toContainText('TXN-')
+  })
+})
+```
+
+### Parallel-Safe Order IDs
+
+Because `OrderFixture` receives `orderId = ORD-W{workerIndex}-{timestamp}`, two concurrent workers can never collide — each confirmation spec asserts against its own order ID passed through the fixture closure.
+
+---
+
+## 6. Waiting Strategy Summary (the "network-idle-free" requirement)
+
+| Scenario | Old Approach | New Approach |
+|---|---|---|
+| Page loads | `waitForLoadState('networkidle')` | `locator.first().waitFor({ state: 'attached' })` |
+| POST submission | `waitForTimeout(3000)` | `locator.button.click()` (auto-waits enabled) + `expect(locator.nextElement).toBeVisible()` |
+| Form validation error | Manual polling | `expect(errorBanner).toBeVisible()` |
+| Interstitial spinner | `sleep` | `expect(spinner).not.toBeVisible()` |
+| Navigation between steps | `wait for URL change` | `expect(newStepStepper).toHaveAttribute('data-active', 'true')` |
+
+This eliminates every source of non-deterministic waiting.
+
+---
+
+## 7. Artifact Policy (trace + video only on retry)
+
+The config already declares:
+
+```typescript
+trace: 'on-first-retry',    // collected only when retrying, never on pass or first fail
+video: 'retain-on-failure', // captured during run, only kept if the test fails
+```
+
+Combined with `screenshot: 'only-on-failure'`, workers that pass burn zero disk I/O. Retries pick up traces for replay in the HTML report.
+
+Per-test explicit captures (if needed for debugging a particular scenario):
+
+```typescript
+test('specific debug case', async ({ page }) => {
+  // ... actions ...
+  // Only called when you explicitly need extra evidence
+  await page.screenshot({ path: `.tmp/debug/${test.info().title}.png` })
+})
+```
+
+---
+
+## 8. Quarantine Policy for Flaky Specs
+
+When a test consistently flakes (>2 failures over 10 runs), escalate through three tiers:
+
+### Tier 1 — Diagnostic (flag & reproduce)
+
+```bash
+# Run suspect test 10 times with full retries — surface the instability
+npx playwright test tests/e2e/checkout/payment.spec.ts --repeat-each=10 --retries=3
+```
+
+Capture results in `benchmarks/flakiness/YYYY-MM-DD-payment.log` and attach to a tracking issue.
+
+### Tier 2 — Quarantine (soft block)
+
+```typescript
+test('should handle promo codes with multiple layers', async ({ page }) => {
+  test.fixme(true, 'Flaky Q3-2026 — Issue #847: race between coupon cache and UI thread')
+  // ... existing test logic preserved, ready to unfix once patched ...
+})
+```
+
+`test.fixme(true, ...)` marks it skipped but still listed in the report under "flaky". Never use `test.skip` alone — the `fixme` flag keeps visibility in CI dashboards.
+
+### Tier 3 — Escalation Criteria
+
+A test must be quarantined when **any** of these hold:
+
+1. Fails > 20% of runs across ≥ 10 consecutive executions
+2. Passes only after adding a `waitForTimeout` (smell: the fix papered over the real problem)
+3. Depends on external service SLA (third-party payment gateway returning inconsistent payloads)
+
+After quarantine:
+
+- File a bug with reproduction script and attached trace
+- Do NOT leave it marked `fixme` beyond one sprint
+- Unquarantine only after running the same `--repeat-each=10` benchmark and observing 100% pass
+
+### Monitoring Script
+
+```bash
+#!/bin/bash
+# scripts/check-flakiness.sh
+REPORT=".tmp/reports/flakiness-latest.json"
+npx playwright test --reporter=json --output=$REPORT
+python -c "
+import json, sys
+data = json.load(open('$REPORT'))
+failed = sum(1 for t in data.get('suites',[{}])[0].get('tests',[]) if t.get('status')=='failed')
+total = len(data.get('suites',[{}])[0].get('tests',[]))
+print(f'{total} tests, {failed} failed')
+sys.exit(1 if failed else 0)
+"
+```
+
+Run nightly via cron or GitHub Actions; archive the report and alert if `failed > 0`.
+
+---
+
+## 9. Parallel Execution Safety Checklist
+
+| Concern | Mechanism |
+|---|---|
+| Shared session cookies | `storageState` seeded per-worker from `.tmp/seeds/worker-{N}.json` |
+| Concurrent DB writes | API stubs eliminate all real DB access |
+| Non-deterministic order IDs | `OrderFixture` receives `workerIndex` prefix from environment |
+| Sibling test interference | `fullyParallel: true` + isolated fixtures (no module-level mutable state) |
+| File-system collisions | Artifacts land in `.tmp/artifacts/videos/` which Playwright names with hash prefixes |
+| Port conflicts | `webServer.reuseExistingServer: !CI` — one app instance serves all workers |
+| Stale stub routes | Each fixture installs/uninstalls its own route listeners in `use()` cleanup |
+
+---
+
+## 10. Putting It All Together
+
+**Expected outcome with this architecture:**
+
+- **Flake reduction:** From 15% → ~0–2%. The biggest wins come from (a) stubbed APIs eliminating network variance, (b) `storageState` bypassing login entirely, and (c) dropping `waitForTimeout` in favor of locator auto-wait.
+- **Speed:** Skipping the login flow saves ~2–3 seconds per test. API stubs respond in < 1ms vs hundreds of ms over the wire. With 8 workers, a typical 20-test suite drops from ~60s to ~8–12s.
+- **Debugging:** On retry, traces are recorded and linked from the HTML report. Videos show exactly where a failure occurred. No wasted IO on passing tests.
+- **Maintainability:** Adding a checkout step is just creating a new page object, a new fixture interceptor, and a new spec file importing from `../fixtures`. The hierarchy does the wiring.

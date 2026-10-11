@@ -1,0 +1,232 @@
+I'll analyze the vulnerabilities in order of severity and provide a corrected implementation.
+
+## Vulnerabilities (by severity)
+
+1. **CRITICAL: Signature verified AFTER JSON parsing** — Attacker-controlled input is processed before authentication. Malicious payloads can exploit parser vulnerabilities (billion laughs, stack exhaustion) or trigger side effects in custom decoders.
+
+2. **HIGH: In-memory replay ledger** — Lost on restart, not shared across instances. Replays succeed after deployment or with multiple workers.
+
+3. **HIGH: No concurrency-safe idempotency** — Race window between check-and-insert allows duplicate processing under concurrent duplicate webhooks.
+
+4. **MEDIUM: Processor errors leak to clients** — Stack traces, internal paths, or database errors exposed in responses.
+
+5. **MEDIUM: No rate limiting** — Endpoint vulnerable to volumetric abuse.
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import json
+import time
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import Column, String, DateTime, create_engine, UniqueConstraint
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from redis import Redis
+import structlog
+
+logger = structlog.get_logger()
+app = FastAPI()
+
+# --- Configuration (from env, never hardcoded) ---
+WEBHOOK_SECRET_CURRENT = os.environ["WEBHOOK_SECRET_CURRENT"]
+WEBHOOK_SECRET_PREVIOUS = os.environ.get("WEBHOOK_SECRET_PREVIOUS")  # For rotation
+REDIS_URL = os.environ["REDIS_URL"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+# --- Persistent replay ledger (PostgreSQL) ---
+Base = declarative_base()
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
+    event_id = Column(String, primary_key=True)
+    processed_at = Column(DateTime, nullable=False, server_default=func.now())
+    # Store response to return on replay (idempotent response)
+    response_body = Column(String, nullable=True)
+
+Base.metadata.create_all(engine)
+
+# --- Redis for distributed rate limiting ---
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+
+async def read_raw_body(request: Request) -> bytes:
+    """Read raw bytes BEFORE any parsing."""
+    return await request.body()
+
+
+def verify_signature(raw_body: bytes, signature_header: str, secrets: list[str]) -> bool:
+    """
+    Verify HMAC-SHA256 signature against raw body.
+    Try current secret first, then previous (for rotation window).
+    """
+    if not signature_header:
+        return False
+
+    for secret in secrets:
+        expected = hmac.new(
+            secret.encode(),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison to prevent timing attacks
+        if hmac.compare_digest(expected, signature_header):
+            return True
+
+    return False
+
+
+def check_rate_limit(client_ip: str, max_requests: int = 100, window: int = 60) -> bool:
+    """Sliding window rate limit using Redis."""
+    key = f"webhook:ratelimit:{client_ip}"
+    now = time.time()
+    pipe = redis.pipeline()
+    pipe.zremrangebyscore(key, 0, now - window)
+    pipe.zadd(key, {str(now): now})
+    pipe.zcard(key)
+    pipe.expire(key, window)
+    _, _, count, _ = pipe.execute()
+    return count <= max_requests
+
+
+def record_event_idempotent(event_id: str, db, response_body: Optional[str] = None) -> bool:
+    """
+    Atomically record event. Returns True if new (should process),
+    False if already seen (replay). Uses INSERT ... ON CONFLICT for
+    concurrency safety.
+    """
+    stmt = pg_insert(ProcessedEvent).values(
+        event_id=event_id,
+        response_body=response_body
+    ).on_conflict_do_nothing(
+        index_elements=["event_id"]
+    )
+
+    result = db.execute(stmt)
+    db.commit()
+    return result.rowcount > 0  # True if inserted, False if conflict
+
+
+@app.post("/webhooks/payment")
+async def payment_webhook(request: Request):
+    client_ip = request.client.host
+
+    # 1. Rate limit FIRST (cheap rejection)
+    if not check_rate_limit(client_ip):
+        logger.warning("rate_limit_exceeded", client_ip=client_ip)
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # 2. Read raw body (no parsing yet)
+    raw_body = await read_raw_body(request)
+
+    if not raw_body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+
+    # 3. Verify signature on RAW body (before any parsing)
+    signature = request.headers.get("X-Webhook-Signature", "")
+    secrets = [WEBHOOK_SECRET_CURRENT]
+    if WEBHOOK_SECRET_PREVIOUS:
+        secrets.append(WEBHOOK_SECRET_PREVIOUS)
+
+    if not verify_signature(raw_body, signature, secrets):
+        logger.warning("invalid_signature", client_ip=client_ip)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # 4. NOW parse JSON (after authentication)
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+
+    # 5. Validate required fields
+    event_id = payload.get("event_id")
+    event_type = payload.get("event_type")
+
+    if not event_id or not event_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing required fields"
+        )
+
+    # 6. Idempotent processing with concurrency-safe check
+    db = SessionLocal()
+    try:
+        is_new = record_event_idempotent(event_id, db)
+
+        if not is_new:
+            # Replay — return cached response or 200
+            existing = db.query(ProcessedEvent).get(event_id)
+            logger.info("replay_detected", event_id=event_id)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"status": "already_processed", "event_id": event_id}
+            )
+
+        # 7. Process the event
+        try:
+            result = await process_payment_event(event_type, payload)
+            # Cache successful response for replay idempotency
+            record_event_idempotent(event_id, db, response_body=json.dumps(result))
+            return JSONResponse(status_code=200, content=result)
+
+        except PaymentProcessingError as e:
+            # Expected business errors — safe to acknowledge
+            logger.info("payment_processing_error", event_id=event_id, error=str(e))
+            # Remove from processed to allow retry
+            db.query(ProcessedEvent).filter_by(event_id=event_id).delete()
+            db.commit()
+            return JSONResponse(
+                status_code=200,  # Acknowledge to prevent processor retries
+                content={"status": "failed", "event_id": event_id}
+            )
+
+        except Exception as e:
+            # Unexpected error — log internally, generic response externally
+            logger.error(
+                "unexpected_error",
+                event_id=event_id,
+                error=str(e),
+                exc_info=True
+            )
+            # Remove from processed to allow retry
+            db.query(ProcessedEvent).filter_by(event_id=event_id).delete()
+            db.commit()
+            # Generic response — no internal details leaked
+            return JSONResponse(
+                status_code=200,  # Acknowledge to prevent processor retries
+                content={"status": "error", "event_id": event_id}
+            )
+
+    finally:
+        db.close()
+
+
+async def process_payment_event(event_type: str, payload: dict) -> dict:
+    """Business logic here. Raises PaymentProcessingError for expected failures."""
+    # ... actual processing ...
+    pass
+
+
+class PaymentProcessingError(Exception):
+    """Expected business logic failures (e.g., insufficient funds)."""
+    pass
+```
+
+## Key Fixes Summary
+
+| Vulnerability | Fix |
+|---|---|
+| Signature after parsing | Verify HMAC on **raw bytes** before `json.loads()` |
+| In-memory replay ledger | PostgreSQL with `ON CONFLICT DO NOTHING` |
+| Concurrent duplicates | Atomic insert — rowcount check prevents race |
+| Error leakage | Generic 200 response to processor; detailed logs internally |
+| Secret rotation | Try current + previous secret |
+| Timing attacks | `hmac.compare_digest()` instead of `==` |
+| Rate limiting | Redis-backed sliding window before any processing |

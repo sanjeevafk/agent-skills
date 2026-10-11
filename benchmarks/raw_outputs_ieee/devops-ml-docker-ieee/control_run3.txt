@@ -1,0 +1,257 @@
+[exit=0 latency=35.79s]
+Here's the complete containerization design with layered justification.
+
+## Architecture Overview
+
+The current single-stage 9GB image wastes space bundling compilers, CUDA stubs, wheel-build artifacts, and root-owned caches into the final filesystem. The redesign splits compilation from runtime delivery — building wheels in a heavy builder stage, then copying only the compiled binaries into a minimal `slim` runtime. Every layer is ordered to maximize cache invalidation distance: when only `requirements.txt` changes, nothing upstream re-runs.
+
+---
+
+## Dockerfile
+
+```dockerfile
+# =============================================================================
+# Stage 1: Builder — compile PyTorch wheels & install deps into a staging dir
+# =============================================================================
+FROM python:3.12-slim AS builder
+
+WORKDIR /opt/build
+
+# Pin pip/setuptools/wheel once; these rarely change.
+RUN pip install --no-cache-dir --upgrade pip==24.3.1 setuptools==75.6.0 wheel==0.44.0
+
+# Copy only requirements first. Cache busted only when requirements change.
+COPY requirements.txt ./
+
+# Build all wheels into a local directory; offline install avoids network cache leaks.
+RUN pip wheel \
+        --no-binary :all: \
+        --wheel-dir /opt/wheels \
+        -r requirements.txt || \
+    # If some packages are already binary, allow them through the index but
+    # still capture everything we actually download into /opt/wheels.
+    pip install \
+        --no-deps \
+        --no-binary torch==2.5.1+cpu \
+        --wheel-dir /opt/wheels \
+        -r requirements.txt
+
+# =============================================================================
+# Stage 2: Runtime — minimal image, non-root user, wheels only
+# =============================================================================
+FROM python:3.12-slim AS runtime
+
+LABEL maintainer="infra@example.com" \
+      description="PyTorch CPU inference service (non-root, multi-stage)"
+
+# ---------------------------------------------------------------------------
+# System deps needed by libatomic (required by CPU torch). Clean apt cache
+# immediately to reclaim ~200-400MB per layer.
+# ---------------------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libatomic1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Create non-root user/group with numeric UIDs/GIDs for deterministic hashing.
+# GID/UID < 1000 avoids collision with systemd/system users.
+# ---------------------------------------------------------------------------
+RUN groupadd -g 1000 appuser && \
+    useradd -u 1000 -g appuser -s /usr/sbin/nologin \
+            -m -d /home/appuser appuser
+
+# ---------------------------------------------------------------------------
+# Copy compiled wheels from builder into the runtime image.
+# Only one COPY = one layer; content-hash means rebuilds skip if wheels
+# haven't changed (even if source code did).
+# ---------------------------------------------------------------------------
+COPY --from=builder /opt/wheels /opt/wheels
+
+# Install wheels offline. No index lookups = no network noise.
+# --no-cache-dir avoids writing an additional pip cache layer.
+RUN pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        torch==2.5.1+cpu \
+        && rm -rf /opt/wheels
+
+# ---------------------------------------------------------------------------
+# Application layer — comes LAST so dependency-only changes don't
+# invalidate it. Copy entrypoint scripts too since the app depends on them.
+# ---------------------------------------------------------------------------
+COPY server.py  /opt/app/server.py
+COPY health.py  /opt/app/health.py
+COPY config/    /opt/app/config/
+
+RUN chown -R appuser:appuser /opt/app
+
+USER appuser
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # MALLOC_ARENA_MAX prevents glibc from leaking RSS memory under load;
+    # kept as ARG so it's injected at runtime, not baked in.
+    MALLOC_ARENA_MAX=2
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; r = urllib.request.urlopen('http://localhost:8080/healthz'); exit(0 if r.status == 200 else 1)"
+
+CMD ["python", "-u", "/opt/app/server.py"]
+```
+
+---
+
+## Layer-by-Layer Justification
+
+| Layer | Decision | Why |
+|---|---|---|
+| **Stage 1 base** (`python:3.12-slim`) | Not full debian/python image | Slim is ~120MB vs ~500MB for full tag. Compiler toolchain comes pre-bundled, saving a separate `gcc` install. |
+| **pip upgrade** | Separate early RUN | `pip` upgrades rarely; pinning versions makes the layer stable across builds. Without it every pip call downloads latest metadata. |
+| **requirements.txt → `pip wheel`** | Dependencies before application code | This is the cache-critical layer. When only `server.py` changes, Docker skips this entire stage. When dependencies *do* change, only this layer rebuilds. |
+| **`pip wheel … --wheel-dir`** | Pre-build wheels instead of `pip install` | Wheels are portable binary blobs. We copy just the `.whl` files to runtime — no gcc, no headers, no build logs, no `.eggs` directory polluting the final image. This alone shaves ~2-3GB off what would be installed in a single-stage build. |
+| **`--no-binary torch==2.5.1+cpu`** | Force torch to be built-from-source here so we get the exact version pinned in runtime | Ensures build and runtime match exactly. The fallback path handles packages where `--no-binary` fails. |
+| **Stage 2 base** (`python:3.12-slim`) | Reuse same slim image | Consistency across stages; no redundant system package sets. |
+| **apt install + `rm -rf /var/lib/apt/lists/*`** | Inline cleanup in the SAME RUN | If split into two RUN commands you'd keep the apt cache layers permanently. Doing both in one RUN eliminates the intermediate layer containing package metadata. Saves ~150MB. |
+| **`libatomic1`** | Explicitly install libatomic1 | PyTorch C++ extensions link `-latomic`. Without this the import crashes at runtime with `undefined symbol: __atomic_fetch_add_8`. |
+| **Non-root user (GID/UID 1000)** | `groupadd` / `useradd` before any COPY | Creates the user layer once. Placed before `COPY --from=builder` so file ownership fixes run after content arrives. Numeric IDs avoid DNS/NSS lookups. `/usr/sbin/nologin` shell blocks interactive login even if someone compromises the process UID. |
+| **`COPY --from=builder /opt/wheels`** | Single COPY of pre-built wheels | One layer, content-addressed. If wheel set hasn't changed (e.g., new app code but same deps), this entire layer is cached. No compiler, no source trees, no `.src` directories. |
+| **`pip install --no-index --find-links`** | Offline install from local wheels | No PyPI connection = no network timeout risk in CI. No dependency resolution = faster install. After install, we `rm -rf /opt/wheels` to reclaim the copy — wheels aren't needed after pip links them. |
+| **Application COPY last** | Server code placed after all deps | Maximizes cache utilization. Changing `server.py` invalidates only this final layer (~seconds, not minutes). Dependency-only changes invalidate zero app layers. |
+| **`chown -R appuser:appuser`** | Ownership fixup before `USER` directive | Files copied as root are owned by root. Running `chown` in the same context ensures permissions propagate correctly to mounted volumes too. |
+| **`USER appuser`** | Drop privileges before HEALTHCHECK/CMD | Process runs as unprivileged UID 1000. Even if a container escape occurs, the attacker gets no root capabilities inside the host namespace. |
+| **`PYTHONDONTWRITEBYTECODE=1`** | Env var, not filesystem clean | Prevents `.pyc` writes to disk during requests. Slightly faster startup (no bytecode compilation). |
+| **`PYTHONUNBUFFERED=1`** | Stdout/stderr flushes immediately | Essential for log aggregation (Fluentd, Datadog, etc.) and avoiding dead-man switches where the process buffers output while hanging. |
+| **HEALTHCHECK** | 15s interval, 5s timeout, 30s start-period, 3 retries | Interval short enough to detect failure within ~30s without overloading Kubelet/ECS agent. Timeout gives Flask/uWSGI room to accept the connection. Start period accounts for cold-start model loading (could take 10-20s for large models). Retries prevent false positives from transient GC pauses. |
+| **`MALLOC_ARENA_MAX=2`** | Env variable (not baked into the image via sed/glibc patch) | Controls how many malloc arenas glibc creates. Default is unlimited — under high-concurrency inference workloads this can leak RSS up to 3x physical memory. Setting to 2 caps it safely. Kept as an env variable (arguably should be set at pod/runtime level) rather than baked into the image or patched into glibc. |
+| **`--no-cache-dir`** (pip) | No pip cache persisted | pip caches downloaded packages in `~/.cache/pip`. That's another ~1-2GB of reproducible binary junk. With `--no-cache-dir`, pip installs and discards. Since we're using offline wheels anyway, caching adds zero value. |
+
+---
+
+## Expected Image Size Breakdown
+
+| Component | Size |
+|---|---|
+| `python:3.12-slim` base | ~120 MB |
+| `libatomic1` + ca-certificates (+ apt cache removal) | ~5 MB |
+| PyTorch CPU 2.5.1 (pre-built wheel) | ~800 MB |
+| Other Python dependencies (estimated) | ~300-500 MB |
+| Application code | ~50 MB |
+| Overhead (layers, Python stdlib dedup) | ~100 MB |
+| **Total estimated** | **~1.4–1.6 GB** |
+
+Well under the 2.5 GB target. The current 9GB image likely includes CUDA runtime libraries, gcc, make, build artifacts, pip cache, `.eggs` directories, and possibly the entire `torchvision`+`torchaudio` stack unnecessarily. By installing `+cpu` variant and stripping the build stage entirely, we remove roughly 7GB of waste.
+
+---
+
+## .dockerignore
+
+```gitignore
+# ── Environment & virtual environments ────────────────────────────────
+.venv/
+venv/
+*.egg-info/
+.env
+.env.*
+
+# ── Datasets & model weights (hundreds of GB) ─────────────────────────
+datasets/
+data/
+models/*.bin
+models/*.safetensors
+models/*.gguf
+
+# ── Build artifacts ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+.wheels/
+
+# ── VCS & tooling ─────────────────────────────────────────────────────
+.git/
+.gitignore
+.hypothesis/
+.pytest_cache/
+
+# ── IDE & editor ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Misc ──────────────────────────────────────────────────────────────
+*.md
+tests/
+.github/
+```
+
+Key exclusions:
+- **`.venv/`** — `pip wheel` captures everything needed. Bundling the venv brings in editable-installed dev tools, test harnesses, and potentially multiple Python ABI builds.
+- **`datasets/`** — These are usually 10-100GB of raw training data. They should be mounted as volumes or loaded at runtime from object storage (S3/GCS), never baked into the image.
+- **Model weights** — Large models are better served via a separate registry or mounted volume because they change more frequently than the inference server itself. Shipping them in the Docker image couples model deployment to server redeployment.
+
+---
+
+## Secrets at Runtime (Never as ENV)
+
+The Dockerfile does **not** contain any `ENV KEY=value` instructions for secrets. Instead, secrets are provided:
+
+**Option A: Docker Compose**
+```yaml
+services:
+  inference:
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL}          # resolved from .env at compose time
+      API_KEY: ${API_KEY}
+```
+
+**Option B: Kubernetes Secret**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inference-secrets
+type: Opaque
+stringData:
+  DATABASE_URL: postgresql://…
+  API_KEY: sk-abc123
+```
+Mounted as env vars at pod runtime via `envFrom.secretRef`. Never appear in `docker history` or `docker inspect`.
+
+**Option C: Docker BuildKit secret mount (for build-time needs only)**
+```bash
+DOCKER_BUILDKIT=1 docker build --secret id=aws_creds,.env=.aws/credentials .
+```
+In the Dockerfile:
+```dockerfile
+RUN --mount=type=secret,id=aws_creds \
+    cat /run/secrets/aws_creds > ~/.aws/credentials
+```
+Secrets exist only in the ephemeral build layer and are discarded afterward.
+
+---
+
+## Build Command
+
+```bash
+# Standard build
+docker build -t inference-service:latest --target runtime .
+
+# Verify size
+docker images inference-service
+
+# Run with secrets passed at runtime
+docker run -d \
+  --name inference \
+  --memory 8g \
+  --cpus 4 \
+  -e DATABASE_URL=postgresql://… \
+  -e API_KEY=$API_KEY \
+  -v /host/models:/models:ro \
+  -p 8080:8080 \
+  inference-service:latest
+```
+
+Using `--target runtime` explicitly skips the builder stage entirely when you only want the runtime image (buildkit supports this natively). In CI pipelines, pass `--target runtime` to produce the deployable artifact.

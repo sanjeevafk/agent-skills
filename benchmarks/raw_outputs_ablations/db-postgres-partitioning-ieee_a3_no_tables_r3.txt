@@ -1,0 +1,185 @@
+No existing `audit_logs` table found — this is a clean-room design request from the benchmark task. I've written the complete migration to `benchmarks/databases/postgres-audit-logs-partitioning/migration.sql`. Here's the full production-grade strategy:
+
+---
+
+## Zero-Downtime Declarative Partitioning Migration (500M rows)
+
+### Architecture Overview
+
+```
+┌─────────────┐   dual-write   ┌──────────────────────┐
+│ audit_logs  │ ──────────────►│ audit_logs_partitioned │
+│ (heap)      │ ◄───────────── │ (monthly range parts) │
+└─────────────┘  rename+drop   └──────────────────────┘
+                          ▲
+                          │ pg_partman auto-manages
+                    CREATE TABLE IF NOT EXISTS
+                    DROP old partitions (>2yr retention)
+```
+
+### Step-by-Step Breakdown
+
+#### 1. Pre-checks & Extensions
+- Installs `pg_partman` and `pg_stat_statements`
+- Enumerates existing indexes (for replication)
+- Flags unindexed foreign keys using the anti-pattern query from standards
+
+#### 2. Create Partitioned Table
+```sql
+CREATE TABLE audit_logs_partitioned (
+    id              BIGSERIAL       NOT NULL,
+    tenant_id       BIGINT          NOT NULL,
+    user_id         BIGINT,
+    action          VARCHAR(100)    NOT NULL,
+    entity_type     VARCHAR(100)    NOT NULL,
+    entity_id       BIGINT          NOT NULL,
+    changes         JSONB,
+    source_ip       INET,
+    user_agent      TEXT,
+    request_id      UUID,
+    metadata        JSONB DEFAULT '{}'::JSONB,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    created_by      BIGINT          NOT NULL,
+    PRIMARY KEY (created_at, id),  -- composite PK required by PG partitioning
+    CHECK (...action IS NOT NULL...),
+    CHECK (...entity_type IS NOT NULL...)
+) PARTITION BY RANGE (created_at);
+```
+**Key design**: Composite primary key `(created_at, id)` matches the partition key first, enabling efficient partition elimination on point lookups.
+
+#### 3. Initial Partition Build
+Dynamic DO block scans existing data range, creates one monthly partition per month from min date through 6 months in the future:
+```sql
+-- e.g., audit_logs_2021_01, audit_logs_2021_02, ..., audit_logs_2027_06
+```
+
+#### 4. Index Replication (on empty table, then CONCURRENTLY later)
+
+| Index | Type | Purpose |
+|-------|------|---------|
+| `idx_audit_action_created` | **Composite** `(action, created_at)` | WHERE action = X AND created_at > Y (equality + range) |
+| `idx_audit_tenant_created` | **Composite** `(tenant_id, created_at)` | Multi-tenant tenant filter + range |
+| `idx_audit_entity_lookup` | **Covering** `(entity_type, entity_id, created_at) INCLUDE (action, changes, tenant_id)` | Avoids heap fetches for entity lookup reads |
+| `idx_audit_recent_active` | **Partial** WHERE created_at >= NOW() - 90d | Smaller index, hot-path only |
+| `idx_audit_request_id` | **Partial unique** WHERE request_id IS NOT NULL | Trace-only correlation |
+| `idx_audit_metadata_gin` | **GIN** ON metadata | JSONB `->` / `@>` queries |
+
+#### 5. pg_partman Auto-Management
+```sql
+SELECT partman.create_parent(
+    p_parent_table   := 'public.audit_logs_partitioned',
+    p_control        := 'created_at',
+    p_interval       := '1 month',
+    p_premake        := 6,          -- pre-create 6 months ahead
+    p_autocreate     := true,
+    p_inherit_privileges := true
+);
+```
+This handles:
+- Future partition creation automatically
+- Optional retention policy (drops partitions older than 2 years)
+- Scheduled maintenance via pg_cron (`partman.run_maintenance_proc()`)
+
+#### 6. Batched Backfill (Lock Timeout Protected)
+```sql
+-- Configuration: batch_size = 100k rows, inner loop chunk = 1k
+-- Each INSERT ... SELECT uses ON CONFLICT DO NOTHING (idempotent)
+-- SET lock_timeout = '5s' at session level prevents long contention
+SET lock_timeout = '5s';
+
+DO $$
+DECLARE
+    total_rows BIGINT;
+    processed  BIGINT := 0;
+    batch_size BIGINT := 100000;
+    start_id   BIGINT := -9223372036854775808;
+BEGIN
+    SELECT COUNT(*) INTO total_rows FROM audit_logs;
+
+    LOOP
+        EXECUTE format(
+            'INSERT INTO audit_logs_partitioned (...)
+             SELECT ... FROM audit_logs
+             WHERE id > $1 AND id <= $2
+             ORDER BY id LIMIT $3
+             ON CONFLICT (created_at, id) DO NOTHING',
+            start_id, start_id + 1000, 1000
+        );
+        GET DIAGNOSTICS last_id = ROW_COUNT;
+        IF last_id = 0 THEN done := TRUE; END IF;
+        
+        processed := processed + last_id;
+        PERFORM pg_sleep(wait_ms);  -- yield between large batches
+    END LOOP;
+END $$;
+```
+**Properties**: Idempotent (`ON CONFLICT DO NOTHING`), progress-tracked, lock-timeout protected, pause-and-resume capable.
+
+#### 7. Dual-Write Trigger (Zero-Downtime Cutover)
+```sql
+CREATE TRIGGER tg_audit_dual_write
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION fn_audit_dual_write();
+```
+Application switches writes to both tables simultaneously → validate consistency → atomic rename → drop old table.
+
+#### 8. Atomic Rename & CONCURRENT Index Build
+```sql
+ALTER TABLE audit_logs RENAME TO audit_logs_archive;
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+CREATE INDEX CONCURRENTLY ON audit_logs (...);  -- all 6 indexes
+```
+Rename is O(1) catalog update. CONCURRENT allows reads during rebuild.
+
+### Partition Pruning Verification
+
+All these use `EXPLAIN (COSTS OFF)` to show execution plans without running queries:
+
+```sql
+-- Single-month filter → prunes all but 1 partition
+EXPLAIN (COSTS OFF)
+    SELECT * FROM audit_logs
+    WHERE created_at BETWEEN '2025-01-01' AND '2025-01-31';
+
+-- Cross-month range → 2+ partitions scanned
+EXPLAIN (COSTS OFF)
+    SELECT * FROM audit_logs
+    WHERE created_at BETWEEN '2025-01-20' AND '2025-03-10';
+
+-- Point lookup → single partition access
+EXPLAIN (COSTS OFF)
+    SELECT * FROM audit_logs
+    WHERE created_at = '2025-06-15 12:00:00' AND id = 12345;
+
+-- Partition health view: row counts, dead tuples, sizes, last vacuum per partition
+SELECT child.relname AS partition, n_live_tup, n_dead_tup,
+       pg_size_pretty(pg_relation_size(child.oid)) AS size
+FROM pg_inherits JOIN pg_class parent ON inhparent = parent.oid
+                 JOIN pg_class child  ON inhrelid  = child.oid
+WHERE parent.relname = 'audit_logs';
+```
+
+### Production Configuration (from standards)
+
+```sql
+ALTER SYSTEM SET max_connections = 100;
+ALTER SYSTEM SET work_mem = '8MB';
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s';
+ALTER SYSTEM SET statement_timeout = '30s';
+REVOKE ALL ON SCHEMA public FROM public;
+SELECT pg_reload_conf();
+```
+
+### Rollback Plan (if needed before Step 9)
+
+```sql
+-- If dual-write phase has issues, simply disable the trigger
+ALTER TABLE audit_logs DISABLE TRIGGER tg_audit_dual_write;
+-- Application continues writing to original table normally
+-- Partitioned table can be dropped after cleanup period
+DROP TABLE audit_logs_partitioned CASCADE;
+```
+
+The full SQL is in `benchmarks/databases/postgres-audit-logs-partitioning/migration.sql` — it's structured as 10 sequential steps that can execute end-to-end or stop/start between phases for operational control.

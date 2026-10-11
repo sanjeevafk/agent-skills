@@ -1,0 +1,501 @@
+[exit=0 latency=35.00s]
+# Zero-Downtime Column Rename: `users.email` → `users.primary_email` on 120M Rows
+
+## Architecture at a Glance
+
+```
+8 App Replicas ──┐
+                 ├──► PostgreSQL 14+ (primary + standbys)
+Mixed versions    │     └── users (120M rows)
+                 ┘
+```
+
+The critical constraint: **replicas run different code versions simultaneously**. Any DDL change must not block the old code path. Dual-write + gradual cutover is the only safe pattern.
+
+---
+
+## Phase 1 — Expand: Add Column + Dual-Write Triggers
+
+### Step 1.1: Create the new column (concurrent, no exclusive lock)
+
+```sql
+-- Run once against primary. All standbys replicate automatically.
+
+BEGIN;
+
+-- ADD COLUMN without DEFAULT avoids rewriting the entire table.
+-- In PG 11+, ADD COLUMN ... NOT NULL with DEFAULT is instant (just catalogs).
+-- We use nullable first so backfill can be safe.
+
+ALTER TABLE users ADD COLUMN primary_email TEXT;
+
+-- Quick sanity check: does the column exist?
+-- \d users | grep primary_email
+
+COMMIT;
+```
+
+**Lock behavior:** `ALTER TABLE ... ADD COLUMN` acquires `ACCESS EXCLUSIVE` but is essentially instant since it's just a catalog update (PG 11+). Duration: milliseconds. No data rewrite. Safe during production load.
+
+**Rollback:** `BEGIN; ALTER TABLE users DROP COLUMN primary_email; COMMIT;` — also instant, catalog-only.
+
+### Step 1.2: Write migration triggers (bidirectional guard rails)
+
+These ensure every INSERT/UPDATE after this point writes to *both* columns until cutover.
+
+```sql
+CREATE OR REPLACE FUNCTION trg_sync_email_to_primary_email()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Only sync when email was actually touched (avoid cascade updates from other columns)
+  IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND (NEW.email IS DISTINCT FROM OLD.email)) THEN
+    NEW.primary_email := NEW.email;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_email ON users;
+CREATE TRIGGER trg_sync_email
+  BEFORE INSERT OR UPDATE ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION trg_sync_email_to_primary_email();
+```
+
+**What this does:** Every app row that touches `email` now auto-fills `primary_email`. Old code writes `email`; the trigger copies it forward. New code can write to either column — if both are set, trust `primary_email` explicitly (see Step 1.3).
+
+**Rollback:** Drop the trigger. Existing trigger-created data persists harmlessly in `primary_email`. Old code never references `primary_email`, so it's fine.
+
+### Step 1.3: Deploy new code alongside old (canary rollout)
+
+Update the application layer to handle both columns:
+
+```python
+# Pseudocode — ORM model update
+
+class User(Base):
+    # old column stays, new column gets populated
+    email = Column(String(320), index=True)
+    primary_email = Column(String(320), nullable=True)
+
+    @property
+    def effective_email(self):
+        """Returns the authoritative email value."""
+        return self.primary_email or self.email
+
+    @effective_email.setter
+    def effective_email(self, value: str):
+        # Prefer setting primary_email explicitly; keep email synced via trigger
+        self.primary_email = value
+        self.email = value  # bidirectional for safety
+```
+
+**Key design decisions:**
+- Reads use `primary_email or email` — works on old code reads (uses `email`) and new code reads (prefers `primary_email`).
+- Writes go to **both** columns. Trigger catches anything that misses.
+- Deploy to one replica → verify health → gradually rotate all 8. During this window, **no old-to-new inconsistency can appear**.
+
+**Rollback at any point before backfill:** Stop deploying new code. Existing `primary_email` values are harmless nulls or stale copies. Old path unaffected.
+
+### Summary of Post-Expand State
+
+| What                | Value                                    |
+|---------------------|------------------------------------------|
+| Schema              | `email` + `primary_email` (nullable)     |
+| Inserts             | Both columns set by app + trigger        |
+| Updates             | Same                                      |
+| Read path           | `primary_email or email` (new); `email` (old) |
+| Old code            | Unaffected, works as-is                  |
+| Risk if rollback    | None — just stop deploying new code      |
+
+---
+
+## Phase 2: Backfill in Bounded Batches
+
+This is where most migrations fail. Let me be precise.
+
+### Step 2.1: Batch parameters
+
+```python
+import time
+import psycopg2
+
+BATCH_SIZE = 10_000          # ~0.1–0.3s per batch, minimal WAL pressure
+POLL_INTERVAL_MS = 200       # check progress frequently without hammering
+LOCK_TIMEOUT_S = 5           # fail fast if we hit a hot transaction
+STATE_TABLE = "_migration_state"
+```
+
+**Why BATCH_SIZE=10K?** At ~400 bytes/row including indexes, each batch is ~4MB of writes. That's negligible vs typical transaction limits. Larger batches increase risk of statement timeouts under heavy concurrent load.
+
+### Step 2.2: Idempotent state table
+
+```sql
+-- Prevents duplicate runs if the process restarts mid-backfill
+CREATE TABLE IF NOT EXISTS _migration_state (
+    key   TEXT PRIMARY KEY,
+    value BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+INSERT INTO _migration_state (key, value)
+VALUES ('email_backfill_cursor', 0)
+ON CONFLICT (key) DO NOTHING;
+```
+
+### Step 2.3: Backfill worker (retryable, lock-aware)
+
+```python
+import psycopg2
+from psycopg2 import sql, extras
+
+def backfill(primary_host_config, max_runtime_s=None):
+    conn = psycopg2.connect(**primary_host_config)
+    conn.set_session(readonly=False, autocommit=False)
+    cur = conn.cursor()
+
+    start_time = time.monotonic()
+    processed_total = 0
+    consecutive_failures = 0
+
+    while True:
+        elapsed = time.monotonic() - start_time
+        if max_runtime_s and elapsed >= max_runtime_s:
+            print(f"[{elapsed:.0f}s] Time budget exhausted. Stopping safely.")
+            break
+
+        # ---- Atomic cursor acquisition (idempotent) ----
+        cur.execute(
+            "SELECT value FROM _migration_state WHERE key = 'email_backfill_cursor' "
+            "FOR UPDATE SKIP LOCKED"
+        )
+        row = cur.fetchone()
+        min_id = row[0] if row else 0
+
+        # ---- Fetch & copy -----
+        cur.execute(sql.SQL("""
+            SELECT id, email
+            FROM   users
+            WHERE  id > %s AND primary_email IS NULL
+            ORDER  BY id
+            LIMIT  %s
+        """), (min_id, BATCH_SIZE))
+        rows = cur.fetchall()
+
+        if not rows:
+            # Nothing left — final consistency pass will confirm
+            print("[backfill] Queue empty. Running final verification...")
+            break
+
+        # ---- Bulk UPDATE (single round-trip per batch) ----
+        extras.execute_batch(
+            cur,
+            sql.SQL("UPDATE users SET primary_email = %s WHERE id = %s"),
+            [(r[1], r[0]) for r in rows],
+            page_size=BATCH_SIZE
+        )
+        affected = cur.rowcount
+        conn.commit()
+
+        # ---- Advance cursor atomically ----
+        new_cursor = rows[-1][0]
+        cur.execute(
+            "UPDATE _migration_state SET value = %s, updated_at = now() "
+            "WHERE key = 'email_backfill_cursor'",
+            (new_cursor,)
+        )
+        conn.commit()
+
+        processed_total += affected
+
+        print(f"[{elapsed:.0f}s] Processed {processed_total} total "
+              f"(batch: {affected}, cursor: {new_cursor})")
+
+        consecutive_failures = 0
+        time.sleep(POLL_INTERVAL_MS / 1000.0)
+
+    conn.close()
+
+    # Final stats
+    print(f"[DONE] Backfill finished: {processed_total} rows updated. "
+          f"Remaining NULL: {count_remaining()}")
+
+
+def count_remaining():
+    conn = psycopg2.connect(**primary_host_config)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users WHERE primary_email IS NULL")
+    return cur.fetchone()[0]
+```
+
+### Step 2.4: Statement timeout avoidance
+
+```sql
+-- Set conservative timeouts in your connection pool config or session level:
+SET statement_timeout = '10s';     -- kills runaway queries before they block
+SET lock_timeout = '5s';            -- fail fast instead of waiting forever
+SET idle_in_transaction_session_timeout = '30s';  -- prevents zombie txns
+```
+
+**Critical:** Do NOT set these globally for all connections — only in the migration worker's connection. Application connections should have their own (likely longer) timeouts. A good practice:
+
+```python
+conn = psycopg2.connect(**config)
+cur = conn.cursor()
+for stmt in ("SET statement_timeout = '10s'", "SET lock_timeout = '5s'"):
+    cur.execute(stmt)
+```
+
+With 10s statement timeout + 10K batch size, a single batch takes <1s under normal conditions. Under extreme contention, the query dies cleanly and retries on next loop iteration — no partial corruption possible because we commit *after* the whole batch succeeds.
+
+### Step 2.5: Index strategy during backfill
+
+```sql
+-- Do NOT create the index yet. It would slow the backfill enormously
+-- and hold locks that could stall the application.
+
+-- Just ensure there's still a unique index on `email` for existing constraints:
+-- (already exists as part of original schema)
+
+-- After backfill completes, we'll rebuild properly in Phase 3.
+```
+
+Creating a `UNIQUE INDEX` on 120M rows during a live system is dangerous — it blocks concurrent writes for minutes. Defer until after the contract phase.
+
+**Rollback during backfill:** Kill the process. `primary_email` values partially filled are harmless — the verification step in Phase 3 will catch gaps. Old `email` code path remains fully operational.
+
+---
+
+## Phase 3: Verify Consistency
+
+Before touching reads, prove the two columns match everywhere.
+
+```sql
+BEGIN;
+
+-- 3a. How many rows still have a mismatch?
+SELECT COUNT(*) AS mismatches
+FROM   users
+WHERE  primary_email IS NOT NULL
+  AND  email IS DISTINCT FROM primary_email;
+
+-- Expected: 0. If > 0, those were written via the trigger before dual-write deployed.
+-- Fix them:
+UPDATE users
+SET    primary_email = email
+WHERE  primary_email IS NOT NULL
+  AND  email IS DISTINCT FROM primary_email;
+
+-- 3b. How many have email but NOT primary_email? (backfill gap)
+SELECT COUNT(*) AS backfill_gaps
+FROM   users
+WHERE  email IS NOT NULL
+  AND  primary_email IS NULL;
+
+-- Expected: 0 after full backfill. If > 0, re-run backfill:
+UPDATE users
+SET    primary_email = email
+WHERE  primary_email IS NULL AND email IS NOT NULL;
+
+-- 3c. Count totals for sanity
+SELECT
+    COUNT(*)                          AS total_rows,
+    COUNT(email)                      AS non_null_email,
+    COUNT(primary_email)              AS non_null_primary_email,
+    COUNT(email) - COUNT(primary_email) AS missing_primary
+
+FROM   users;
+
+COMMIT;
+```
+
+All three counts must be **zero** before proceeding. Re-run backfill on any gaps.
+
+**Rollback after verification:** Still easy. All data is identical in both columns. You haven't changed read logic yet.
+
+---
+
+## Phase 4: Contract — Flip Reads, Drop Old Column
+
+### Step 4.1: Wait until ALL replicas have the new code deployed
+
+```bash
+# Check replica version markers (adjust to your deployment system)
+for replica in $(seq 1 8); do
+    curl -s http://replica-$replica.internal/version | grep -q "v2.x" && echo "$replica: OK" || echo "$replica: STALE"
+done
+```
+
+Do NOT proceed until every replica reports the new version. If you're doing rolling deployments, wait for the last one.
+
+### Step 4.2: Update reads (new code only)
+
+At this point, *every* replica already has the new code running (deployed in Phase 1.3). The read path has already been `primary_email or email` in the new code, and old code never reads `primary_email`. So no additional deploy is needed — the old code path simply stops reading `email` from here forward.
+
+### Step 4.3: Make `primary_email` NOT NULL (if desired)
+
+```sql
+-- Guard: ensure nothing slips through
+DO $$
+DECLARE cnt BIGINT;
+BEGIN
+  SELECT COUNT(*) INTO cnt FROM users WHERE primary_email IS NULL;
+  IF cnt > 0 THEN
+    RAISE EXCEPTION '% rows still have NULL primary_email. Aborting.', cnt;
+  END IF;
+END $$;
+
+-- Now safe to add NOT NULL
+ALTER TABLE users ALTER COLUMN primary_email SET NOT NULL;
+```
+
+**Lock behavior:** `SET NOT NULL` scans every row to verify — this acquires a `SHARE UPDATE EXCLUSIVE` lock, which **blocks** other concurrent writers briefly. On 120M rows this may take several seconds to minutes depending on disk throughput. Acceptable during a maintenance window or low-traffic period. Not a long-duration lock — the scan is sequential but doesn't hold `ACCESS EXCLUSIVE`.
+
+**Rollback:** `ALTER TABLE users ALTER COLUMN primary_email DROP NOT NULL;` — instant, catalog-only.
+
+### Step 4.4: Create the UNIQUE index on `primary_email`
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY idx_users_primary_email
+  ON users (primary_email);
+```
+
+**Lock behavior:** `CONCURRENTLY` allows reads/writes during creation. It does take much longer than a normal index build (minutes for 120M rows), but it won't block the application. Multiple passes are used internally to handle concurrency.
+
+If the index fails partway, it leaves nothing behind — you can retry immediately.
+
+**Rollback:** `DROP INDEX CONCURRENTLY idx_users_primary_email;` — instant if concurrent, otherwise shares the same lock class.
+
+### Step 4.5: Drop the old column
+
+```sql
+-- Optional but recommended: drop the old trigger since we no longer need bidirectional sync
+DROP TRIGGER IF EXISTS trg_sync_email ON users;
+DROP FUNCTION IF EXISTS trg_sync_email_to_primary_email();
+
+-- Drop the old column.
+-- This DOES acquire ACCESS EXCLUSIVE lock on the table for a brief moment.
+-- It triggers a rewrite of the table TOAST storage.
+
+-- Mitigation: schedule during traffic dip, or accept brief pause:
+ALTER TABLE users DROP COLUMN email;
+
+-- Cleanup migration state table
+DROP TABLE IF EXISTS _migration_state;
+```
+
+**Lock behavior:** `DROP COLUMN` acquires `ACCESS EXCLUSIVE` lock — this **blocks all reads and writes** to the `users` table. For 120M rows this typically takes seconds to a minute (table rewrite + TOAST cleanup). Plan for this.
+
+**Mitigations for the lock:**
+1. Schedule during off-peak hours
+2. If using connection pooling (PgBouncer), set `server_lifetime` to flush stale connections
+3. Monitor `pg_stat_activity` to verify no long-running transactions before dropping
+
+**Rollback of DROP COLUMN:** There is no `UNDO`. Once dropped, recovery requires pg_basebackup restore or logical backup replay. This is why Step 4.5 comes last and only after everything above is verified. Ensure you have a recent base backup or streaming replication standby ready to promote.
+
+---
+
+## Complete Lock Behavior Reference
+
+| Statement                          | Lock Level               | Duration       | Blocks App Writes? |
+|------------------------------------|--------------------------|----------------|--------------------|
+| `ADD COLUMN`                       | ACCESS EXCLUSIVE         | ms (catalog)   | No                 |
+| `CREATE TRIGGER`                   | ACCESS EXCLUSIVE         | ms             | Brief flash        |
+| `BACKFILL batches`                 | RowExclusive (per batch) | <1s/batch      | Minimal            |
+| `SET NOT NULL`                     | ShareUpdateExclusive     | seconds-min    | Brief pauses       |
+| `CREATE INDEX CONCURRENTLY`        | AccessShare (per tuple)  | minutes        | No                 |
+| `DROP COLUMN`                      | ACCESS EXCLUSIVE         | seconds-minute | **Yes**            |
+| `DROP TRIGGER` / `DROP FUNCTION`   | ACCESS EXCLUSIVE         | ms             | Brief flash        |
+| `DROP INDEX CONCURRENTLY`          | AccessShare (per tuple)  | seconds        | No                 |
+
+---
+
+## Rollback Matrix
+
+| Stage                     | Damage                        | Rollback Action                              | Data Integrity Impact |
+|---------------------------|-------------------------------|---------------------------------------------|-----------------------|
+| After Expand              | None                          | Stop deploying new code                     | None                  |
+| Mid-Backfill              | Partially filled `primary_email` | Kill worker, fix gaps later                 | None (email source of truth) |
+| After Verification        | None                          | Undo verification (trivial, no changes made) | None                |
+| After SET NOT NULL        | None                          | `DROP NOT NULL`                             | None                  |
+| After CREATE INDEX        | None                          | `DROP INDEX CONCURRENTLY`                   | None                  |
+| After DROP COLUMN         | CATASTROPHIC                  | Restore from backup/promote standby         | **DATA LOSS RISK**    |
+
+**Rule:** The `DROP COLUMN` step is irreversible. Everything before it is trivially reversible.
+
+---
+
+## Full Sequence Checklist
+
+```bash
+# 1. BACKUP — before touching anything
+pg_basebackup -h primary -D /backups/pre_migration/ -Ft -z -Xs -P
+
+# 2. EXPAND
+psql -f 01_add_column.sql
+psql -f 02_create_trigger.sql
+# Deploy new code to replica 1, verify health
+# Gradually rotate remaining 7 replicas (rolling update)
+
+# 3. BACKFILL
+python backfill_worker.py --host primary --max-runtime 86400  # 24hr budget
+
+# 4. VERIFY
+psql -f 03_verify_consistency.sql   # all counts == 0
+
+# 5. CONTRACT
+psql -f 04_set_not_null.sql          # brief shared lock
+psql -f 05_create_index_concurrent.sql  # no blocking, takes minutes
+psql -f 06_drop_column.sql           # short exclusive lock — schedule carefully
+
+# Done.
+```
+
+### Monitoring Queries (run alongside the migration)
+
+```sql
+-- Long-running transactions that could delay DROP COLUMN
+SELECT pid, now() - xact_start AS duration, state, query
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND now() - xact_start > interval '10 seconds'
+ORDER BY duration DESC;
+
+-- Index build progress
+SELECT phase, block_count, total_blocks,
+       ROUND(100.0 * block_count / total_blocks, 1) AS pct_complete
+FROM pg_stat_progress_create_index
+WHERE relation = 'users'::regclass;
+
+-- Current lock conflicts
+SELECT blocked_pid, blocking_pid, blocked_locks.pid AS blocked_relation,
+       blocking_locks.pid AS blocking_relation
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_locks blocking_locks
+  ON blocking_locks.locktype = blocked_locks.locktype
+  AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+  AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+  AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+  AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+  AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+  AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+  AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+  AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+  AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+  AND blocking_locks.pid != blocked_locks.pid;
+```
+
+---
+
+## Why This Works Under Mixed Versions
+
+1. **Old code never sees `primary_email`** — it reads/writes only `email`. The trigger ensures `primary_email` stays in sync whenever `email` changes.
+2. **New code handles both paths** — `primary_email or email` covers pre-deployment and post-backfill states.
+3. **Dual-write starts the moment new code deploys** — even one canary replica creates consistency ahead of the others.
+4. **No single point of failure** — each stage is independently verifiable and rollbackable without affecting adjacent stages.
+5. **DDL waits are bounded** — statement timeouts, skip locked, and atomic commits prevent cascading failures across the cluster.

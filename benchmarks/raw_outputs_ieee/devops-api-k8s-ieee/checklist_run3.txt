@@ -1,0 +1,322 @@
+[exit=0 latency=26.71s]
+Here's the full production setup — three manifests plus explanation of the probe math and drain sequence.
+
+---
+
+## Manifests
+
+### 1. Deployment
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: go-api-sa
+  namespace: api
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: api
+  labels:
+    app: go-api
+spec:
+  selector:
+    matchLabels:
+      app: go-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0          # never drop below desired replica count
+  replicas: 3                    # baseline; HPA scales to 10
+  template:
+    metadata:
+      labels:
+        app: go-api
+    spec:
+      serviceAccountName: go-api-sa
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30   # matches SIGTERM-to-SIGKILL window
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      containers:
+        - name: go-api
+          image: registry.example.com/go-api:v1.2.3   # pinned, no :latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "192Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          # ── Probes (see arithmetic section below) ──────────────────────
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 5
+            # 30 × 5s = 150s budget for cold-start + cache warmup
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+            successThreshold: 1
+            # 3 × 10s = 30s before K8s restarts; no initialDelay since startupProbe guards early life
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 3
+            successThreshold: 1
+            # removes pod from Service endpoints when cache-warm or unhealthy
+
+          # Secrets mounted as FILES, not env vars
+          volumeMounts:
+            - name: secret-tls
+              mountPath: /etc/secrets/tls
+              readOnly: true
+            - name: secret-db
+              mountPath: /etc/secrets/db
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: secret-tls
+          secret:
+            secretName: go-api-tls
+        - name: secret-db
+          secret:
+            secretName: go-api-db-creds
+        - name: tmp
+          emptyDir: {}
+```
+
+**Key decisions:**
+
+| Concern | Choice | Why |
+|---------|--------|-----|
+| `terminationGracePeriodSeconds` | 30 | Gives the Go HTTP server time to finish in-flight requests after SIGTERM |
+| `maxUnavailable: 0` | Yes | Rolling update never drains below desired count — combined with PDB this gives zero dropped requests |
+| `automountServiceAccountToken: false` | Both SA and pod-level | This API doesn't call the K8s API — kill surface area |
+| Secrets as volumes | `volumeMounts` from `secret:` sources | Raw env-var injection is visible in pod specs, process lists, and logging; file mounts avoid that |
+
+---
+
+### 2. Horizontal Pod Autoscaler (HPA)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api-hpa
+  namespace: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+  minReplicas: 3                     # must match Deployment baseline for PDB
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60          # burst up by 2 pods/min
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5-min cooldown to avoid flapping
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120         # shed 1 pod every 2min max
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70     # scale up when avg pod CPU > 70% of request (150m)
+
+    - type: External
+      external:
+        metric:
+          name: queue_depth_per_pod
+        selector:
+          matchLabels:
+            queue_name: orders
+        target:
+          type: AverageValue
+          averageValue: "100"       # ~100 pending msgs/pod triggers scale-up
+```
+
+**Why two different metric types:**
+
+- **CPU** handles general load spikes (new connections, compute-heavy routes)
+- **External** (`queue_depth_per_pod`) handles back-pressure — the Queue Depth adapter (via Prometheus Adapter) exposes your consumer lag metric. Scaling on this keeps p99 latency flat regardless of how CPU-heavy each message is.
+
+**Behavior tuning rationale:**
+
+- Scale-up window of 60s avoids reacting to momentary blips
+- Scale-down window of 300s prevents thrash when traffic oscillates
+- Asymmetric policy (2 up, 1 down) favors responsiveness over cost savings
+
+**Prerequisite:** You need a custom metrics API server running in-cluster (Prometheus Adapter or kube-state-metrics + custom-metrics-adapter) scraping the `queue_depth_per_pod` gauge from your app.
+
+---
+
+### 3. PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: api
+spec:
+  minAvailable: 2                       # always keep at least 2 pods available
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+With `replicas: 3` minimum, `minAvailable: 2` means K8s will allow at most **one** pod to be voluntarily disrupted at a time (node drain, cluster upgrade). Combined with `maxUnavailable: 0` on the Deployment strategy, this guarantees:
+
+- During a rolling deploy: old pod terminates → new pod becomes ready → old pod fully removed. At no point are active pods reduced below the current count minus one (and the PDB enforces that even that one requires approval).
+- During a node drain: if 2 pods land on the same node, the PDB blocks the drain until one pod is safely rescheduled elsewhere.
+
+---
+
+## Probe Threshold Arithmetic
+
+Here's the timeline for a fresh pod starting up:
+
+```
+Time (s)    Event
+───────────────────────────────────────────────────────────────
+0           Container starts; all three probes begin checking
+0–5         startupProbe: 1st attempt (period=5s)
+5           startupProbe: 2nd attempt ← if /healthz passes here, startup succeeds immediately
+...
+20          Cold cache finishes warming (application internal milestone)
+25          readinessProbe has seen ≥2 consecutive successes → pod added to Service endpoints
+30          startupProbe has now passed; it stops being evaluated entirely
+>30         Only liveness + readiness are active
+```
+
+**Startup probe: 30 × 5s = 150s budget**
+
+This is the maximum wall-clock time from container start to the first successful `/healthz`. A compiled Go binary starts fast; the bottleneck is cache warmup (20s) plus network/DNS to dependencies. Even with a conservative retry budget, 150s covers 7× the actual warmup time. If the cache never warms, the container dies after 150s instead of sitting in a degraded state forever.
+
+**Liveness probe: 3 × 10s = 30s before restart**
+
+No `initialDelaySeconds` because the startup probe already validated the process could start. Once it transitions past startup, liveness takes over. If the process deadlocks, `timeoutSeconds: 3` ensures a single failed check completes within 3s (avoids blocking the period window). After 3 consecutive failures (30s), K8s kills and restarts the container. This catches goroutine leaks where the process is alive but unresponsive.
+
+**Readiness probe: 3 × 5s = 15s before traffic stops**
+
+The `/readyz` endpoint checks whether the cold cache is warmed. While it returns HTTP 503, K8s removes the pod from the Service's endpoint slice — no new requests land here. Consecutive failures (`failureThreshold: 3`) trigger removal. Note this uses `successThreshold: 1` — once the cache warms and `/readyz` returns 200, the pod rejoins endpoints after just one successful check (no unnecessary delay on recovery).
+
+**What happens at each phase:**
+
+| Phase | Startup | Liveness | Readiness | Traffic? |
+|-------|---------|----------|-----------|----------|
+| 0–20s (warming) | Failing → eventually succeeds | May pass (process alive) | Failing (cache cold) | No (not in endpoints) |
+| 20–150s (running) | Passed → disabled | Checks continue | Passing | Yes |
+| Deadlock after 150s | N/A | Fails → restart | Irrelevant (pod dying) | None |
+| Crash after startup | Would fail if happened | Would fail → restart | Irrelevant | Depends on timing |
+
+---
+
+## Graceful Drain Sequence
+
+When K8s decides a pod should terminate (deploy, scale-down, node drain), the sequence is:
+
+```
+Step 1 ─ SIGTERM sent to PID 1 (the Go process)
+         ↓
+Step 2 ─ Server.Shutdown(ctx) begins:
+         • New requests are rejected (HTTP 503 from router layer)
+         • In-flight requests continue processing
+         ↓
+Step 3 ─ Readiness probe returns 503 → K8s removes from endpoints immediately
+         ↓
+Step 4 ─ [Up to terminationGracePeriodSeconds (30s)]
+         Active requests finish. Each request handler should
+         respect the context cancellation deadline.
+         ↓
+Step 5 ─ SIGKILL sent (if still alive at 30s) → hard kill
+```
+
+**Critical code requirements on the Go side:**
+
+```go
+// main.go pattern for graceful shutdown
+srv := &http.Server{Addr: ":8080"}
+
+go func() {
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, syscall.SIGTERM)
+    <-sig
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+    defer cancel()
+    
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Printf("server shutdown error: %v", err)
+    }
+}()
+
+if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+    log.Fatalf("listen: %v", err)
+}
+```
+
+**Important detail — `terminationGracePeriodSeconds: 30` vs context timeout: 25s.** The 5s buffer accounts for Docker/containerd cleanup overhead after the process exits. If handlers have long-running operations (e.g., downstream calls), they should use `ctx.Done()` to abort early rather than waiting the full 30s.
+
+**Zero-dropped-guarantee stack:**
+
+1. PDB (`minAvailable: 2`) blocks drain if <2 pods remain
+2. Deployment (`maxUnavailable: 0`) ensures rolling update doesn't cut replicas
+3. Readiness removal (Step 3 above) stops routing *new* traffic to draining pods
+4. Graceful shutdown (Steps 4–5) finishes existing work before exit
+5. New requests land on surviving pods or the fresh replacement pod
+
+No configuration alone achieves this — the `/readyz` endpoint must return 503 while the cache is warming AND during graceful shutdown (so Step 3 fires early), and the HTTP server must properly shut down.

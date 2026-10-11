@@ -1,0 +1,488 @@
+[exit=0 latency=46.77s]
+# Refactoring Campaign: 1,400-Line God `OrderService`
+
+## Problem Statement (Current State)
+
+| Metric | Value | Implication |
+|---|---|---|
+| Lines of code | ~1,400 | Single unit of compilation; changes cascade blindly |
+| Public fields | 34 | Every method shares mutable state; hard to isolate behavior |
+| Concerns mixed | Validation, pricing, tax, persistence, email, audit logging + SQL string fragments | Violates SRP, impossible to test any single concern in isolation |
+| Tests | 0 | Any change is a deploy-time gamble |
+
+**Goal**: Split into composable collaborators behind an identical public API, verified by behavioral regression tests at every commit.
+
+---
+
+## Phase 0 — Inventory & Static Baseline
+
+Before writing a single test, establish what you're preserving.
+
+### Step A: Call-graph dump
+
+```python
+# Pseudo: walk AST or use your language's introspection tool
+# Goal: confirm which methods touch SQL, which send email, which compute pricing
+grep -n -E "\.(execute|query|send_mail|SMTP|render_template|pricing|tax_rate)" \
+     src/domain/orders/order_service.py -h -r > scripts/inventory/call-sites.txt
+```
+
+Count occurrences per concern. You'll need these numbers to prove later that concerns are fully migrated.
+
+### Step B: Extract the public contract
+
+List every `public`/non-dunder method signature and its docstring. This becomes the immutable boundary.
+
+```python
+# Output file: scripts/inventory/public_contract.json
+[
+  {"method": "create_order", "params": ["cart_id", "customer_id"], "returns": "Order"},
+  {"method": "apply_coupon", "params": ["order_id", "coupon_code"], "returns": None},
+  {"method": "place_order", "params": ["order_id", "payment_token"], "returns": "OrderConfirmation"},
+  ...  # one entry per public method
+]
+```
+
+Every refactor step must preserve the JSON-encoded return shape (or raise the same domain exceptions). No schema drift allowed on these signatures.
+
+---
+
+## Phase 1 — Golden-Master Characterization Tests
+
+**Principle**: We cannot refactor what we cannot measure. Write *characterization tests* that assert against the **current observable behavior**, not idealized behavior. These are regression contracts, not happy-path specs.
+
+### 1.1 Test Infrastructure: Test Harness Adapter
+
+Wrap the three side-effect channels before anything else:
+
+```python
+"""tests/harness/side_effect_harness.py"""
+from __future__ import annotations
+import json
+import smtplib
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from datetime import datetime
+
+
+class QueryLog:
+    """Captures raw SQL strings + params so golden-masters can diff them."""
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple]] = []
+    def record(self, sql: str, params: tuple) -> None:
+        self.calls.append((sql, params))
+    def as_json(self) -> str:
+        return json.dumps(
+            [{"sql": s, "params": p} for s, p in self.calls],
+            indent=2, sort_keys=True, default=str,
+        )
+
+
+class EmailSnapshot:
+    """Sucks up SMTP calls into JSON for golden-matching."""
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+    def capture_sendmail(self, from_addr: str, to_addrs: list[str], msg: str) -> None:
+        self.sent.append({
+            "from": from_addr,
+            "to": to_addrs,
+            "subject": _extract_header(msg, "Subject"),
+            "body_preview": msg.split("\n\n")[1][:200] if "\n\n" in msg else "",
+        })
+    def as_json(self) -> str:
+        return json.dumps(self.sent, indent=2, sort_keys=True, default=str)
+
+
+def _extract_header(raw_msg: str, header_name: str) -> str:
+    for line in raw_msg.splitlines():
+        if line.lower().startswith(header_name.lower() + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+# Factory used by each characterization test
+def snapshot_harness(db_conn_mock: MagicMock) -> tuple[QueryLog, EmailSnapshot]:
+    queries = QueryLog()
+    emails = EmailSnapshot()
+
+    def fake_execute(sql: str, params: tuple):
+        queries.record(sql, params)
+        return []  # stub row result
+
+    db_conn_mock.cursor.return_value.execute = fake_execute
+    db_conn_mock.commit = MagicMock()
+
+    with patch("smtplib.SMTP") as smtp_cls:
+        mock_smtp = MagicMock()
+        smtp_cls.return_value = mock_smtp
+        mock_smtp.sendmail.side_effect = emails.capture_sendmail
+        yield queries, emails
+```
+
+**Why a harness, not just mocks?** Because the harness captures *every* outgoing query and email instead of asserting individual calls. The golden master file is the serialized JSON blob from one run. Future runs fail the test if the JSON differs.
+
+### 1.2 Snapshot Existing Behavior
+
+For each public method, create one characterization test that:
+
+1. Seeds known database rows (customers, products, coupons, tax rules).
+2. Calls the real (unmodified) service via the harness.
+3. Serializes `(queries.as_json(), emails.as_json(), final_database_snapshot)` to a `.golden.json` file.
+4. Asserts equality between current run and committed golden file.
+
+```python
+"""tests/char/test_place_order_characterization.py"""
+import pytest
+import json
+from pathlib import Path
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from src.domain.orders.order_service import OrderService
+from tests.harness.side_effect_harness import snapshot_harness, QueryLog, EmailSnapshot
+
+
+GOLDEN_PATH = Path(__file__).parent / "golden/place_order_default_v1.golden.json"
+
+
+@pytest.fixture
+def order_service(tmp_path, monkeypatch):
+    """Build the real OrderService with mocked deps wired through the harness."""
+    conn_mock = MagicMock()
+    queries, emails = snapshot_harness(conn_mock)
+
+    # Seed: monkey-patch the internal repo/loader so it returns static data
+    # In your language: wire interfaces pointing to in-memory fixtures
+    svc = OrderService(
+        db_connection=conn_mock,
+        email_sender=MagicMock(),   # captured by harness patch
+        coupon_repo=MagicMock(return_value={"code": "SAVE10", "discount_pct": 10}),
+        tax_calculator=MagicMock(return_value=7.5),
+        event_bus=MagicMock(),
+    )
+    return svc
+
+
+def test_place_order_snapshots_all_side_effects(order_service):
+    """Golden-master: verify every query + email matches the committed baseline."""
+    # Arrange: known inputs
+    cart_items = [
+        {"product_id": "PROD-1", "qty": 2, "unit_price_cents": 5000},
+        {"product_id": "PROD-2", "qty": 1, "unit_price_cents": 12000},
+    ]
+    order_id = order_service.create_order(
+        cart_id="CART-A", customer_id="CUST-B", items=cart_items
+    )
+
+    # Act
+    confirmation = order_service.place_order(
+        order_id=order_id, payment_token="tok_test_42"
+    )
+
+    # Assert: compare to golden file
+    payload = {
+        "queries": json.loads(order_service._query_log.as_json()),
+        "emails": json.loads(order_service._email_snapshot.as_json()),
+        "confirmation_shape": {
+            "order_id": confirmation.order_id,
+            "total_cents": confirmation.total_cents,
+            "status": confirmation.status,
+        },
+    }
+
+    if not GOLDEN_PATH.exists():
+        GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        pytest.skip(f"Created initial golden file at {GOLDEN_PATH}")
+
+    existing = json.loads(GOLDEN_PATH.read_text())
+    assert payload == existing, (
+        f"Behavior changed! Diff:\n"
+        f"  queries delta:  {_json_diff(existing['queries'], payload['queries'])}\n"
+        f"  emails delta:   {_json_diff(existing['emails'], payload['emails'])}"
+    )
+```
+
+Run this **before** any refactoring. Commit the golden file. From now on, every green build proves "no behavioral regression."
+
+### 1.3 What Gets Snapped
+
+| Side Effect | Capture Mechanism | Golden File Content |
+|---|---|---|
+| SQL executed per call | `QueryLog.call(sql, params)` | Array of `{sql, params}` ordered by call sequence |
+| Emails sent per call | `EmailSnapshot.sent[]` | Array of `{from, to, subject, body_preview}` |
+| Database mutations | After-run `SELECT * FROM orders WHERE id=?` | Row diffs pre/post operation |
+| Return-value shapes | Dict serialization | Full return object |
+| Exception types/messages | Catch + serialize | `{exception_type, message}` if any |
+
+> **Rule**: If it produces an observable effect outside the method's pure return value, it gets snapped.
+
+---
+
+## Phase 2 — Target Module Boundaries
+
+Design the future architecture *on paper* before extracting seams. This keeps each step heading toward a coherent destination rather than random splits.
+
+```
+target/
+├── core/
+│   ├── model/          # Order, OrderLine, OrderStatus, Money, Address (value objects)
+│   └── exception/      # OrderNotFound, InvalidCartError, PricingError (domain exceptions)
+│
+├── validation/         # Reads request DTO, validates business invariants
+│   └── order_validator.py       # validate_cart_for_order(cart, customer)
+│
+├── pricing/            # Pure functions: given inputs → money
+│   ├── price_calculator.py      # compute_line_total(item), compute_subtotal(items)
+│   ├── discount_engine.py       # apply_coupon(subtotal, coupon, customer)
+│   └── shipping_estimator.py    # estimate_shipping(weight, zone, member_since)
+│
+├── tax/                # Pure functions (or thin facade over external rate API)
+│   └── tax_calculator.py        # calculate_tax(subtotal, address, product_class)
+│
+├── fulfillment/        # Orchestrates: persist → charge → notify
+│   ├── order_repository.py      # interface: save(Order) -> OrderId
+│   ├── payment_gateway.py       # interface: charge(token, amount) -> ChargeResult
+│   ├── email_sender.py          # interface: send_order_confirmation(to, order_data)
+│   └── audit_logger.py          # interface: log_event(event_type, payload)
+│
+├── infrastructure/
+│   ├── db/                # SQL implementations of OrderRepository
+│   │   └── order_repo_impl.py    # execute INSERT/UPDATE, maps rows→model
+│   ├── mail/              # SMTP/MJML implementations of EmailSender
+│   └── audit/             # DB/file/log-based AuditLogger
+│
+└── application/
+    └── order_service.py   # Thin orchestrator: reads → validates → prices → taxes → persists → notifies
+                              ~80 lines. Almost zero logic.
+```
+
+### Why this decomposition (SRP + dependency direction)
+
+- **Validation, Pricing, Tax** contain zero I/O. They are pure functions or close enough. Extract them first because they have zero risk — they don't read or write state.
+- **Fulfillment** defines the collaborator interfaces (ports). These are the *seams*.
+- **Infrastructure** implements ports with SQL, SMTP, etc. — where the dirty work lives.
+- **Application.OrderService** becomes a composition root / orchestrator, not a god object.
+
+The key insight: **pull dependencies inward**. The original `OrderService` has `db_connection`, `smtp_server`, etc. as fields. Those become injected interfaces pointing to infrastructure impls.
+
+---
+
+## Phase 3 — Seam Extraction Order
+
+### Extract Sequence (Least Risk → Most Risk)
+
+```
+Step 1: Model extraction      → Move 34 fields into typed domain classes (no behavior change)
+Step 2: Validation extract    → Pull all validation logic into a standalone validator
+Step 3: Pricing extract       → Pull all price math into pure-price-calculator
+Step 4: Discount engine       → Pull coupon/tax into separate calculators
+Step 5: Persistence port      → Define OrderRepository interface + stub impl
+Step 6: Email port            → Define EmailSender interface + stub impl
+Step 7: Audit port            → Define AuditLogger interface + stub impl
+Step 8: Payment port          → Define PaymentGateway interface + stub impl
+Step 9: Wiring                → Inject interfaces into slimmed OrderService
+Step 10: Infra impls          → Wire real SQL/SMTP/implementations behind the ports
+```
+
+### Why This Order?
+
+| Order | Concern | Rationale |
+|---|---|---|
+| 1st | Model | Zero I/O. Rename field access `self.field` → `order.field`. Characterization tests stay green immediately. Lowest-risk step possible. |
+| 2nd | Validation | Validates input → may raise early. No side effects. Extracting here gives quick win: cleaner service methods, tests still pass. |
+| 3rd | Pricing | Pure math. Extract, add unit tests, then refactor callers. |
+| 4th | Discounts/Tax | Depends on pricing outputs. Can be done after pricing is proven pure. |
+| 5th | Persistence port | First interface extraction. Introduce `OrderRepository` abstract base. Swap out direct SQL with `repo.save(order)`. **First point where SQL leaves the service.** |
+| 6th | Email port | Next seam. Replace `self.smtp.sendmail(...)` → `self.email_sender.send_confirmation(...)`. |
+| 7th | Audit | Same pattern as email. Trivial. |
+| 8th | Payment | May have transactional semantics — do last because it may interact with persistence in complex ways. |
+| 9th | Wiring | Compose everything together. Service is now ~80 lines. Final cleanup. |
+| 10th | Infra impls | Real SQL mapper, real SMTP sender. All behind interfaces. Tests unchanged. |
+
+### Concrete Seam Example (Persistence Port — Step 5)
+
+**Before** (in `OrderService.place_order`, roughly):
+
+```python
+def place_order(self, order_id, payment_token):
+    self._validate_order_exists(order_id)
+    total = self._compute_total(order_id)
+    
+    conn = self.db_connection
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE orders SET status='paid', "
+        "total_cents=%s, payment_ref=%s WHERE id=%s",
+        (total, self._generate_payref(payment_token), order_id)
+    )
+    conn.commit()
+    self._send_confirmation_email(order_id)
+    self._audit_log("ORDER_PLACED", {"order_id": order_id})
+```
+
+**After** (still inside the unmodified service, next commit):
+
+```python
+# New: infrastructure/ports.py
+class OrderRepository(ABC):
+    @abstractmethod
+    def save(self, order: Order) -> Order: ...
+    @abstractmethod
+    def find_by_id(self, order_id: str) -> Order: ...
+
+class PaymentGateway(ABC):
+    @abstractmethod
+    def charge(self, token: str, amount_cents: int) -> PaymentResult: ...
+
+class EmailSender(ABC):
+    @abstractmethod
+    def send_order_confirmation(self, order_id: str, recipient: str) -> None: ...
+
+class AuditLogger(ABC):
+    @abstractmethod
+    def log(self, event: AuditEvent) -> None: ...
+
+
+# Still in OrderService but calling abstractions:
+def place_order(self, order_id, payment_token):
+    order = self._repo.find_by_id(order_id)           # was: raw SQL
+    self._validate_order_exists(order_id)
+    total = self._pricing.compute_total(order.items)   # was: inline calc
+    
+    payment_result = self._gateway.charge(payment_token, total.cents)
+    
+    order.status = OrderStatus.PAID
+    order.payment_ref = payment_result.reference
+    self._repo.save(order)                             # was: raw SQL UPDATE
+    
+    self._sender.send_order_confirmation(order.id, order.customer_email)  # was: self.smtp.sendmail
+    self._logger.log(AuditEvent(order_placed, order_id=order_id))          # was: self._audit_log
+```
+
+The key move: **one abstraction at a time**. Replace only the SQL statements for *one* concern (e.g., persistence), run characterization tests (they should still pass because the SQL produced is identical — it comes from the new repo impl, which just wraps the old SQL). Then move to the next concern.
+
+---
+
+## Phase 4 — Incremental Strangler Map
+
+Each step is shippable behind the existing public API. Each step has its own green build.
+
+### Commits (each = one shipped step)
+
+```
+commit  1: chore(test): add golden-master harness + characterization suite for all public methods
+commit  2: refactor(model): extract 34 fields into Order/OrderLine/Address/Money value objects
+commit  3: refactor(validation): extract OrderValidator class from inline check_* methods
+commit  4: refactor(pricing): extract PriceCalculator with pure compute_* methods
+commit  5: refactor(discount): extract DiscountEngine.apply_coupon(subtotal, coupon) 
+commit  6: refactor(tax): extract TaxCalculator.calculate_tax(base, address, item_class)
+commit  7: feat(infra): define OrderRepository port + SqlOrderRepository impl (wraps existing SQL)
+commit  8: refactor(svc): wire OrderRepository into OrderService, replace INSERT/SELECT SQL
+commit  9: feat(infra): define EmailSender port + SmtpEmailSender impl (wraps existing SMTP)
+commit 10: refactor(svc): wire EmailSender into OrderService, replace self.smtp.sendmail
+commit 11: feat(infra): define AuditLogger port + DbAuditLogger impl
+commit 12: refactor(svc): wire AuditLogger into OrderService, replace self._audit_log
+commit 13: feat(infra): define PaymentGateway port + StripePaymentGateway impl
+commit 14: refactor(svc): wire PaymentGateway, extract charge sequencing logic
+commit 15: refactor(svc): clean orchestration layer (~80 lines), remove dead fields
+commit 16: test: replace characterization tests with proper unit/integration test suite
+```
+
+**Between each commit**, run the characterization suite. Green = safe to ship. Red = roll back that commit; fix the impl.
+
+---
+
+## Phase 5 — Proving Behavior Preservation At Every Commit
+
+### 5.1 CI Gate Script
+
+```bash
+#!/bin/bash
+# scripts/verify_behavior.sh
+set -euo pipefail
+
+echo "▶ Running characterization (golden-master) suite..."
+pytest tests/char/ --tb=short -v || {
+  echo "❌ CHARACTERIZATION TEST FAILED — behavior regression detected!"
+  echo "   If the change is intentional, regenerate golden files:"
+  echo "   pytest tests/char/ --update-golden"
+  exit 1
+}
+
+echo "✓ All characterizations match expected behavior."
+
+echo "▶ Running regression suite..."
+pytest tests/regression/ --tb=line -q || {
+  echo "❌ REGRESSION TEST FAILURE"
+  exit 1
+}
+
+echo "✅ Behavior preserved. Safe to merge."
+```
+
+### 5.2 What Each Commit Must Pass
+
+| Check | Tool | Fail Action |
+|---|---|---|
+| Characterization (golden JSON diff) | `pytest tests/char/` | Abort merge; update golden if spec changed |
+| Unit tests for extracted modules | `pytest tests/unit/` | Fix the impl |
+| No-plain-SQL lint rule | `grep -rn '\.execute("' src/domain/orders/` | Redirect to repo impl, not service |
+| Import-guard: service imports no infra | `pytest tests/arch/import_guard.py` | Remove circular/leaky import |
+
+### 5.3 Manual Regression Smoke Tests
+
+After each commit, run the app in a dev environment with staging data and:
+
+1. Create an order → verify DB row + email landed.
+2. Apply a coupon → verify price recalculated correctly.
+3. Place the order → verify payment charged, status updated, audit row created.
+4. Cancel/refund flow → verify reversal logic intact.
+
+These are not automated in the commit gate (they require live services), but they are mandatory QA steps before deploying that commit to staging.
+
+### 5.4 Golden File Regeneration Protocol
+
+If a change *intentionally* alters behavior:
+
+```bash
+# 1. Run with regeneration flag
+pytest tests/char/ --update-golden -v
+
+# 2. Inspect the diff
+git diff tests/char/golden/
+
+# 3. Commit both the code change AND the updated golden file together
+git add tests/char/golden/*.json src/domain/orders/
+git commit -m "refactor(pricing): switch from flat-rate to tiered shipping
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>"
+```
+
+Never update goldens silently. The diff is the spec change.
+
+---
+
+## Risks & Mitigations
+
+| Risk | Probability | Mitigation |
+|---|---|---|
+| Characterization tests miss a side effect | Medium | Use the harness approach (capturing *everything*, not asserted calls); supplement with integration smoke tests |
+| Transaction boundary shifts during SQL extraction | Medium | Keep the exact same transaction scope in the repo impl until all callers use the new port |
+| SQL-generated strings differ but produce identical DB state | Low | Include parameter values in the golden JSON, not just raw SQL text |
+| Email rendering changes (newlines, headers) break golden | High | Normalize whitespace in the harness before comparison; compare rendered body, not raw MIME string |
+| Stepping on another developer's feature branch | Low | Extract to a dedicated `refactor-order-service` feature branch; rebase frequently; small PRs |
+
+---
+
+## Post-Migration Checklist
+
+Once the service is slimmed to ~80 lines and all SQL/email lives behind interfaces:
+
+1. **Delete** the 34 shared fields; each collaborator owns its own state.
+2. **Add** proper dependency injection container wiring (if using one).
+3. **Document** the module boundaries as an Architecture Decision Record.
+4. **Remove** `--update-golden` from CI; characterize tests become regression tests with explicit assertions.
+5. **Consider** breaking the monolith further: extract `pricing/` and `tax/` into separate packages if they serve other domains.
+6. **Measure**: Confirm that the slowest method in the old service is now either removed (pure function cached) or delegated to the correct collaborator. Add perf benchmarks to the characterization suite.

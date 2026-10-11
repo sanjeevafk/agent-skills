@@ -1,0 +1,347 @@
+Here's my security analysis of the described FastAPI webhook implementation, ordered by severity:
+
+---
+
+## Vulnerability Analysis
+
+### 1. CRITICAL — Signature Verification After JSON Parsing
+
+```python
+# INSECURE PATTERN
+@app.post("/webhook")
+async def webhook(request: Request):
+    body = await request.json()        # ← Parses entire payload first
+    verify_hmac(body, secret)         # ← Only then checks authenticity
+```
+
+**Impact:** A malicious actor can send thousands of large, malformed, or crafted payloads before any auth check. This is a classic **auth-then-validate vs validate-then-auth** inversion that enables:
+
+- **Resource exhaustion DoS** — JSON parsing allocates memory; forged payloads multiply this cost per request.
+- **Timing oracle leakage** — Different error paths (parse failure vs HMAC failure) have subtly different timing, enabling side-channel attacks against the HMAC comparison function (`hmac.compare_digest` constant-time helps, but earlier failure modes don't).
+- **Log poisoning** — If the parser throws, stack traces or partial data may leak into structured logs.
+
+**Fix:** Verify the HMAC over the *raw request body bytes* **before** any deserialization. The HMAC header contains the signature computed over the exact byte stream; we must compute it the same way.
+
+### 2. HIGH — In-Memory Replay ID Ledger
+
+```python
+# INSECURE PATTERN
+_seen_event_ids: set[str] = set()   # ← Volatile, non-persistent
+
+# On restart, all protection vanishes.
+@app.post("/webhook")
+async def webhook(request: Request):
+    event_id = request.headers.get("X-Event-Id")
+    if event_id in _seen_event_ids:
+        return JSONResponse({"error": "replayed"}, status=200)
+    _seen_event_ids.add(event_id)
+```
+
+**Impact:**
+- **Zero durability.** A process restart, horizontal scale-out, or pod eviction wipes the deduplication window entirely. Every subsequent duplicate delivery is treated as novel.
+- **No bounded TTL.** The set grows unboundedly until process death → OOM.
+- **Not atomic.** `in` + `add` is a race condition under concurrent requests; two identical webhooks arriving simultaneously both pass the check.
+
+**Fix:** Use a persistent store (Redis recommended) with TTL-based expiration. Redis `SETNX` with an expiry is both atomic and durable.
+
+### 3. HIGH — Rotating Secret Not Handled in Verification
+
+The prompt states secrets *rotate*, but the pattern uses a single hardcoded or env-backed secret string. Rotation creates a period where old signatures use key ID `k-old` and new ones use `k-new`. Without:
+
+- A **key ID** passed in a header (e.g., `X-Secret-Key-Id`)
+- A **multi-key verification loop** (newest first, fallback to previous)
+
+…legitimate webhooks during rotation will be rejected, causing payment processing outages.
+
+### 4. MEDIUM — Idempotent Processing Under Concurrency
+
+Using `set.add()` or `dict["id"] = result` is not atomic at the application level across workers. Two Gunicorn/Uvicorn workers receiving the same webhook simultaneously will both enter processing.
+
+**Fix:** Combine Redis SETNX (atomic dedup) with the idempotency guard — only the worker who wins the CAS proceeds. Others short-circuit with a stored result lookup.
+
+### 5. LOW — Error Leakage to Client
+
+If the processor raises on a third-party API call, an unhandled exception propagates as a 500 with framework traceback. Even with middleware, internal details like upstream provider names or transaction IDs may appear.
+
+**Fix:** Catch all errors, log internally, and return a neutral `200 Accepted` (per webhook best practice) so the provider doesn't retry aggressively.
+
+### 6. LOW — Missing Timing-Attack Resistance on Event-ID Comparison
+
+Using `event_id in _seen_event_ids` is fine for dicts (O(1), deterministic hash), but if ever migrated to list-based lookup, a linear comparison leaks timing. With Redis, this is moot since the provider returns `NIL` or value atomically.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+FastAPI payment webhook endpoint — production-grade security.
+
+Dependencies:
+    pip install fastapi uvicorn[standard redis cryptography pydantic-settings python-dotenv
+"""
+
+import hashlib
+import hmac
+import logging
+import time
+from datetime import timedelta
+from typing import Optional
+
+import redis.asyncio as redis
+from fastapi import FastAPI, Header, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────── Settings ────────────────────
+
+class Settings(BaseSettings):
+    # Single rotating key pair; replaced via config management (Vault/K8s secrets)
+    WEBHOOK_HMAC_SECRET: str
+    # Redis connection (shared cache)
+    REDIS_URL: str = "redis://localhost:6379/0"
+    # Dedup window — matches provider's max-retry span
+    REPLAY_WINDOW_SECONDS: int = 3600
+    # Allow 10s clock skew between us and the provider
+    MAX_CLOCK_SKEW_SECONDS: int = 10
+
+settings = Settings()
+
+
+# ──────────────────── App & Redis singleton ────────────────────
+
+app = FastAPI(title="Payment Webhook Service")
+
+_redis_client: redis.Redis | None = None
+
+
+@app.on_event("startup")
+async def _start():
+    global _redis_client
+    _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+@app.on_event("shutdown")
+async def _stop():
+    if _redis_client:
+        await _redis_client.close()
+
+
+def _get_redis() -> redis.Redis:
+    if _redis_client is None:
+        raise RuntimeError("Redis client not initialized")
+    return _redis_client
+
+
+# ──────────────────── Secret key ring ─────────────────────
+
+# Active key index for signing (outgoing); for verifying we check current + previous.
+_ACTIVE_KEY_ID = "current"
+_PREVIOUS_KEY_ID = "previous"
+
+# Map key_id → secret bytes. Rotate by swapping values in your secret manager.
+_SECRET_KEYRING: dict[str, bytes] = {
+    _ACTIVE_KEY_ID: settings.WEBHOOK_HMAC_SECRET.encode(),
+    _PREVIOUS_KEY_ID: b"rotated-secret-placeholder",  # swap via infra secrets
+}
+
+
+def get_available_key_ids() -> list[tuple[str, bytes]]:
+    """Return keys newest-first so we verify the current key and fall back."""
+    return [(_ACTIVE_KEY_ID, _SECRET_KEYRING[_ACTIVE_KEY_ID]),
+            (_PREVIOUS_KEY_ID, _SECRET_KEYRING[_PREVIOUS_KEY_ID])]
+
+
+# ──────────────────── HMAC verification (on raw bytes) ───────
+
+async def verify_webhook_signature(
+    raw_body: bytes,
+    signature: str,
+    key_id: str,
+) -> bool:
+    """Compute HMAC-SHA256 over the **exact raw request body** and compare."""
+    expected = hmac.new(
+        _SECRET_KEYRING[key_id],
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def verify_any_key(raw_body: bytes, signature: str) -> bool:
+    """Try all registered keys; the newest matching key wins."""
+    for _, secret in get_available_key_ids():
+        expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return True
+    return False
+
+
+# ──────────────────── Replay / idempotency (Redis) ───────────
+
+_REPLAY_KEY_PREFIX = "wh:duplicate:"   # wh = webhook
+
+
+async def claim_delivery(event_id: str) -> tuple[bool, Optional[str]]:
+    """
+    Atomically attempt to claim a unique delivery.
+
+    Returns:
+        (claimed, stored_result_or_None)
+
+    If another worker already claimed it, returns (False, stored_response_body).
+    """
+    r = _get_redis()
+    raw_ttl = settings.REPLAY_WINDOW_SECONDS
+    ttl_ms = int(timedelta(seconds=raw_ttl).total_seconds() * 1000)
+    # SET key value NX PX  — atomic "set-if-not-exists" with expiry in ms
+    acquired = await r.set(
+        f"{_REPLAY_KEY_PREFIX}{event_id}",
+        "",                       # placeholder — we'll store result separately
+        nx=True,                  # only if key does NOT exist
+        px=ttl_ms,                # expire after dedup window
+    )
+    if not acquired:
+        # Another worker won; fetch its processed result if stored.
+        stored = await r.get(f"{_REPLAY_KEY_PREFIX}{event_id}:result")
+        if stored:
+            return False, stored
+        # Still in-flight (processing by the winner); brief spin-wait then re-check.
+        await asyncio.sleep(0.05)
+        stored = await r.get(f"{_REPLAY_KEY_PREFIX}{event_id}:result")
+        if stored:
+            return False, stored
+        return False, None  # Give up — treat as unknown (provider retries)
+    return True, None
+
+
+# ──────────────────── Process handler (caller-supplied) ──────
+
+async def process_payment_event(payload: dict) -> dict:
+    """
+    Domain logic: apply the payment event, update ledger, etc.
+    Raise on failure so the caller records an error.
+    """
+    raise NotImplementedError("Replace with actual processing logic")
+
+
+# ──────────────────── Clock-skeu check ────────────────────────
+
+async def check_clock_skeu(timestamp_header: Optional[str]) -> bool:
+    if timestamp_header is None:
+        return False  # Let sig verification fail below
+    try:
+        ts = float(timestamp_header)
+    except ValueError:
+        return False
+    return abs(time.time() - ts) <= settings.MAX_CLOCK_SKEW_SECONDS
+
+
+# ──────────────────── Endpoint ───────────────────────────────
+
+@app.post("/v1/webhook/payment")
+async def payment_webhook(
+    request: Request,
+    response: Response,
+    # These headers come from the payment processor
+    x_signature: str = Header(alias="X-Signature"),
+    x_secret_key_id: str = Header(alias="X-Secret-Key-Id"),
+    x_event_id: str = Header(alias="X-Event-Id"),
+    x_timestamp: Optional[str] = Header(default=None, alias="X-Timestamp"),
+):
+    """
+    Accept inbound payment webhooks. Security measures:
+
+    1. Verify HMAC over **raw body bytes** before JSON parsing.
+    2. Deduplicate using Redis SETNX with TTL (persistent, atomic, concurrent-safe).
+    3. Handle secret key rotation by trying multiple keys.
+    4. Never expose internal errors to the caller.
+    """
+
+    # Step 1 — Read RAW body (bytes are what the HMAC covers).
+    raw_body = await request.body()
+
+    # Step 2 — Clock skew gate.
+    if not await check_clock_skeu(x_timestamp):
+        logger.warning("clock skew too large from %s", x_event_id)
+        return JSONResponse(
+            {"detail": "retry later"}, status_code=503,
+            headers={"Retry-After": "10"}
+        )
+
+    # Step 3 — HMAC verification over raw bytes, trying rotated keys.
+    if not await verify_any_key(raw_body, x_signature):
+        logger.warning(
+            "invalid HMAC: event_id=%s key_id=%s",
+            x_event_id, x_secret_key_id,
+        )
+        # Return 200 so the provider does NOT storm with retries.
+        return JSONResponse(
+            {"detail": "ignored"}, status_code=200,
+        )
+
+    # Step 4 — Atomic deduplication claim (Redis SETNX).
+    claimed, existing_result = await claim_delivery(x_event_id)
+    if not claimed:
+        if existing_result:
+            # Return exactly the same 2xx we returned originally.
+            parsed = json.loads(existing_result)
+            return JSONResponse(content=parsed)
+        # Still being processed by another worker — accept and let them handle result storage.
+        # We still return 200 to prevent retries.
+        return JSONResponse({"detail": "accepting"}, status_code=200)
+
+    # Step 5 — NOW parse JSON (signature verified, dedup won).
+    try:
+        payload: dict = json.loads(raw_body)
+    except json.JSONDecodeError:
+        logger.exception("json decode failed")
+        return JSONResponse({"detail": "accepted"}, status_code=200)
+
+    # Step 6 — Store the event-id → result mapping for concurrent coalescing.
+    result_cache_key = f"{_REPLAY_KEY_PREFIX}{x_event_id}:result"
+
+    try:
+        result = await process_payment_event(payload)
+    except Exception:
+        # Internal error — log fully, return neutral acceptance so provider stops retrying.
+        logger.exception("payment event processing failed for %s", x_event_id)
+        result = {"status": "accepted", "event_id": x_event_id, "retry_later": True}
+
+    # Step 7 — Persist result so concurrent claims can return it.
+    await _get_redis().set(
+        result_cache_key,
+        json.dumps(result),
+        ex=settings.REPLAY_WINDOW_SECONDS,
+    )
+
+    return JSONResponse(content=result, status_code=200)
+
+
+# ──────────────────── Imports needed above (order matters for module load) ──
+import asyncio
+import json
+```
+
+---
+
+## Summary of Fixes
+
+| # | Vulnerability | Severity | Fix Applied |
+|---|---|---|---|
+| 1 | HMAC verified after JSON parse | **Critical** | `request.body()` reads raw bytes; HMAC computed over those bytes *before* `json.loads()` |
+| 2 | In-memory replay set | **High** | Redis `SETNX` with TTL — persistent, atomic across processes, auto-expiring |
+| 3 | Key rotation not supported | **High** | Multi-key verification loop (`verify_any_key`) checks current and previous key |
+| 4 | Concurrent idempotency race | **High** | `claim_delivery` uses atomic `SETNX`; losers wait briefly, then read stored result |
+| 5 | Error leakage | **Medium/Low** | All exceptions caught; always returns `200` with generic detail; full traceback logged server-side only |
+| 6 | Missing timestamp/skew guard | **Low** | `X-Timestamp` checked against local clock within tolerance |
+| 7 | Unbounded `_seen_event_ids` set | **Low** | Redis TTL auto-evicts stale entries; no memory leak |
+
+### Architecture notes:
+
+- **Raw-body-first ordering** means even a gigabyte-sized forged body never gets deserialized — we reject at the HMAC stage.
+- **Redis provides distributed state** so horizontal scaling doesn't weaken replay protection.
+- **Key ring is pluggable**: swap `_SECRET_KEYRING` values through your secret manager (HashiCorp Vault, K8s Secrets, AWS Secrets Manager) without code changes.
+- **Always returning 200** prevents retry storms on known-invalid events (bad HMAC, duplicates) while still logging failures internally.

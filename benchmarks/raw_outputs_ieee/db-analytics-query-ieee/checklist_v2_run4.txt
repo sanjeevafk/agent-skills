@@ -1,0 +1,475 @@
+[exit=0 latency=42.41s]
+I have everything I need. Here's the complete diagnosis and production-grade solution.
+
+---
+
+## Problem Diagnosis: Node-by-Node Breakdown
+
+### The Query Profile
+
+```
+Seq Scan on events          (cost=0.00..42M rows=800M)    → 800M row scan, no index used
+  Filter: (tenant_id = $1 AND event_type = $2 AND created_at BETWEEN $3 AND $4)
+  Rows Removed by Filter: ~798M
+
+Sort (cost=15M rows=2M)     (sort_method: external merge, disk: 2GB+)  → spills to temp file
+  Sort Key: tenant_id, created_at
+
+WindowAgg                   (rank())                      → operates on spilled result
+
+Hash Join                   (2M users × ranked events)    → memory pressure from prior spill
+  Hash Cond: events.user_id = users.id
+```
+
+### Root Causes
+
+| # | Symptom | Root Cause |
+|---|---------|------------|
+| 1 | **Seq Scan** | No index matches the filter pattern (`tenant_id`, `event_type`, `created_at` composite). Planner chose sequential because stale stats underestimated output at 100 rows vs 2M reality. |
+| 2 | **Sort spill to disk** | `work_mem` (default 4MB) insufficient for sorting 2M rows by `tenant_id, created_at`. External merge writes temp files — slow I/O bound. |
+| 3 | **Stale estimates** | Table wasn't analyzed recently or has high modification ratio. The planner's histogram is 2 orders of magnitude wrong (100 expected → 2M actual), causing it to choose a nested-loop join over hash join and skip index creation entirely. |
+
+---
+
+## Index Strategy
+
+### The Core Decision: Composite vs Single vs Partial
+
+You have three tools; each solves different problems. The right choice depends on your access patterns.
+
+**Single-column indexes don't work here.** An index on only `tenant_id` narrows from 800M down to (say) 10M, but you still Seq Scan on `event_type` and `created_at`. Same problem — just smaller.
+
+**Covering index avoids heap fetches but bloats the index.** With 800M rows and 5+ included columns, the index grows to 50-80GB. Worth it if the query runs hundreds of times per day; not worth it if it runs once daily.
+
+**Partial indexes are niche.** Only justified when the predicate excludes >90% of rows permanently (e.g., `WHERE event_type IN ('signup', 'purchase')`). Don't partial-index unless you've proved the selective filter dominates your workload.
+
+### Recommended Index
+
+```sql
+-- Primary composite index - matches the common access pattern
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_time
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Why this column order:**
+
+1. **`tenant_id` first** — Equality filter. Multi-tenant systems typically isolate one tenant per request. This is the most selective equality column. If you had <10 tenants total, flip the order to start with `created_at`, but multi-tenant apps have thousands of tenants.
+
+2. **`event_type` second** — Second equality filter. Narrowed further within each tenant.
+
+3. **`created_at DESC` third** — Range filter. Placed last because range predicates "consume" the rest of the index. Including `DESC` means the index scan already satisfies the `ORDER BY` for most window functions (top-N by recency), avoiding the post-index sort step.
+
+**What queries this serves:**
+
+| Pattern | Matches? | Why |
+|---------|----------|-----|
+| `WHERE tenant_id = X AND event_type = Y AND created_at BETWEEN A AND B` | Full range scan | All three columns drive the search |
+| `WHERE tenant_id = X AND created_at BETWEEN A AND B` | Prefix match | Uses first two columns for equality, scans created_at range |
+| `WHERE tenant_id = X AND event_type = Y` | Prefix match | Two-column prefix; may still need filter for created_at |
+| `WHERE tenant_id = X` | Prefix match | Single-column prefix; broader scan but indexed |
+| `WHERE event_type = Y AND created_at BETWEEN A AND B` | ❌ | Missing leading tenant_id; cannot use prefix |
+
+### Optional Enhancements
+
+**Covering index** — If this query runs frequently and SELECTs additional columns repeatedly:
+
+```sql
+-- Only add if EXPLAIN shows the planner is doing expensive bitmap heap scans
+-- even after the primary index exists. Test with pgstat_user_tables to measure
+-- actual usage before committing to an 80GB index.
+CREATE INDEX CONCURRENTLY idx_events_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, metadata, status);
+```
+
+**Partial index** — Only if a specific event_type dominates this query across all tenants:
+
+```sql
+-- Justified only if 'pageview' or similar accounts for >95% of filtered results
+CREATE INDEX CONCURRENTLY idx_events_common_type
+  ON events (tenant_id, created_at DESC)
+  WHERE event_type = 'pageview';
+```
+
+Don't create partial indexes unless you've measured the query workload and proven the filter selectivity. They double index maintenance cost and complicate autovacuum.
+
+---
+
+## Fixing the Stale Statistics Problem
+
+The planner estimated 100 rows but got 2M — that's a 20,000× error. This alone breaks every downstream decision (join type, sort strategy, index usage).
+
+### Immediate Fix
+
+```sql
+-- Run this ASAP against the production database
+ANALYZE events;
+ANALYZE users;
+```
+
+### Persistent Fix: Increase Statistics Target
+
+Default `STATISTICS` target is 100 for every column. On 800M rows, that's barely sampling 200 data points across the histogram. Increase it for the skewed columns:
+
+```sql
+-- Apply to the most statistically significant columns only.
+-- Do NOT increase on all columns — ANALYZE runtime scales quadratically.
+ALTER TABLE events ALTER COLUMN tenant_id    SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN event_type   SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN created_at   SET STATISTICS 500;
+
+-- Re-analyze to pick up new statistics granularity
+ANALYZE events;
+```
+
+**Trade-off:** ANALYZE takes longer with higher targets (~5–10s on 800M rows vs ~2s at default). This is a one-time cost. Autovacuum will re-collect statistics on schedule.
+
+### Monitoring Statistics Health
+
+```sql
+-- Check if tables are out of sync between last analyze and actual rows
+SELECT
+  relname AS table_name,
+  n_live_tup AS live_rows,
+  n_mod_since_analyze AS modified_rows_since_analyze,
+  CASE
+    WHEN n_live_tup > 0 THEN round(100.0 * n_mod_since_analyze / n_live_tup, 1)
+    ELSE 0
+  END AS pct_modified,
+  last_analyze,
+  autoanalyze_last
+FROM pg_stat_user_tables
+WHERE relname IN ('events', 'users')
+ORDER BY pct_modified DESC;
+
+-- Flag for action: when pct_modified > 10%, run ANALYZE immediately.
+-- Autovacuum may not keep pace on heavily-written 800M-row tables.
+```
+
+If `n_mod_since_analyze / n_live_tup` exceeds 10% consistently, consider scheduling manual `ANALYZE` runs more aggressively than autovacuum handles.
+
+---
+
+## Partitioning Decision: Monthly Range Partitioning on created_at
+
+### When It Makes Sense
+
+Partitioning helps when:
+- You routinely query recent data only (last 30/90 days) and skip older partitions entirely
+- You have archival policies (drop old partitions vs vacuum forever)
+- Index size on any single partition becomes manageable (<50M rows/partition)
+
+### When It Does NOT Help
+
+- Your queries span the entire table regardless
+- You rarely filter on the partition key
+- The composite index already eliminates enough data
+
+### Assessment for Your Case
+
+An 800M-row table with a good composite index starting with `(tenant_id, event_type)` means you're never scanning more than `total_rows / num_tenants / num_event_types` per query. If you have 10,000 tenants and 20 event types, that's ~400 rows per query. Partitioning wouldn't measurably improve that scenario.
+
+Partitioning IS justified when:
+- You have few tenants (or the same tenant drives most traffic)
+- Queries cover wide date ranges within that tenant
+- You have a retention policy dropping old data
+
+### Partitioning Schema (if warranted)
+
+```sql
+-- Create partitioned table (new schema, migrate data with expand-contract)
+CREATE TABLE events_partitioned (
+  id        bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id bigint       NOT NULL,
+  event_type text         NOT NULL,
+  user_id   bigint       NOT NULL,
+  created_at timestamptz NOT NULL,
+  -- ... other columns ...
+  PRIMARY KEY (id, created_at)  -- partition key MUST be in primary key
+) PARTITION BY RANGE (created_at);
+
+-- Current month partition
+CREATE TABLE events_y2026m08 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+-- Next month in advance
+CREATE TABLE events_y2026m09 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+-- Default catches anything past future partitions
+CREATE TABLE events_default PARTITION OF events_partitioned DEFAULT;
+
+-- Indexes must be created per-partition (Postgres propagates DDL but CONCURRENTLY doesn't)
+CREATE INDEX CONCURRENTLY ON events_y2026m08 (tenant_id, event_type, created_at DESC);
+CREATE INDEX CONCURRENTLY ON events_y2026m09 (tenant_id, event_type, created_at DESC);
+-- ... repeat per partition ...
+
+-- Retention: drop = instant deletion, no vacuum needed
+DROP TABLE events_y2024m01;  -- removes entire month instantly
+```
+
+**Migration strategy:** Use expand-contract. Create the partitioned table alongside the original, backfill gradually via application dual-write, verify consistency, cutover reads, drop old table. This skill provides the pattern above.
+
+**Bottom line:** Start with the composite index + statistics fix. Measure query time. Only add partitioning if the 40s reduces to <10s and you still have latency SLO violations. Partitioning adds operational complexity (cron for new partitions, monitoring per-partition sizes, backup configuration changes) that isn't justified as a first step.
+
+---
+
+## Configuration Tuning
+
+### Prevent Future Sort Spills
+
+```sql
+-- Session-level override for reporting queries only.
+-- Do NOT raise this globally — it applies per-sort-op and can OOM a connection pool.
+SET LOCAL work_mem = '256MB';
+-- Or set session-wide if you have dedicated reporting connections with guaranteed capacity:
+-- SET work_mem = '256MB';
+
+-- Also tune shared_buffers and effective_cache_size for the 800M-row table scale
+-- (global settings, apply via ALTER SYSTEM + pg_reload_conf())
+ALTER SYSTEM SET shared_buffers = '4GB';           -- ~25% of RAM for this server size
+ALTER SYSTEM SET effective_cache_size = '12GB';     -- OS cache + PG buffers (estimate)
+```
+
+Per-session `SET work_mem` is safest. It costs nothing to connections that don't run sorts, and guarantees your reporting queries have room for 2M-row sorts without touching global config.
+
+---
+
+## The Rewritten Query
+
+### Original Pattern (Slow)
+
+```sql
+WITH ranked AS (
+  SELECT
+    e.tenant_id,
+    e.event_type,
+    e.user_id,
+    e.created_at,
+    ROW_NUMBER() OVER (PARTITION BY e.tenant_id, e.user_id ORDER BY e.created_at DESC) AS rn
+  FROM events e
+  WHERE e.tenant_id = $1
+    AND e.event_type = $2
+    AND e.created_at >= $3
+    AND e.created_at <= $4
+)
+SELECT
+  u.email,
+  u.name,
+  r.created_at  AS last_event_at,
+  r.event_type
+FROM ranked r
+JOIN users u ON u.id = r.user_id
+WHERE r.rn = 1                          -- latest event per user per tenant
+ORDER BY r.created_at DESC
+LIMIT 50;
+```
+
+**Why it's slow:**
+1. CTE is an optimization barrier in Postgres 12+. The planner cannot push predicates through it, so it materializes all matching events before applying `rn = 1`.
+2. The window function ranks ALL events in the date range — potentially millions — before filtering to one per user.
+3. Sort spills to disk because `work_mem` is too small for the intermediate sorted set.
+4. Join happens on 2M rows instead of the final ~50K unique users.
+
+### Fixed Query — Flattened with Direct Index Seek
+
+```sql
+-- Set work_mem just for this query's execution
+BEGIN;
+SET LOCAL work_mem = '256MB';
+
+SELECT
+  u.email,
+  u.name,
+  e.created_at  AS last_event_at,
+  e.event_type
+FROM events e
+JOIN users u ON u.id = e.user_id
+WHERE e.tenant_id = $1
+  AND e.event_type = $2
+  AND e.created_at >= $3
+  AND e.created_at <= $4
+  AND NOT EXISTS (
+    SELECT 1
+    FROM events e2
+    WHERE e2.tenant_id  = e.tenant_id
+      AND e2.user_id    = e.user_id
+      AND e2.event_type = e.event_type
+      AND (e2.created_at > e.created_at
+           OR (e2.created_at = e.created_at AND e2.id > e.id))
+  )
+ORDER BY e.created_at DESC, e.id DESC
+LIMIT 50;
+```
+
+**How this works:**
+- The correlated `NOT EXISTS` replaces the window function rank. Postgres correlates it using the index on `(tenant_id, user_id, event_type, created_at DESC)`, doing an efficient semi-not-exist probe for each candidate row.
+- Combined with the `LIMIT 50` and `ORDER BY`, the executor does early termination — it stops after finding 50 qualifying rows rather than ranking and sorting the entire result set.
+- No CTE barrier. The planner pushes the `tenant_id`, `event_type`, and `created_at` filters directly into the index scan.
+- The `id` tiebreaker ensures deterministic ordering without a secondary sort on arbitrary columns.
+
+### Alternative: Correlated Subquery for Latest Event Per User (More Readable)
+
+If the correlated NOT EXISTS is hard to read or audit, use a lateral join instead — the planner generates identical plans:
+
+```sql
+SELECT
+  u.email,
+  u.name,
+  latest.created_at  AS last_event_at,
+  latest.event_type
+FROM (
+  SELECT DISTINCT ON (tenant_id, user_id)
+    tenant_id,
+    user_id,
+    created_at,
+    event_type
+  FROM events
+  WHERE tenant_id = $1
+    AND event_type = $2
+    AND created_at >= $3
+    AND created_at <= $4
+  ORDER BY tenant_id, user_id, created_at DESC, id DESC
+) latest
+JOIN users u ON u.id = latest.user_id
+ORDER BY latest.created_at DESC, latest.id DESC
+LIMIT 50;
+```
+
+**Why `DISTINCT ON` wins here:** It's a built-in aggregate that Postgres optimizes specifically for "take one per group ordered by X." The planner implements it via index-only scan + merge-like grouping — no sort spill because it processes groups incrementally from the index, and the `LIMIT 50` enables early exit once it has collected 50 distinct groups.
+
+---
+
+## Complete Migration Plan
+
+Apply these steps in order. Each is a separate migration file.
+
+### Step 1: Increase Statistics Target (non-blocking)
+
+```sql
+-- migrations/YYYYMMDDHHSS_increase_events_statistics.sql
+
+ALTER TABLE events ALTER COLUMN tenant_id    SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN event_type   SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN created_at   SET STATISTICS 500;
+
+-- Force immediate re-collection (read-heavy, safe on large tables)
+ANALYZE events;
+```
+
+### Step 2: Create Index Concurrency (no downtime)
+
+```sql
+-- migrations/YYYYMMDDHHSS_create_events_composite_index.sql
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_tenant_type_time
+  ON events (tenant_id, event_type, created_at DESC);
+
+-- Verify it was created and is usable
+SELECT indexrelid::regclass, indisready
+FROM pg_index
+JOIN pg_class ON pg_class.oid = pg_index.indexrelid
+WHERE relname = 'idx_events_tenant_type_time';
+-- Should return: indisready = true
+```
+
+### Step 3: Deploy Updated Query Code
+
+Ship the rewritten query (DISTINCT ON variant recommended for readability) with the `SET LOCAL work_mem = '256MB'` at the top.
+
+### Step 4: Validate
+
+```sql
+EXPLAIN ANALYZE
+SELECT
+  u.email,
+  u.name,
+  latest.created_at  AS last_event_at,
+  latest.event_type
+FROM (
+  SELECT DISTINCT ON (tenant_id, user_id)
+    tenant_id,
+    user_id,
+    created_at,
+    event_type
+  FROM events
+  WHERE tenant_id = 12345
+    AND event_type = 'pageview'
+    AND created_at >= '2026-01-01'
+    AND created_at <= '2026-08-26'
+  ORDER BY tenant_id, user_id, created_at DESC, id DESC
+) latest
+JOIN users u ON u.id = latest.user_id
+ORDER BY latest.created_at DESC, latest.id DESC
+LIMIT 50;
+```
+
+Expected plan:
+
+```
+Limit  (cost=0.56..X.XX rows=50)
+  -> Merge/GroupAggregate  (avoids full sort)
+       -> Index Scan using idx_events_tenant_type_time on events
+            Index Cond: (tenant_id = 12345
+                       AND event_type = 'pageview'
+                       AND created_at >= '2026-01-01'
+                       AND created_at <= '2026-08-26')
+            Order: tenant_id, user_id, created_at DESC, id DESC
+  -> Hash Join on users
+```
+
+No seq scan. No external merge sort. Index_cond uses the composite index directly. Expected reduction: **40s → <500ms**.
+
+### Step 5: Monitor Post-Deployment
+
+```sql
+-- Track index usage after deployment
+SELECT
+  schemaname,
+  relname AS table_name,
+  indexrelname AS index_name,
+  idx_scan AS times_used,
+  idx_tup_read,
+  idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE indexrelname LIKE 'idx_events%'
+ORDER BY idx_scan DESC;
+
+-- Monitor planner accuracy going forward
+SELECT
+  schemaname,
+  relname,
+  n_tup_ins + n_tup_upd + n_tup_del AS total_modifications,
+  last_autovacuum,
+  last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname = 'events'
+  AND n_mod_since_analyze > 100000;
+```
+
+### Rollback (if regression found)
+
+```sql
+-- Downgrade index only; statistics and query code rollback via app deploy
+DROP INDEX IF EXISTS idx_events_tenant_type_time;
+
+-- Statistics revert
+ALTER TABLE events ALTER COLUMN tenant_id    SET STATISTICS 100;
+ALTER TABLE events ALTER COLUMN event_type   SET STATISTICS 100;
+ALTER TABLE events ALTER COLUMN created_at   SET STATISTICS 100;
+ANALYZE events;
+```
+
+---
+
+## Summary: What Changed and Why
+
+| Problem | Fix | Impact |
+|---------|-----|--------|
+| Seq Scan on 800M rows | Composite index `(tenant_id, event_type, created_at DESC)` | O(n) → O(log n) index seek |
+| Sort spill to disk | `DISTINCT ON` with index-order elimination + `work_mem = 256MB` | Disk I/O → memory-only, incremental processing |
+| Stale estimates (100 vs 2M) | `ANALYZE` + increased `STATISTICS` target to 500 | Planner chooses correct join type and access path |
+| CTE optimization barrier | Flattened query with `DISTINCT ON` | No materialization overhead; early termination |
+| Full-window-function ranking | `DISTINCT ON` (group-aware, not full-table) | Ranks per-group incrementally instead of globally |
+
+Total expected improvement: **~80x faster** (40s → sub-second). Partitioning is deferred until this baseline is optimized and latency SLOs remain unmet.

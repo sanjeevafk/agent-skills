@@ -1,0 +1,252 @@
+[exit=0 latency=24.62s]
+I'll work through this systematically using the root-cause methodology, then provide deterministic fixes for all three tests.
+
+---
+
+## Systematic Debugging Analysis
+
+### Phase 1: Root Cause Investigation
+
+**Error profile:** 3/240 tests fail ~1.25% of the time, correlated with (a) machine load, (b) developer timezone, (c) reruns go green. This is the fingerprint of three distinct classes of indeterminism — not one bug manifesting three ways.
+
+**Hypotheses ranked by likelihood:**
+
+| Rank | Hypothesis | Evidence Supporting | Evidence Against |
+|------|-----------|-------------------|------------------|
+| H1 | Timestamp test crosses a boundary (hour/day/month/year change) between when `datetime.now()` is called and when the string is formatted, compounded by timezone mismatch between CI (UTC) and dev machines | Timezone correlation, intermittent, timestamp assertion | None |
+| H2 | Async worker test's `sleep(2)` is shorter than the worker's actual latency under load; CI machines are fast/dedicated while dev machines are throttled | Machine-load correlation, "reruns usually go green" (race window closes on retry), sleep-based polling | None |
+| H3 | Dict iteration order depends on insertion order, but fixture IDs come from a `set` which has no guaranteed order; Python ≥3.7 preserves dict insertion order, so the failure comes from sets being converted to dicts without explicit sorting | "relies on dict iteration order over a set," deterministic Python semantics make this reliably wrong | Would fail *every* run, not just intermittently — unless set→dict conversion is wrapped in something that occasionally reshuffles |
+| H4 | All three share a common environmental dependency (e.g., missing `tzdata` package) | Correlates with dev machines vs CI | Each symptom is structurally different; single shared dependency is unlikely |
+
+**Most likely: H1 + H2 + H3.** These are three separate bugs in three separate tests. Let me address each.
+
+---
+
+### Phase 2: Pattern Analysis — What Should These Tests Look Like?
+
+**Working example pattern 1 (time):** Any test that asserts timestamps must freeze time or use a fixed mock. `pytest-timeout` doesn't solve this — you need `freezegun` or `unittest.mock.patch`.
+
+**Working example pattern 2 (async polling):** Any test that waits for async completion must use an event signal (`asyncio.Event`, `queue.Queue.get(timeout=N)`) or `pytest-asyncio`'s built-in retry helpers, not arbitrary `sleep()`.
+
+**Working example pattern 3 (ordered iteration):** Any test asserting order must assert on a sorted sequence or explicitly ordered list. Sets are unordered by design.
+
+---
+
+### Phase 3: Hypothesis Testing & Minimal Reproductions
+
+#### Test A: Timestamp Formatting
+
+```python
+# --- BROKEN TEST (reproduces the bug) ---
+def test_format_timestamp_crosses_boundary():
+    """Reproduce: datetime.now() called at 23:59:59, .strftime('%Y-%m-%d') formats to next day."""
+    from unittest import mock
+    from datetime import datetime
+    # Simulate the exact conditions: dev timezone != UTC, time shifts between call and format
+    target = datetime(2026, 8, 25, 23, 59, 59, tzinfo=__import__('datetime').timezone.utc)
+    
+    def slow_now(dt):
+        """Simulates slight delay causing cross-boundary shift."""
+        return dt.replace(second=dt.second + 1)  # rolls to 00:00:00 next day
+    
+    with mock.patch('datetime.datetime') as MockDT:
+        MockDT.now.return_value = target
+        # In the real test, there's code like: datetime.now().strftime('%Y-%m-%d %H:%M')
+        # The fix would freeze time instead of letting it drift
+```
+
+**Root cause:** The test (or code under test) calls `datetime.now()` at one point and asserts on the formatted result later, with a race between those two points. Combined with timezone offsets (CI runs in UTC, devs may be in PST/IST/etc.), the wall-clock interpretation of "the same moment" differs, and if the code converts between timezones, the formatted output can differ by ±1 hour or even ±1 day near boundaries.
+
+**Fix:** Freeze time with `freezegun` or patch `datetime.utcnow`/`datetime.now` at the module level so both the production code and the test observe the identical clock.
+
+```python
+# --- DETERMINISTIC FIX ---
+from freezegun import freeze_time
+from datetime import datetime
+
+@freeze_time("2026-08-25T14:30:00+00:00")  # Fixed ISO timestamp with explicit UTC offset
+def test_formatted_timestamp_is_correct():
+    now = datetime.utcnow()  # or whatever the production code actually calls
+    assert now.strftime("%Y-%m-%dT%H:%M:%SZ") == "2026-08-25T14:30:00Z"
+```
+
+**Alternative (no new dependency):** Patch at source.
+
+```python
+from unittest.mock import patch
+from datetime import datetime, timezone, timedelta
+
+FIXED_TIME = datetime(2026, 8, 25, 14, 30, 0, tzinfo=timezone.utc)
+
+@patch('datetime.datetime', return_value=FIXED_TIME)
+def test_formatted_timestamp(mock_datetime):
+    # Force every call to datetime.now() or datetime.utcnow() to return FIXED_TIME
+    mock_datetime.utcnow.return_value = FIXED_TIME
+    mock_datetime.side_effect = lambda *args, tz=None: FIXED_TIME
+    now = datetime.now(tz=timezone.utc)
+    assert now.strftime("%Y-%m-%d %H:%M") == "2026-08-25 14:30"
+```
+
+---
+
+#### Test B: Async Worker Polling
+
+```python
+# --- BROKEN TEST (reproduces the bug) ---
+def test_async_worker_completes():
+    """Reproduce: worker takes 2.5s under load, sleep(2) times out, test fails."""
+    import asyncio
+    import random
+    
+    async def flawed_poll(worker):
+        MAX_ATTEMPTS = 10
+        for i in range(MAX_ATTEMPTS):
+            await asyncio.sleep(2)  # ← hardcoded 2s, no backoff, no deadline
+            if worker.ready():
+                return True
+        raise TimeoutError("worker didn't complete")
+```
+
+**Root cause:** `sleep(2)` is a blind poll with two fatal flaws:
+1. It assumes the worker completes within 2s — false under load (dev machines share CPU; CI runners are isolated).
+2. It polls every 2s regardless, creating a "latency gap": if the worker finishes at t=1.5s, you waste 0.5s; if it finishes at t=2.1s, you miss it and waste another full cycle. Under load, the worker may consistently exceed 2s.
+
+This is also a correctness issue — you're *guessing* the polling interval rather than computing it from the actual condition.
+
+**Fix:** Replace `sleep(2)` with an event-driven signal. If the worker exposes a callback/event, wait on that directly. Otherwise, use exponential backoff with a total deadline.
+
+```python
+# --- DETERMINISTIC FIX (event-driven, preferred) ---
+def test_async_worker_completes():
+    """Use a sentinel/event to signal completion instead of polling."""
+    import asyncio
+    
+    done = asyncio.Event()  # Worker sets this when ready
+    
+    async def worker_with_signal(queue):
+        # ... worker logic ...
+        queue.put_nowait(result)
+        done.set()  # Signal completion
+    
+    async def test_coro():
+        queue = asyncio.Queue()
+        asyncio.create_task(worker_with_signal(queue))
+        
+        # Wait up to 30s for the event, not a blind sleep
+        await asyncio.wait_for(done.wait(), timeout=30.0)
+        result = queue.get_nowait()
+        assert result.status == "success"
+    
+    asyncio.run(test_coro())
+```
+
+```python
+# --- DETERMINISTIC FIX (if you must poll — bounded retry with backoff) ---
+import asyncio
+
+async def test_async_worker_completes():
+    max_wait_s = 30
+    poll_interval = 0.1  # start small
+    deadline = asyncio.get_event_loop().time() + max_wait_s
+    
+    while asyncio.get_event_loop().time() < deadline:
+        if worker.ready():
+            assert worker.result().status == "success"
+            return
+        await asyncio.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.5, 2.0)  # exponential backoff, cap at 2s
+    
+    pytest.fail(f"Worker did not complete within {max_wait_s}s (loaded machine)")
+```
+
+---
+
+#### Test C: Dict Iteration Order Over Set of Fixture IDs
+
+```python
+# --- BROKEN TEST (reproduces the bug) ---
+@pytest.fixture(params=["alpha", "beta", "gamma"])  # set-like无序
+def fixture_id(request):
+    return request.param
+
+def test_fixture_ids_in_expected_order(fixture_id):
+    """Fails because set → list conversion is implementation-dependent (hash seed randomized per process)."""
+    ids = set(["alpha", "beta", "gamma"])
+    id_list = list(ids)  # ← UNSORTED; order varies by process hash seed
+    expected = ["alpha", "beta", "gamma"]
+    assert id_list == expected  # ← flakes: [gamma, alpha, beta] != [alpha, beta, gamma]
+```
+
+**Root cause:** Python's `set` type has **no ordering guarantee**. Converting `set → list` produces unpredictable order because:
+1. Hash-based lookup tables don't store elements sequentially.
+2. Since Python 3.3, hash randomization (`PYTHONHASHSEED` is randomized by default) means the same set produces different list orders across Python processes.
+3. `dict` preserves *insertion order*, but only after you decide the insertion order — and a `set` gives you no control over that.
+
+In CI, `PYTHONHASHSEED` may be set deterministically (e.g., `0`), giving consistent order. On dev machines, it's randomized, giving flaky order. This explains why it flakes 3/240 times consistently rather than randomly.
+
+**Fix:** Sort before comparing, or use an ordered collection from the start.
+
+```python
+# --- DETERMINISTIC FIX (explicit sort — most robust) ---
+def test_fixture_ids_in_expected_order(fixture_id):
+    ids = {"alpha", "beta", "gamma"}
+    id_list = sorted(ids)  # ← Deterministic alphabetical order
+    expected = ["alpha", "beta", "gamma"]
+    assert id_list == expected
+
+# --- ALTERNATIVE (use list, not set) ---
+def test_fixture_ids_ordered():
+    ids = ["alpha", "beta", "gamma"]  # list preserves declaration order
+    assert ids == ["alpha", "beta", "gamma"]
+```
+
+If the test is about checking dict keys against expected values:
+
+```python
+# --- DETERMINISTIC FIX (compare sorted keys) ---
+def test_dict_keys_match_expected():
+    d = {"beta": 2, "gamma": 3, "alpha": 1}
+    assert sorted(d.keys()) == ["alpha", "beta", "gamma"]
+    assert d == {"alpha": 1, "beta": 2, "gamma": 3}  # value comparison is order-independent
+```
+
+---
+
+### Phase 4: Implementation Summary — Deterministic Fixes
+
+Here's the consolidated fix table:
+
+| Test | Bug Class | Root Cause | Deterministic Fix | New Dependency? |
+|------|-----------|-----------|-------------------|-----------------|
+| **A: Timestamp** | Temporal nondeterminism | `datetime.now()` drifts between call and assertion; timezone mismatch amplifies boundary crossings | `@freeze_time("2026-08-25T14:30:00+00:00")` from `freezegun` — OR patch `datetime.*now` at module level | Yes (`freezegun`) or No (patch approach) |
+| **B: Async worker** | Timing/race condition | Hardcoded `sleep(2)` < actual worker latency under load; blind polling misses completions | Replace with `asyncio.Event` + `wait_for()` — OR bounded exponential-backoff poll with 30s deadline | No |
+| **C: Dict/set order** | Algorithmic indeterminism | `set → list` conversion is hash-seed-dependent; `PYTHONHASHSEED` differs between CI and dev environments | Replace `list(ids)` with `sorted(ids)` — OR convert test to use `list` instead of `set` | No |
+
+### Reproduction Script
+
+To verify these fixes locally before committing, run this stress test:
+
+```bash
+# Run only the 3 flaky tests 100 times each; any failure = broken
+for i in $(seq 1 100); do
+    pytest tests/test_a_timestamp.py tests/test_b_worker.py tests/test_c_order.py \
+           --tb=no -q 2>&1 || echo "FAILURE on attempt $i"
+done
+
+# Also force non-UTC timezone to catch H1
+TZ=America/New_York pytest tests/test_a_timestamp.py --tb=short || echo "TZ FAILURE"
+
+# Also force random hash seeds (Python does this by default, but be explicit)
+PYTHONHASHSEED=random pytest tests/test_c_order.py --tb=short || echo "HASH FAILURE"
+```
+
+### Verification Criteria
+
+Each fix passes if:
+- **Test A:** Asserts equal across all world timezones (`TZ=UTC`, `TZ=PST`, `TZ=JST`) and across 100 iterations — zero failures.
+- **Test B:** Succeeds under artificial load (`stress-ng --cpu 4 --timeout 30s`) — the event-based or deadline-based approach makes the test bound on *progress*, not wall-clock guesses.
+- **Test C:** Produces identical results with `PYTHONHASHSEED=0`, `PYTHONHASHSEED=1`, and `PYTHONHASHSEED=random` — sorted comparison is independent of hash function internals.
+
+### Architecture Notes
+
+One question to flag with your human partner: why does the async worker not expose a completion signal? If the worker is internal code you own, add a `threading.Event` (sync) or `asyncio.Event` (async) to its public API so tests wait on *signals*, not *sleeps*. That eliminates timing flakiness at the source rather than papering it over in assertions.

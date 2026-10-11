@@ -1,0 +1,644 @@
+[exit=0 latency=45.78s]
+This repository is the Agent Skills Framework, not the Node.js service itself — so there's no target code to inspect. I'll produce the complete diagnosis plan directly as requested.
+
+---
+
+## Diagnosis Plan: Node.js 20 RSS 300MB → 4GB OOM Leak
+
+### Symptom Summary
+
+| Observation | Implication |
+|---|---|
+| RSS climbs steadily 300MB → 4GB over ~48h | Classic gradual leak, not a one-time allocation spike |
+| Closure growth retained by event-emitter registry | Listener-closure cycle or listener-accumulation pattern |
+| Buffer growth from response-logging middleware | Response bodies (or request bodies) stored but never released |
+| OOM-killed in K8s at ~4GB limit | Linux OOM killer terminates the process; container restarts |
+
+---
+
+### Phase 1: Safe Heap Snapshot Capture in Production
+
+**Do NOT use `--heapsnapshot-nofile` on a live production process without care.** Follow this sequence:
+
+```bash
+# Step 1: Confirm V8 pid via /proc or pmap
+ls /proc/<pid>/fd/ | head   # look for v8 heap info
+cat /proc/<pid>/status | grep SigCgt  # confirm it's the node process
+
+# Step 2: Write a .heapsnapshot WITHOUT stopping all GC
+kill -USR1 <pid>
+# V8 writes snapshot to cwd as isolate-0x<addr>-v8.heapsnapshot
+# USR1 does NOT stop the world for more than ~50ms at modern V8
+
+# Step 3: Immediately copy it away
+cp isolate-*.heapsnapshot /tmp/heap-$(date +%s).heapsnapshot
+
+# Step 4: Compress before transferring to avoid holding FD open
+gzip /tmp/heap-$(date +%s).heapsnapshot
+
+# Step 5: Transfer off-node securely
+scp /tmp/heap-*.gz monitoring-team@internal-bucket:/heap-snapshots/
+```
+
+**For frequent captures (every 6h):** Set up a cron-like sidecar or health-check handler:
+
+```typescript
+// In the API service itself, expose a safe internal endpoint or IPC trigger:
+process.on('SIGUSR2', () => {
+  // V8 automatically writes snapshot on SIGUSR2 too
+  console.error(`[${new Date().toISOString()}] Heap snapshot triggered via SIGUSR2`);
+});
+```
+
+Or add a route guarded by auth + internal-only IP:
+
+```typescript
+app.get('/debug/heapsnapshot', helmet({
+  contentSecurityPolicy: false, // minimal endpoint
+}), (req, res) => {
+  const dest = fs.createWriteStream(`/tmp/snapshot-${Date.now()}.heapsnapshot`);
+  vm.runInNewContext(
+    'process._debugHeapSnapshot()',
+    {},
+    { timeout: 30000 }
+  ); // actually better to just emit signal
+  process.kill(process.pid, 'SIGUSR2');
+  setTimeout(() => res.sendFile(res.locals.snapshotPath), 1000);
+});
+```
+
+**Better yet:** Use the built-in `v8.writeHeapSnapshot()` synchronously (Node 16+):
+
+```typescript
+import v8 from 'node:v8';
+import fs from 'node:fs';
+
+// Call periodically from a timer or HTTP hook
+const buf = v8.writeHeapSnapshot();
+fs.writeFileSync(`/tmp/heap-${Date.now()}.heapsnapshot`, buf);
+```
+
+This blocks the thread during write (~tens of ms), so use with caution on high-QPS services. A background worker thread isolates the cost:
+
+```typescript
+import { Worker, isMainThread, parentPort } from 'node:worker_threads';
+
+if (!isMainThread) {
+  parentPort?.on('message', async (msg) => {
+    if (msg === 'snapshot') {
+      const path = `/tmp/heap-worker-${Date.now()}.heapsnapshot`;
+      v8.writeHeapFileSync(path);
+      parentPort!.postMessage({ ok: true, path });
+    }
+  });
+}
+```
+
+---
+
+### Phase 2: Diffing Snapshots to Isolate Growth
+
+Download both snapshots (T0 and T0+6h) and open Chrome DevTools or Edge Tools:
+
+```
+chrome://inspect → "Open dedicated DevTools for Node" → "Memory" tab
+```
+
+Or use CLI tools:
+
+```bash
+# Option A: llnode (GDB-based, fastest)
+sudo apt install llnode gdb
+gdb -batch -ex "source /usr/share/lldb/nodejs.py" \
+    -ex "heapdump /tmp/gdb-snapshot.heapsnapshot" \
+    -p <pid>
+
+# Option B: heapprof / heapdump CLI
+npx heapdump /tmp/t0.heapsnapshot <pid>
+sleep 21600
+npx heapdump /tmp/t6.heapsnapshot <pid>
+
+# Option C: chrome-devtools UI (most powerful for retainers)
+# Load both in Memory panel → take Allocation instrumentation timeline
+```
+
+**In the Chrome DevTools Memory tab:**
+
+1. Load `t0.heapsnapshot` → switch to **Summary** view → filter by `Closure`.
+2. Load `t6.heapsnapshot` → same view.
+3. Click **"Comparison"** mode (load two snapshots side by side) → select both files.
+4. Look at the **Diff** column:
+   - Sort by `"Retainers"` descending for the top-growing type entries.
+   - Focus on `Closure` and `String` (closures store string keys, arguments).
+   - Also check `External` (this is what Buffers appear as when backed by native memory outside JS heap).
+
+5. For each top retainer chain:
+   - Click the row → **"Show objects retained by..."** → expand upward.
+   - Trace: `Closure → [retained by Array/Object] → [retained by EventEmitter.once wrapper] → [rooted in module singleton]`
+
+**Key search terms in the diff:**
+- `anonymous` closure + increasing count → leaked inline function registration
+- `Object.fromEventEmitterListener` or similar listener wrapper names
+- `Buffer` appearing under `Shallow Size` growing significantly
+- Any object whose shallow size grows monotonically between snapshots
+
+---
+
+### Phase 3: Retainer Chain Analysis — Closures via Event Emitter
+
+#### What You're Looking For
+
+V8's profiler reports closures because Node's `EventEmitter` stores listener functions as array elements. If these listeners hold references to outer scope variables (which they always do), they create closures that can't be GC'd while the listener remains registered.
+
+**Common leak patterns:**
+
+**Pattern A: Accidental `once` or `on` accumulation (the most common)**
+
+```typescript
+// BUG: Every call registers a NEW listener that NEVER gets removed
+function handleRequest(req, res) {
+  const data = decompressBody(req.body); // large buffer
+  
+  emitter.on('flushDone', () => {
+    // closure captures `data` — a large Buffer
+    writeToDisk(data);
+  });
+  // Missing: emitter.removeListener(emitter.listeners(...).pop())
+  // Result: every request adds a closure → 4GB in 48h
+}
+```
+
+**Pattern B: Dynamic event names (event name proliferation)**
+
+```typescript
+// BUG: Each unique request ID becomes a separate event name
+emitter.on(`request:${reqId}`, callback); 
+// These event names never get cleaned up → memory for event map grows linearly
+```
+
+**Pattern C: Circular reference between closure and payload**
+
+```typescript
+// BUG: Object referencing emitter, emitter storing closure referencing object
+const context = { reqId, data, emitter };
+emitter.on('complete', () => {
+  context.data = null; // attempted cleanup, but context still referenced
+});
+// circular: context → emitter → listeners[0].closure → lexical environment → context
+```
+
+**Pattern D: `EventEmitter.wrap()` misuse**
+
+```typescript
+// wrap() creates a bound function that references the wrapped method's `this`
+const originalHandler = obj.handle.bind(obj);
+emitter.on('event', originalHandler); // if obj has large state attached
+```
+
+#### How to Confirm It
+
+Run this diagnostic script against your running process:
+
+```typescript
+// attach-diagnostics.ts — inject into the service or run standalone with --require
+import * as util from 'node:util';
+import * as v8 from 'node:v8';
+
+let snapshotCount = 0;
+setInterval(async () => {
+  snapshotCount++;
+  const snapPath = `/tmp/diag-heapsnap-${snapshotCount}-${Date.now()}.heapsnapshot`;
+  
+  // Write snapshot
+  await new Promise<void>((resolve, reject) => {
+    const stream = require('fs').createWriteStream(snapPath);
+    v8.writeHeapSnapshotToStream(stream, () => resolve());
+    v8.writeHeapSnapshotToStream(stream);
+  });
+  
+  // Dump event emitter internals
+  const eeRegistry = getEventEmittersFromV8();
+  console.log(`[${new Date()}] Snapshot ${snapshotCount}: ${eeRegistry.length} emitters found`);
+  for (const ee of eeRegistry.slice(0, 5)) {
+    const types = Object.keys(ee.eventNames ? ee : {});
+    // Manually inspect using debugging APIs
+  }
+}, 3600_000); // every hour
+```
+
+**Quicker confirmation — check listener count over time:**
+
+```typescript
+// Inject at module level where the emitter is created
+const originalOn = EventEmitter.prototype.on;
+const originalAddListener = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.on = function(type, fn) {
+  const len = this.listenerCount(type);
+  if (len > 100) {
+    console.error(`[LEAK?] ${type} has ${len} listeners (registered here:)`, new Error().stack);
+  }
+  return originalOn.call(this, type, fn);
+};
+```
+
+**Chrome DevTools confirmatory test:** In the Memory panel, take a **Allocation sampling** profile during normal traffic. Filter for objects allocated inside `EventEmitter.on`. If you see thousands of allocations per minute with no deallocations, that confirms the leak.
+
+---
+
+### Phase 4: Retainer Chain Analysis — Buffers from Response-Logging Middleware
+
+#### What You're Looking For
+
+Response-logging middleware commonly captures full request/response bodies for audit/debug purposes. If these are pushed into an array/set/map that's never pruned, Buffers accumulate. Since Buffers sit partly outside the JS heap (in native memory), they show up as RSS growth even when V8's reported heap size seems moderate.
+
+**Common leak patterns:**
+
+**Pattern A: Growing log buffer array**
+
+```typescript
+// BUG: All responses logged to an ever-growing array
+const responseLog: Buffer[] = [];
+
+app.use((req, res, next) => {
+  const originalEnd = res.end;
+  res.end = function(chunk?: any, ...args: any[]) {
+    // chunk is a Buffer containing the response body
+    if (chunk) {
+      responseLog.push(Buffer.from(chunk)); // NEVER pruned
+    }
+    originalEnd.call(this, chunk, ...args);
+  };
+  next();
+});
+
+// No rotation, no TTL, no max length
+```
+
+**Pattern B: Async logging buffer overflow**
+
+```typescript
+// BUG: Log queue fills faster than disk flush drains it
+const logQueue: Buffer[][] = [];
+
+app.use(async (req, res, next) => {
+  const chunks: Buffer[] = [];
+  const origWrite = res.write;
+  res.write = function(chunk: Buffer) {
+    chunks.push(Buffer.from(chunk)); // copies!
+    return origWrite.call(res, chunk);
+  };
+  
+  const origEnd = res.end;
+  res.end = function(chunk?: Buffer, ...args: any[]) {
+    if (chunk) chunks.push(Buffer.from(chunk));
+    
+    // Async flush — if this throws or the writer blocks, queue grows
+    logQueue.push(chunks);
+    flushLogs(logQueue.shift()).catch(() => {}); // errors silently ignored
+    origEnd.call(res, ...args);
+  };
+  next();
+});
+```
+
+**Pattern C: Request/response body caching for analytics**
+
+```typescript
+// BUG: Storing entire request + response bodies keyed by correlation ID
+const cache = new Map<string, { req: Buffer; res: Buffer; ts: number }>();
+
+app.use(async (req, res, next) => {
+  const correlationId = uuidv4();
+  const startTime = Date.now();
+  
+  // Collect request body
+  let reqBody: Buffer;
+  req.on('data', chunk => { /* accumulate */ });
+  
+  // Collect response body
+  const origEnd = res.end;
+  res.end = function(chunk?: any) {
+    const latency = Date.now() - startTime;
+    
+    // BUG: This entry NEVER gets deleted
+    cache.set(correlationId, {
+      req: reqBody,       // could be megabytes
+      res: chunk ?? Buffer.alloc(0),
+      ts: startTime,
+    });
+    
+    origEnd.call(res, chunk);
+  };
+  next();
+});
+```
+
+**Pattern D: Stream piping with pause/resume bugs**
+
+```typescript
+// BUG: Pause-stream buffering due to slow downstream consumer
+pipeline(
+  req.bodyStream,
+  transformStream, // pauses when emitting
+  res,
+  (err) => { /* error swallowed */ }
+);
+// If transformStream pauses, the piped readable buffers accumulate internally
+// In Node 12+, pipeline uses internal buffering that leaks under certain conditions
+```
+
+#### Confirming Buffer Leaks
+
+```typescript
+// Diagnostic: Track Buffer allocation count & total size
+global.gc?.(); // requires --expose-gc
+
+const startBuffers = process.memoryUsage();
+console.log('Before:', startBuffers.heapUsed, startBuffers.rss);
+
+// After some traffic:
+global.gc?.();
+const endBuffers = process.memoryUsage();
+console.log('After:', endBuffers.heapUsed, endBuffers.rss);
+console.log('Delta RSS:', endBuffers.rss - startBuffers.rss);
+console.log('Delta Heap:', endBuffers.heapUsed - startBuffers.heapUsed);
+
+// Large RSS delta with small heap delta = external memory leak (Buffers, strings)
+```
+
+If `rss - heapTotal >> heapUsed`, the gap is **external memory** — almost certainly Buffers backed by C++ `Malloc` or `mmap`.
+
+**Chrome DevTools confirmatory test:** In the Memory panel, change the snapshot comparison filter to `External`. Sort by retained size. Any entry labeled `External String` or backing object with growing retention confirms Buffers/Strings held externally.
+
+---
+
+### Phase 5: Root Cause Hypotheses with Code-Level Fixes
+
+Based on the symptom profile, here are the three most likely root causes in order of probability, with fixes:
+
+#### Fix 1: Listener Accumulation on Shared Event Emitter (Highest Probability)
+
+```typescript
+// BEFORE (buggy):
+import { EventEmitter } from 'node:events';
+const apiEmitter = new EventEmitter();
+
+app.use('/api/data', async (req, res) => {
+  const payload = await decompress(req.body); // Large Buffer
+  
+  apiEmitter.on('processed', (result) => {
+    sendResponse(res, result);
+  });
+  // Closure captures payload (large Buffer) + res (express Response object)
+  // Both stay alive forever because 'processed' never fires or listener never removed
+  transform(payload).then(r => apiEmitter.emit('processed', r));
+});
+
+// AFTER (fixed):
+app.use('/api/data', async (req, res) => {
+  const payload = await decompress(req.body);
+  
+  // Use once() instead of on(), OR remove after single firing
+  const handler = (result) => {
+    sendResponse(res, result);
+    apiEmitter.removeListener('processed', handler); // explicit cleanup
+  };
+  apiEmitter.once('processed', handler);
+  // or simply: don't register a listener at all
+  transform(payload).then(result => sendResponse(res, result));
+});
+
+// Even better: use a Promise-based pattern, not EventEmitter
+async function handleData(req, res) {
+  const payload = await decompress(req.body);
+  const result = await transform(payload);
+  sendResponse(res, result);
+}
+// No EventEmitter needed for simple request-response flows
+```
+
+**Global safeguard — limit listeners per emitter:**
+
+```typescript
+import { EventEmitter } from 'node:events';
+
+const MAX_LISTENERS_PER_TYPE = 50;
+
+class TrackedEventEmitter extends EventEmitter {
+  constructor() { super(); }
+  
+  addListener(event: string | symbol, listener: (...args: any[]) => void): this {
+    const count = this.listenerCount(event);
+    if (count >= MAX_LISTENERS_PER_TYPE) {
+      throw new RangeError(
+        `[EMITTER LEAK] "${String(event)}" has ${count} listeners (max ${MAX_LISTENERS_PER_TYPE})`
+      );
+    }
+    return super.addListener(event, listener);
+  }
+}
+```
+
+#### Fix 2: Response-Logging Middleware Not Pruning Buffered Bodies (Second Highest)
+
+```typescript
+// BEFORE (buggy):
+const RESPONSE_BUFFER = [];
+
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  
+  const originalEnd = res.end;
+  res.end = function(chunk?: any, ...rest: any[]) {
+    const latency = Date.now() - startTime;
+    
+    // Store everything — unbounded
+    if (chunk && typeof chunk !== 'string') {
+      RESPONSE_BUFFER.push(Buffer.from(chunk));
+    }
+    
+    originalEnd.call(this, chunk, ...rest);
+  };
+  next();
+});
+
+// Process buffer occasionally... never?
+
+// AFTER (fixed): Ring buffer with LRU eviction
+import { LRUCache } from 'lru-cache';
+
+const RESPONSE_LOG = new LRUCache<string, { 
+  timestamp: number; 
+  latencyMs: number; 
+  sizeBytes: number;
+  truncatedBody: string;  // string, not Buffer — less memory pressure
+}>({
+  maxSize: 1000,              // max entries
+  sizeCalculation: (val) => val.sizeBytes,
+  max: 50 * 1024 * 1024,     // cap at 50MB total
+});
+
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const reqId = req.headers['x-request-id'] ?? crypto.randomUUID();
+  
+  const originalEnd = res.end;
+  res.end = function(chunk?: any, ...rest: any[]) {
+    const latency = Date.now() - startTime;
+    const size = chunk ? Buffer.byteLength(chunk) : 0;
+    
+    LOG.info({ reqId, latencyMs: latency, sizeBytes: size });
+    
+    // Only keep last 1000 responses, evict oldest automatically
+    RESPONSE_LOG.set(reqId, {
+      timestamp: startTime,
+      latencyMs: latency,
+      sizeBytes: size,
+      truncatedBody: typeof chunk === 'string' ? chunk.slice(0, 512) 
+                     : chunk ? `<buffer ${size}b>` : '',
+    });
+    
+    originalEnd.call(this, chunk, ...rest);
+  };
+  next();
+});
+```
+
+**Even simpler fix if logging isn't strictly required in-process:** Write logs asynchronously via a low-priority queue with back-pressure:
+
+```typescript
+const logPipeline = createWriteStream('/var/log/api-responses.jsonl', { flags: 'a' });
+const pendingWrites: string[] = [];
+
+app.use((req, res, next) => {
+  const record = { id: req.id, t: Date.now(), url: req.url, status: 200 };
+  
+  const origEnd = res.end;
+  res.end = function(chunk, ...rest) {
+    if (res.statusCode >= 400) {
+      // Only log errors or above-threshold latencies
+      record.status = res.statusCode;
+      if (chunk && Buffer.isBuffer(chunk)) {
+        record.size = chunk.length;
+      }
+      
+      // Fire-and-forget with flow control
+      const line = JSON.stringify(record);
+      pendingWrites.push(line);
+      
+      // Batch flush — don't block request completion
+      if (pendingWrites.length >= 100) {
+        flushLogs();
+      } else {
+        setImmediate(flushLogs);
+      }
+    }
+    origEnd.call(this, chunk, ...rest);
+  };
+  next();
+});
+
+function flushLogs() {
+  while (pendingWrites.length > 0) {
+    if (!logPipeline.write(pendingWrites.shift() + '\n')) {
+      // Back-pressure: wait for drain
+      logPipeline.once('drain', flushLogs);
+      break;
+    }
+  }
+  if (pendingWrites.length === 0) logPipeline.end();
+}
+```
+
+#### Fix 3: Combined Fix — Remove Event Emitter Where Promises Suffice (Architecture Level)
+
+```typescript
+// The cleanest fix: most "emitter abuse" happens because developers reach for
+// EventEmitter instead of Promises/streams for fire-and-dispatch workflows.
+
+// BEFORE: Using EventEmitter as a job queue
+const jobEmitter = new EventEmitter();
+const workers: Set<Worker> = new Set();
+
+jobEmitter.on('task', async (payload) => {
+  // Each `payload` is captured as a closure variable
+  // If 1000 tasks fire and only 100 complete, 900 closures + payloads persist
+  processTask(payload);
+});
+
+// Resolved: Replace with proper queue
+import Queue from 'bee-queue'; // or bullmq, or simple async generator pattern
+
+async function* createJobProcessor(maxConcurrency = 10) {
+  const queue: Array<(value: any) => void> = [];
+  let active = 0;
+  let done = 0;
+  
+  // Submit
+  const submit = <T>(fn: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve) => {
+      queue.push(() => {
+        const result = fn().then(resolve);
+        active++;
+        result.finally(() => { active--; dequeue(); });
+      });
+      if (active < maxConcurrency) dequeue();
+    });
+  
+  function dequeue() {
+    while (active < maxConcurrency && queue.length > 0) {
+      queue.shift()!();
+    }
+  }
+  
+  return { submit };
+}
+
+// USAGE: Explicit concurrency control, no leaking closures
+const { submit } = await createJobProcessor(10);
+app.post('/api/process', async (req, res) => {
+  const result = await submit(async () => {
+    const payload = await decompress(req.body);
+    return await heavyTransform(payload);
+  });
+  res.json(result);
+});
+```
+
+---
+
+### Verification Checklist
+
+- [ ] **Kubernetes readiness probe** updated so OOM-restarts trigger graceful shutdown (`TERM` signal → stop accepting new requests, drain existing, then exit within 30s grace period)
+- [ ] **Process memory profiling** enabled with periodic heap dumps → auto-uploaded to monitoring
+- [ ] **MaxListeners warning** configured to throw hard rather than warn silent:
+  ```typescript
+  import { EventEmitter } from 'node:events';
+  EventEmitter.defaultMaxListeners = 20;
+  ```
+- [ ] **HTTP response body limits** set to prevent large body accumulation:
+  ```typescript
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ limit: '1mb' }));
+  ```
+- [ ] **Audit all `.on()` calls** across the codebase for matching `.removeListener()` / `.off()` or `.once()` replacement
+- [ ] **Review all response/request body capture middleware** for bounded storage
+- [ ] **Add Prometheus metrics**:
+  ```typescript
+  import promClient from 'prom-client';
+  const emitterListenersMetric = new promClient.Gauge({
+    name: 'api_emitter_listener_count',
+    help: 'Number of listeners per event',
+    labelNames: ['event_name'],
+  });
+  // Updated in .addListener override
+  ```
+
+### Prioritized Action Order
+
+1. **Add `defaultMaxListeners` guard** — immediate visibility into who's registering excess listeners
+2. **Replace unbounded response-logging buffer** with LRU cache or file-based log — removes Buffer leak source
+3. **Audit all `emitter.on()` callers** and convert to `once()` or promise-based patterns — removes closure leak source
+4. **Deploy periodic heap snapshot + upload** — ongoing early-warning system
+5. **Add Prometheus listener-count metric** — alert on abnormally high counts before OOM

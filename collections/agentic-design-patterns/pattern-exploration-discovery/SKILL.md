@@ -1,6 +1,6 @@
 ---
 name: pattern-exploration-discovery
-description: Implement autonomous scientific inquiry and research loops: hypothesis formulation, experiment design, simulation, and iterative synthesis.
+description: "Implement autonomous scientific inquiry and research loops: hypothesis formulation, experiment design, simulation, and iterative synthesis."
 metadata:
   category: agent-architecture
   tier: enterprise

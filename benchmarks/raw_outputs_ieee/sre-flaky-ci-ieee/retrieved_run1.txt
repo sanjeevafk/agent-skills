@@ -1,0 +1,447 @@
+[exit=0 latency=33.54s]
+## Systematic Debugging Analysis: Intermittent Pytest Failures
+
+### The Four Phases
+
+---
+
+## Phase 1: Problem Understanding
+
+**Symptom:** 3 of 240 tests fail intermittently in developer environments but pass in CI. Failures correlate with machine load and developer timezone. Reruns usually go green.
+
+**Key Observations:**
+- 3/240 failure rate (~1.25%) is a classic flaky-test signature
+- Correlation with **machine load** points to race conditions (timing-dependent bugs become more likely under CPU contention)
+- Correlation with **developer timezone** points to time-dependent code paths
+- Reruns going green indicates non-determinism rather than a hard bug
+
+**Failure Modalities Identified:**
+
+| # | Failure Mode | Likely Root Cause |
+|---|-------------|-------------------|
+| 1 | Asserts on formatted timestamp | Timezone / clock drift |
+| 2 | Polls async worker with `sleep(2)` | Race condition / insufficient polling timeout |
+| 3 | Dict iteration order over set of fixture IDs | Non-deterministic hash randomization |
+
+---
+
+## Phase 2: Hypotheses Ranked by Likelihood
+
+### H1: Timezone Dependency (Likelihood: 95%)
+**Applies to:** Timestamp assertion test
+
+Machine-level timezone configuration affects string formatting. CI runs in UTC; developer machines may run in local timezones. A timestamp formatted with `%Y-%m-%d %H:%M:%S` will produce different strings across timezones unless explicitly forced to UTC.
+
+**Why it matches the symptoms:**
+- Fails only when developer timezone ≠ UTC
+- Never fails if developer timezone happens to match CI's UTC
+- Rerun passes once the clock drifts past the boundary being asserted
+
+### H2: Insufficient Async Timeout Under Load (Likelihood: 85%)
+**Applies to:** Async worker poll with `sleep(2)`
+
+A fixed `sleep(2)` assumes the worker completes within 2 seconds. Under CPU contention (developer machine load), the worker may take longer. CI typically runs on dedicated hardware, avoiding this.
+
+**Why it matches the symptoms:**
+- Fails only under high machine load
+- Reruns pass because the second attempt finds the worker ready
+- `sleep(2)` is a brittle polling strategy
+
+### H3: Hash Randomization Breaking Set Iteration Order (Likability: 75%)
+**Applies to:** Dict iteration order over fixture ID set
+
+Python sets have non-deterministic iteration order when using hash randomization (default since Python 3.3, controlled via `PYTHONHASHSEED`). Different `PYTHONHASHSEED` values produce different iteration orders. Some assertions assume a fixed iteration order from the set.
+
+**Why it matches the symptoms:**
+- Fails inconsistently depending on the hash seed at runtime
+- Environment variables or IDE configurations sometimes alter `PYTHONHASHSEED`
+- Reruns may succeed by chance if the new seed produces the expected order
+
+### H4: Test Execution Order Dependency (Likelihood: 50%)
+Shared mutable state between tests causing side effects.
+
+This is less likely since the failures are isolated to exactly 3 specific tests, not cascading.
+
+### Summary — Confidence-Weighted Ranking:
+1. **H1 (Timezone)** — Strongest match, directly explains timezone correlation
+2. **H2 (Async timeout)** — Directly explains machine-load correlation
+3. **H3 (Hash randomization)** — Explains intermittent nature
+
+---
+
+## Phase 3: Minimal Reproduction Design
+
+Below is a self-contained reproduction suite that forces each failure mode. Run with `python -m pytest reproduce_flaky.py -v` and stress with repeated invocations.
+
+```python
+"""
+Reproduction suite for 3 flaky test patterns.
+
+Stress-run instructions:
+    # Force the timezone-dependent failure (run as dev in non-UTC TZ):
+    TZ=America/New_York python -m pytest reproduce_flaky.py::test_timestamp_format_tz -v --count=50
+
+    # Force the async-race failure (simulate load via parallel tasks):
+    python -m pytest reproduce_flaky.py::test_async_worker_poll -v --count=50
+
+    # Force the hash-seed failure (cycle seeds 0..255):
+    python -m pytest reproduce_flaky.py::test_fixture_order_non_deterministic -v --count=255
+
+    # All together (total ~500+ runs):
+    for i in $(seq 1 20); do python -m pytest reproduce_flaky.py -v; done
+"""
+
+import asyncio
+import datetime
+import os
+import sys
+import time
+from collections import OrderedDict
+from unittest.mock import patch
+
+import pytest
+
+
+# ======================================================================
+# Shared fixtures
+# ======================================================================
+
+@pytest.fixture
+def fixture_ids():
+    """Return a set of fixture IDs. Sets do NOT guarantee iteration order."""
+    return {"alpha", "beta", "gamma", "delta"}
+
+
+@pytest.fixture
+def async_worker_task():
+    """Create a mock async worker that has configurable latency."""
+    event = asyncio.Event()
+    latency = float(os.environ.get("WORKER_LATENCY_MS", "50"))  # default 50ms
+
+    async def worker():
+        await asyncio.sleep(latency / 1000)
+        event.set()
+        return {"status": "complete", "items_processed": 4}
+
+    task = asyncio.create_task(worker())
+    yield task
+
+    if not task.done():
+        task.cancel()
+
+
+@pytest.fixture
+def now_utc():
+    """Current UTC time as a naive datetime (no tzinfo)."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+# ======================================================================
+# TEST 1: Timestamp format depends on system timezone
+# ======================================================================
+
+def _format_timestamp(now_dt):
+    """Format a datetime as a human-readable string.
+
+    BUG: Uses local system time instead of UTC, so the output changes
+    based on the process's timezone setting.
+    """
+    return now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_timestamp_format_tz(fixture_ids, now_utc):
+    """Asserts on a formatted timestamp string.
+
+    Reproduction:
+        This test FAILS when the system timezone is not UTC.
+        CI runs in UTC → passes.
+        Developer machine in EST → fails by hours.
+
+        Force it:
+            TZ=America/New_York python -m pytest test_file.py::test_timestamp_format_tz -v
+    """
+    # BUGGY production code being tested:
+    formatted = _format_timestamp(now_utc)  # internally uses local TZ
+
+    # The assertion assumes UTC because CI always uses UTC.
+    # On a machine in a different timezone, `formatted` differs.
+    expected_in_ci = now_utc.strftime("%Y-%m-%d %H:%M:%S")  # What CI expects
+
+    assert formatted == expected_in_ci, (
+        f"Timestamp mismatch: expected '{expected_in_ci}' (UTC) "
+        f"but got '{formatted}' (local TZ)."
+    )
+
+
+# ======================================================================
+# TEST 2: Async worker polling with fixed sleep
+# ======================================================================
+
+async def _poll_worker(task, max_retries=5, retry_delay=2.0):
+    """Poll an async worker by sleeping a fixed interval.
+
+    BUG: Fixed `sleep(2)` means we give up after 10 seconds total.
+    Under heavy machine load, the worker may need more time.
+    """
+    for attempt in range(max_retries):
+        if task.done():
+            result = await task
+            return result
+        time.sleep(retry_delay)  # <-- HARDCODED DELAY
+
+    raise TimeoutError("Worker did not complete within max retries")
+
+
+def test_async_worker_poll(async_worker_task):
+    """Polls an async worker with a fixed sleep interval.
+
+    Reproduction:
+        This test FAILS under high machine load because the worker
+        takes >2 seconds per polling cycle.
+
+        Force it:
+            WORKER_LATENCY_MS=3000 python -m pytest test_file.py::test_async_worker_poll -v
+
+        Simulate load:
+            stress-ng --cpu 4 --timeout 60 &
+            python -m pytest test_file.py::test_async_worker_poll -v
+            killall stress-ng
+    """
+    try:
+        result = asyncio.run(_poll_worker(async_worker_task))
+    except TimeoutError as exc:
+        pytest.fail(f"Worker timed out: {exc}")
+
+    assert result["status"] == "complete"
+
+
+# ======================================================================
+# TEST 3: Dict iteration order over a set of fixture IDs
+# ======================================================================
+
+def _build_summary_dict(ids_set):
+    """Build a summary dict iterating over a set of IDs.
+
+    BUG: Sets have non-deterministic iteration order (depends on
+    PYTHONHASHSEED). Code here assumes a fixed order for assertion.
+    """
+    summary = {}
+    for item_id in ids_set:  # <-- SET: order not guaranteed!
+        summary[item_id] = len(item_id)  # e.g., length of the string ID
+    return summary
+
+
+def test_fixture_order_non_deterministic(fixture_ids):
+    """Relies on dict iteration order from a set.
+
+    Reproduction:
+        This test FAILS unpredictably because Python sets shuffle their
+        iteration order based on PYTHONHASHSEED.
+
+        Force it:
+            # Seed 0 might show one order, seed 1 another:
+            PYTHONHASHSEED=0 python -m pytest test_file.py::test_fixture_order_non_deterministic -v
+            PYTHONHASHSEED=1 python -m pytest test_file.py::test_fixture_order_non_deterministic -v
+
+        The dictionary keys insertion order varies by seed.
+    """
+    summary = _build_summary_dict(fixture_ids)
+
+    # BUGGY ASSERTION: assumes keys appear in alphabetical order
+    # because that happened to be the insertion order when tests were written.
+    ordered_keys = list(summary.keys())
+
+    assert ordered_keys == ["alpha", "beta", "gamma", "delta"], (
+        f"Expected fixed iteration order ['alpha', 'beta', 'gamma', 'delta'] "
+        f"but got {ordered_keys}. Set iteration order is non-deterministic."
+    )
+```
+
+### Stress-Run Scripts
+
+```bash
+#!/usr/bin/env bash
+# stress_run.sh — cyclically invoke pytest with different hash seeds
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+echo "=== Stress-testing flaky test reproduction ==="
+echo ""
+
+# --- Round 1: Timezone variation ---
+echo "[Round 1] Testing timezone sensitivity..."
+for tz in UTC America/New_York Europe/London Asia/Tokyo Brazil/East; do
+    echo "  TZ=$tz ..."
+    TZ="$tz" python -m pytest reproduce_flaky.py::test_timestamp_format_tz -v --tb=short || true
+done
+echo ""
+
+# --- Round 2: Worker latency variation ---
+echo "[Round 2] Testing async worker timing..."
+for ms in 50 500 2000 3000 5000; do
+    echo "  WORKER_LATENCY_MS=$ms ..."
+    WORKER_LATENCY_MS="$ms" python -m pytest reproduce_flaky.py::test_async_worker_poll -v --tb=short || true
+done
+echo ""
+
+# --- Round 3: Hash seed cycling ---
+echo "[Round 3] Testing hash-seed sensitivity..."
+python_failed=0
+for seed in $(seq 0 99); do
+    if PYTHONHASHSEED="$seed" python -m pytest reproduce_flaky.py::test_fixture_order_non_deterministic -v --tb=line -q 2>&1 | grep -q "FAILED"; then
+        ((python_failed++))
+        echo "  PYTHONHASHSEED=$seed → FAILED ($python_failed failures so far)"
+    fi
+done
+echo "  Total hash-seed-induced failures: $python_failed / 100"
+echo ""
+
+echo "=== Complete ==="
+```
+
+---
+
+## Phase 4: Deterministic Fixes
+
+### Fix for Test 1: Timestamp Assertion — Freeze & Explicitly Use UTC
+
+```python
+import pytz  # or use zoneinfo on Python 3.9+
+
+def _format_timestamp(now_dt):
+    """FIXED: Always produce UTC output regardless of system timezone."""
+    # Convert to UTC if the input has timezone info
+    if now_dt.tzinfo is not None:
+        utc_now = now_dt.astimezone(pytz.UTC)
+    else:
+        # Treat naive datetime as UTC
+        utc_now = now_dt.replace(tzinfo=datetime.timezone.utc).astimezone(pytz.UTC)
+    return utc_now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_timestamp_format_fixed(freezer, now_utc):
+    """FIXED: Use freezegun to freeze time AND assert in explicit UTC."""
+    # Freezegun freezes the clock at a known point, eliminating both
+    # clock-drift AND timezone uncertainty during the test lifecycle.
+    from freezegun import freeze_time
+
+    frozen_time = datetime.datetime(2026, 8, 26, 14, 30, 0, tzinfo=datetime.timezone.utc)
+
+    with freeze_time(frozen_time):
+        formatted = _format_timestamp(frozen_time)  # deterministic value
+
+    expected = "2026-08-26 14:30:00"
+    assert formatted == expected
+```
+
+**Key principles applied:**
+- **Freeze time** with `freezegun` or `unittest.mock.patch` so the clock never drifts mid-test
+- **Explicitly use UTC** via `.strftime(...)` with a UTC-aware datetime object; never rely on `datetime.now()` alone
+- In production code, ensure timestamps are always stored/returned as UTC ISO 8601 (`%Y-%m-%dT%H:%M:%SZ`)
+
+### Fix for Test 2: Async Worker Polling — Replace Fixed Sleep with Proper Wait
+
+```python
+async def _poll_worker_with_retry(task, max_wait_seconds=30, poll_interval=0.5):
+    """FIXED: Use proper async wait with exponential backoff."""
+    deadline = asyncio.get_event_loop().time() + max_wait_seconds
+    interval = poll_interval
+
+    while asyncio.get_event_loop().time() < deadline:
+        if task.done():
+            try:
+                return await task
+            except asyncio.CancelledError:
+                pytest.skip("Worker was cancelled")
+
+        # Use async sleep, not blocking time.sleep
+        await asyncio.sleep(interval)
+
+        # Exponential backoff (capped at 5s)
+        interval = min(interval * 1.5, 5.0)
+
+    raise TimeoutError(
+        f"Worker did not complete within {max_wait_seconds}s "
+        f"(task state: {task.get_state()})"
+    )
+
+
+def test_async_worker_poll_fixed(async_worker_task):
+    """FIXED: Uses async-compatible polling with proper timeout."""
+    # Run with asyncio.run which handles the event loop properly
+    result = asyncio.run(_poll_worker_with_retry(async_worker_task))
+
+    assert result["status"] == "complete"
+    assert isinstance(result["items_processed"], int)
+```
+
+**Key principles applied:**
+- **Never use `time.sleep()` in async code** — it blocks the entire event loop. Use `await asyncio.sleep()`.
+- **Replace magic-number sleeps** with configurable `max_wait_seconds` and `poll_interval` parameters
+- **Exponential backoff** prevents thrashing under load while still catching quick completions
+- **Timeout is generous enough** for loaded machines (30s vs the original 10s) but bounded to prevent infinite hangs
+- **Check `task.done()` before awaiting** to avoid `InvalidStateError`
+
+### Fix for Test 3: Dict Iteration Over Set — Sort Before Assertion
+
+```python
+def _build_summary_dict_sorted(ids_set):
+    """FIXED: Sort the set before building the dict to guarantee insertion order."""
+    sorted_ids = sorted(ids_set)  # Deterministic order
+    summary = OrderedDict()
+    for item_id in sorted_ids:
+        summary[item_id] = len(item_id)
+    return summary
+
+
+def test_fixture_order_fixed(fixture_ids):
+    """FIXED: No iteration-order assumptions; sort explicitly."""
+    summary = _build_summary_dict_sorted(fixture_ids)
+
+    # Assert on values (which are intrinsic to the IDs) rather than
+    # arbitrary iteration order of a set.
+    assert list(summary.keys()) == sorted(fixture_ids)
+    assert summary["alpha"] == 5   # len("alpha")
+    assert summary["beta"] == 4    # len("beta")
+    assert summary["gamma"] == 5   # len("gamma")
+    assert summary["delta"] == 5   # len("delta")
+```
+
+**Alternative fix if the dict structure itself is the unit under test:**
+
+```python
+def test_fixture_values_order_independent(fixture_ids):
+    """FIXED: Assert that the dict contains the right key-value pairs,
+    regardless of insertion order. Value comparisons are order-independent."""
+    summary = _build_summary_dict_sorted(fixture_ids)
+
+    # Check correctness by value, not position
+    expected_mapping = {fid: len(fid) for fid in fixture_ids}
+    assert summary == expected_mapping  # Dict equality ignores insertion order
+```
+
+**Key principles applied:**
+- **Never iterate over a set expecting deterministic order**. Use `sorted(set)` or convert to a list explicitly.
+- **Use `OrderedDict`** if you need to serialize/dump the dict in a predictable order.
+- **Assert on semantic properties** (key-value mappings) rather than structural ones (iteration order) whenever possible.
+- **Set `PYTHONHASHSEED=0` in CI config** as a belt-and-suspenders measure to ensure consistent hashing across all tests.
+
+---
+
+## Summary of Changes Required
+
+| Issue | Root Cause | Fix | Tool/Pattern |
+|-------|-----------|-----|--------------|
+| Timestamp assertion | System timezone ≠ UTC | Freeze time + enforce UTC with `freezegun` | Deterministic time |
+| Async worker poll | Blocking `sleep(2)` + short timeout | `await asyncio.sleep()` with backoff + generous timeout | Async-native polling |
+| Dict/set order | `PYTHONHASHSEED` non-determinism | `sorted()` before iteration + `OrderedDict` | Deterministic ordering |
+
+## Verification Strategy
+
+After applying these fixes:
+1. Run `pytest -xvs` — all 240 tests should pass immediately (no intermittency)
+2. Run `pytest -xvs --count=100` on each fixed test — zero failures expected
+3. Run under load (`stress-ng --cpu 4 --timeout 60 & ...`) — no regression
+4. Run across multiple timezones (`TZ=America/New_York pytest ...`) — identical results

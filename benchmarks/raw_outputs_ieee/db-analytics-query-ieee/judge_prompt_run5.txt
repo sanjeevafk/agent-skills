@@ -1,0 +1,1235 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+A Postgres 16 reporting query over an 800M-row events table (filter by tenant_id, event_type, created_at range, then window-function rank and join to a 2M-row users table) takes 40s. EXPLAIN ANALYZE shows a Seq Scan, a sort spilling to disk, and stale estimates (planner expects 100 rows, gets 2M). Diagnose and fix: read the plan node by node, choose the right index strategy (composite vs partial vs covering with INCLUDE, and why order of columns matters), fix the estimate problem, decide whether partitioning by month is justified, and give the rewritten query with CTE/materialization choices explained.
+
+---
+[Response A]:
+# Diagnosis & Fix: 800M-Row Postgres Events Query
+
+## Node-by-Node Plan Breakdown
+
+Running `EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)` reveals three cascading failures:
+
+```
+Limit (cost=... rows=100 width=...)
+  -> WindowAgg (cost=... rows=500000 width=...)
+        -> Sort (cost=... rows=500000 width=...)
+              Sort Method: external merge  Disk: 51200kB  ← spills to disk!
+              -> Hash Join (cost=... rows=500000 width=...)
+                    Hash Cond: (events.user_id = users.id)
+                    -> Seq Scan on events (cost=... rows=2000000 width=...)
+                          Filter: tenant_id = 'x' AND event_type = 'pageview'
+                             AND created_at BETWEEN ...
+                            Rows Removed by Filter: 798000000  ← scanning entire table!
+                    -> Hash
+                          -> Seq Scan on users (cost=... rows=2000000 width=...)
+```
+
+**Three problems:**
+
+| # | Problem | Root Cause |
+|---|---------|------------|
+| 1 | **Seq Scan on events** — reads 800M rows, filters down to 2M (0.25% selectivity) | No index covering `(tenant_id, event_type, created_at)` |
+| 2 | **Sort spills to disk** — sorting 2M rows with too many columns pushed through the pipeline | Missing `INCLUDE` columns; planner picks hash join then sorts everything needed for `RANK()` + SELECT columns |
+| 3 | **Stale estimate** (expects 100, sees 2M = 20x error) | Stats are outdated after bulk loads/DELETEs; no correlated statistics capture the multi-column filter combination |
+
+---
+
+## Step 1: Index Strategy
+
+### Why Column Order Matters
+
+Filter predicates: `tenant_id = ?`, `event_type = ?`, `created_at BETWEEN ? AND ?`
+
+The order must follow the "equality first, range last" rule:
+
+```sql
+-- ✅ Correct: equality columns before range column
+-- B-tree is sorted ascending. Equality probes land at one position.
+-- Range scans forward from there — contiguous I/O.
+CREATE INDEX idx_events_tenant_type_date
+    ON events (tenant_id, event_type, created_at DESC);
+
+-- ❌ Wrong: puts range column first, kills selectivity
+CREATE INDEX idx_events_date_first
+    ON events (created_at, tenant_id, event_type);
+-- B-tree on created_at narrows the range, then does nested lookups
+-- for tenant_id within that range — no index-only benefit for
+-- filtering. Essentially a sorted seq scan with extra memory overhead.
+```
+
+### Partial Index vs Covering Index
+
+Two layers of indexing:
+
+```sql
+-- Layer 1: Targeted partial index if a single tenant dominates
+-- Only create if ONE tenant has >10% of all events:
+CREATE INDEX idx_events_major_tenant
+    ON events (tenant_id, event_type, created_at DESC)
+    WHERE tenant_id = 'specific-major-tenant';
+-- This index is ~10% the size of the full index but answers
+-- queries for that tenant alone. Skip for now — you likely
+-- have multiple tenants needing coverage.
+
+-- Layer 2: Full composite index (required)
+CREATE INDEX idx_events_tenant_type_date
+    ON events (tenant_id, event_type, created_at DESC);
+
+-- Layer 3: Covering index if most queries only need a few
+-- additional columns (avoids heap fetches):
+CREATE INDEX idx_events_covering
+    ON events (tenant_id, event_type, created_at DESC)
+    INCLUDE (user_id, id);
+-- INCLUDE adds columns to the index leaf without affecting
+-- sort order. When your query selects user_id and the event id
+-- for ranking, the index becomes self-contained — zero heap
+-- access for those columns. Trade-off: index is ~2-3x larger
+-- but sequential-scan-friendly in its entries.
+```
+
+**Decision:** Start with the basic composite. If `SELECT *` or wide column selection forces heap fetches, move to the covering variant. For an 800M-row table, the covering index could be 60-80GB — budget accordingly.
+
+---
+
+## Step 2: Fix Stale Estimates
+
+The planner expects 100 rows because statistics on the three-column combination are inaccurate. After bulk inserts or deletes, `ANALYZE` needs to refresh:
+
+```sql
+-- Immediate fix for current session / specific table:
+ANALYZE events;
+
+-- But we also need CORRELATED statistics to understand
+-- how tenant_id + event_type interact with created_at ranges:
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+ANALYZE events;
+
+-- If tenant_id × event_type is highly selective (one type
+-- mostly appears in certain tenants), use a multicolumn stat:
+CREATE STATISTICS nds_tenant_event_created (ndistinct)
+    ON tenant_id, event_type, created_at FROM events;
+ANALYZE events;
+
+-- If the distribution isn't uniform within groups, add correlation stats:
+CREATE STATISTICS mcv_tenant_event (mcv)
+    ON tenant_id, event_type FROM events;
+ANALYZE events;
+
+-- Schedule recurring analyze so stats stay fresh:
+-- In cron: VACUUM ANALYZE events; every 6 hours
+-- Or use pg_partman's run_analyze() if partitioned later
+```
+
+With `set_statistics_target` raised from default 100 to 1000, the planner captures much finer histograms. Combined with MCV (most common values) lists on `tenant_id, event_type`, the row estimate for a single tenant's query should drop from 2M to something closer to reality.
+
+---
+
+## Step 3: Partitioning Decision — Do NOT Just Yet
+
+**Current verdict: Don't partition.** Here's why:
+
+| Criterion | Assessment |
+|-----------|------------|
+| Data grows >1B rows? | Not yet at 800M |
+| Query always includes partition key? | Yes — `created_at` is always filtered |
+| Maintenance load (VACUUM, indexes) prohibitive? | Probably, but let's test indexes first |
+| Hot/cold data separation needed? | Not required if archive job handles old data |
+
+Partitioning adds operational complexity. It pays off when:
+- You can drop entire partitions instead of deleting millions of rows
+- Queries that filter on `created_at` skip irrelevant partitions entirely
+
+For now, a well-tuned composite index + better stats will solve 90%+ of the problem. Come back to partitioning if:
+1. Table exceeds 2B rows
+2. You need to delete/archival older than 12 months efficiently
+3. Index maintenance on the full table becomes unsustainable
+
+**If you do partition later**, use range partitioning by month:
+
+```sql
+CREATE TABLE events_monthly_2024_01 PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE events_monthly_2024_02 PARTITION OF events
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+-- Index goes on each partition automatically via inheritance
+CREATE INDEX idx_events_partitioned
+    ON EACH PARTITION (tenant_id, event_type, created_at DESC);
+```
+
+Each partition's index is ~1/12th the size. Faster builds, faster queries that skip months.
+
+---
+
+## Step 4: Rewritten Query
+
+Without seeing the exact original query, here's the pattern for what it almost certainly looks like and how to rewrite it:
+
+```sql
+-- ===== ORIGINAL (slow, ~40s) =====
+SELECT u.name, e.tenant_id, e.event_type, e.created_at,
+       RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rn
+FROM events e
+JOIN users u ON u.id = e.user_id
+WHERE e.tenant_id = 'abc123'
+  AND e.event_type = 'pageview'
+  AND e.created_at BETWEEN '2024-01-01' AND '2024-06-30'
+ORDER BY e.created_at DESC
+LIMIT 100;
+```
+
+```sql
+-- ===== OPTIMIZED (~<2s expected) =====
+WITH ranked AS MATERIALIZED (
+    -- CTE with MATERIALIZED forces a materialization step, preventing
+    -- the planner from pushing limit/sort down into the join. This is
+    -- crucial because the window function operates ONLY on the filtered
+    -- event subset, not the entire joined result.
+    SELECT
+        e.user_id,
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        RANK() OVER w AS rn
+    FROM events e
+    WHERE e.tenant_id = 'abc123'
+      AND e.event_type = 'pageview'
+      AND e.created_at BETWEEN '2024-01-01' AND '2024-06-30'
+    WINDOW w AS (PARTITION BY e.tenant_id ORDER BY e.created_at DESC)
+)
+SELECT r.tenant_id, r.event_type, r.created_at, r.rn,
+       u.name
+FROM ranked r
+JOIN users u ON u.id = r.user_id
+WHERE r.rn <= 100   -- Push LIMIT into WHERE for clarity
+ORDER BY r.created_at DESC;
+```
+
+### Why `MATERIALIZED` vs Default?
+
+By default in PG 12+, CTEs are **inlined** — the planner may push predicates from outside the CTE into it, which can break window-function semantics. With `MATERIALIZED`, the CTE executes as an independent plan node, producing exactly the filtered + ranked event rows, then joins against `users`.
+
+### Window Function Optimization Note
+
+The window frame here defaults to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Since we're partitioning by `tenant_id` and ordering by `created_at DESC`, identical timestamps produce tied ranks. That's correct behavior for reporting. If you need strict row numbering regardless of ties, switch to `ROW_NUMBER()`.
+
+---
+
+## Step 5: Connection Pooling for Reporting Workloads
+
+Reporting queries benefit from dedicated pooling separate from OLTP:
+
+```
+PgBouncer mode: transaction (not session)
+  max_client_conn: 200
+  default_pool_size: 25   (matches max connections to PG minus OLTP pool)
+  min_pool_size: 5
+  reserve_pool_size: 3     (separate pool for critical queries)
+
+  --- connection strings ---
+  oltp_primary = postgres://app_user:...@pg-host:5432/db
+  reporting   = postgres://reporter_user?...@pg-host:5432/db?pool_mode=transaction
+```
+
+The reporting role should have `NOLOGIN` on production tables with explicit views — keeps the surface area smaller and makes read replicas viable:
+
+```sql
+CREATE ROLE reporter NOLOGIN;
+GRANT CONNECT ON DATABASE db TO reporter;
+
+-- Route reporting traffic to replica
+ALTER ROLE reporter IN DATABASE db SET default_transaction_read_only = on;
+
+-- Grant read-only access through a materialized view or regular view
+GRANT USAGE ON SCHEMA analytics TO reporter;
+GRANT SELECT ON analytics.event_summary_view TO reporter;
+-- Consider: GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO reporter;
+```
+
+---
+
+## Complete Execution Checklist
+
+```sql
+-- Phase 1: Immedia
+...[truncated]
+---[Response B]:
+# Diagnosis & Fix: 40s Report Query over 800M-Row Events Table
+
+## Node-by-Node Plan Breakdown
+
+Let me walk through the likely EXPLAIN ANALYZE output node by node, from bottom (most expensive) to top:
+
+```
+Sort (cost=... rows=2000000 width=...) (actual time=... rows=2000000 loops=1)
+  Sort Method: external merge  Disk: 409600kB   ← SPIALLS TO DISK
+  Hash Join  (cost=... rows=2000000 width=...)
+    Hash Cond: (events.user_id = users.id)
+    → Seq Scan on events (cost=... rows=150000000 width=...) (actual time=0.035..120000.000 rows=800000000 loops=1)
+       Filter: (tenant_id = 'abc' AND event_type = 'pageview' AND created_at BETWEEN ...)
+       Rows Removed by Filter: ~785M          ← SEQUENTIAL SCAN WIPING THROUGH 785M ROWS
+    → Hash                              ← Builds hash table of 2M users
+      → Seq Scan on users               ← Full scan of 2M row users table (acceptable here)
+  → Window Function: RANK() OVER (...)  ← Executes after the join
+```
+
+### The Three Root Causes
+
+| # | Problem | Impact | Root |
+|---|---------|--------|------|
+| 1 | **Seq Scan on events** | Reads all 800M rows | No usable index for `WHERE tenant_id = X AND event_type = Y AND created_at BETWEEN ...` |
+| 2 | **External merge sort spilling to disk** | 400+ MB on disk, slow I/O | Planner underestimates rows → allocates tiny `sort_mem` window; actual result is 2M rows |
+| 3 | **Stale planner estimate** (expect 100 vs actual 2M) | Wrong memory allocation + wrong join strategy | Outdated statistics on the selectivity of `(tenant_id, event_type, created_at)` predicates |
+
+## Fix Strategy — In Order of Priority
+
+### 1. Index: Composite with Correct Column Order
+
+```sql
+-- PRIMARY FIX: composite index matching equality columns first, then range column
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_tenant_type_date
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Why this order matters:**
+
+```
+tenant_id   → equality filter (highest cardinality, tightest selectivity)
+event_type  → equality filter (second-level selectivity)
+created_at  → range filter (must come LAST in composite indexes)
+
+Rule: all equality (=) columns before any range (BETWEEN, >, <) column.
+
+This enables an Index Only Scan if we add INCLUDE for the joined columns,
+or at minimum an Index Scan that avoids reading 785M dead rows.
+```
+
+**Partial index consideration:** If you only report on active tenants (e.g., `is_active = true`), a partial index saves ~30–60% space:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_active_tenant_type_date
+  ON events (tenant_id, event_type, created_at DESC)
+  WHERE is_active = true;
+-- Use this ONLY if your WHERE clause already includes "AND is_active = true"
+```
+
+### 2. Covering Index with INCLUDE
+
+Since you join to `users` on `user_id`, you also need those columns available without hitting the heap. Choose between two strategies:
+
+**Option A — Include just the join key (smaller index, one heap fetch):**
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS idx_events_tenant_type_date;
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_date
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, tenant_id);
+```
+
+**Option B — If the query SELECTs specific event columns too:**
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_date_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, tenant_id, payload, ip_address);
+-- Enables Index Only Scan — eliminates ALL heap lookups
+-- But increases index size significantly (~3–4x for wide payload columns)
+```
+
+**Tradeoff decision:** For an 800M-row table, Option A keeps the index manageable (~25–40 GB). Option B can push it past 100 GB. Start with Option A unless heap fetches are still the bottleneck.
+
+### 3. Fix Stale Estimates
+
+The planner expects 100 rows but gets 2M because statistics are out of date or the predicate selectivity doesn't match distribution assumptions.
+
+```sql
+-- Step 1: Force refresh statistics on both tables
+ANALYZE events;
+ANALYZE users;
+
+-- Step 2: If certain tenant_ids have highly skewed distributions,
+-- set per-column statistics targets for better sample accuracy
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ANALYZE events;
+
+-- Step 3: If ANALYZE still gives bad estimates for specific ranges,
+-- adjust scale factor (default is 0.01 for 10k samples). Higher = more accurate but slower analyze.
+-- View current stats:
+SELECT attname, null_frac, avg_width, n_distinct, correlation,
+       most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'events' AND attname IN ('tenant_id', 'event_type');
+
+-- Step 4: As a last resort (not recommended for OLTP), force the planner's row estimate:
+SET LOCAL statement_timeout = '60s';
+SET LOCAL enable_seqscan = off;  -- Debug only — DO NOT deploy this
+```
+
+**Why ANALYZE is usually enough:** It rebuilds histogram and MCV (Most Common Values) lists. After running `ANALYZE events`, the planner will see that `tenant_id = 'abc'` matches ~250M rows (or whatever the real count is) instead of guessing 100.
+
+### 4. Partitioning Decision: Monthly Range on created_at?
+
+**Verdict: YES, justified here.** Here's the reasoning matrix:
+
+| Factor | No Partition | Monthly Partition |
+|--------|-------------|-------------------|
+| Seq scan avoidance | Must use index | **PRUNE partitions entirely** — skips entire months |
+| Index maintenance | One massive btree (~30–40 GB) | Smaller per-month indexes, faster builds |
+| Autovacuum pressure | Single huge table scans | Vacuum scope limited to recent partitions |
+| Write complexity | Simple INSERT | Routing function needed (pg_partman handles it) |
+| Query pattern compatibility | Partially helps | **Perfect fit** — `WHERE created_at BETWEEN ...` maps directly |
+
+Since the report queries filter by a date range (likely weeks or months), partition pruning will **eliminate scanning years of irrelevant data**. This alone can cut scan time from seconds to milliseconds for recent periods.
+
+```sql
+-- Install pg_partman for automated partition management
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+
+-- Convert existing table to partitioned (requires downtime or complex migration)
+-- Easiest path: create new partitioned table and migrate
+
+-- New partitioned table
+CREATE TABLE events_partitioned (
+  LIKE events INCLUDING ALL
+) PARTITION BY RANGE (created_at);
+
+-- Create 12 months of partitions
+SELECT partman.create_parent(
+  p_parent_table   := 'public.events_partitioned',
+  p_control        := 'created_at',
+  p_interval       := '1 month',
+  p_premake        := 3   -- pre-create 3 future partitions
+);
+
+-- Verify partitions were created
+SELECT parent_tablename, partition_name, partition_high_bound, partition_low_bound
+FROM partman.part_config
+JOIN partman.parts_layout USING (parent_schema, parent_table)
+ORDER BY partition_high_bound DESC;
+
+-- Migrate data (run during maintenance window):
+INSERT INTO events_partitioned (SELECT * FROM events);
+
+-- Optional: enable parallel copy for speed
+ALTER TABLE events_partitioned ADD CONSTRAINT pk_events_p
+  PRIMARY KEY (tenant_id, event_type, id);  -- PK needs all partition keys
+```
+
+**If you can't do full partitioning right now,** adding the composite index + ANALYZE fixes ~90% of the problem. Do partitioning next as the infra-level optimization.
+
+### 5. Rewritten Query
+
+Here's the optimized query with explicit CTE strategy and materialization hints:
+
+```sql
+-- ============================================================
+-- OPTIMIZED REPORT QUERY
+-- ============================================================
+WITH tenant_filter AS MATERIALIZED (
+  -- Materialize early to lock in good row estimates
+  -- Forces the planner to treat this as a known intermediate result
+  SELECT e.user_id, e.created_at, e.payload
+  FROM events e
+  WHERE e.tenant_id = $1           -- parameterized tenant
+    AND e.event_type = $2          -- parameterized event type
+    AND e.created_at >= $3         -- parameterized start
+    AND e.created_at <  $4         -- parameterized end (exclusive upper bound)
+),
+ranked AS MATERIALIZED (
+  -- Rank within each logical group; materializing prevents
+  -- the outer query from re-scanning/re-sorting
+  SELECT user_id, created_at, payload,
+         RANK() OVER (
+           PARTITION BY user_id
+           ORDER BY created_at DESC
+         ) AS rnk
+  FROM tenant_filter
+)
+SELECT u.*, r.created_at, r.payload, r.rnk
+FROM ranked r
+JOIN users u ON u.id = r.user_id
+WHERE r.rnk <= $5                  -- limit the rank, e.g., top N per user
+ORDER BY u.name, r.created_at DESC;
+```
+
+**CTE / MATERIALIZED choices explained:**
+
+| Clause | Why MATERIALIZED | Alternative (NON-MATERIALIZED) | Risk |
+|--------|-----------------|-------------------------------|------|
+| `tenant_filter` | Locks in filtered row count so JOIN to users gets correct hash-size estimate | Planner might inline and undo optimizations, picking Nested Loop for 2M estimated rows | Bad join strategy = O(n²) behavior |
+| `ranked` | Prevents duplicate sort of 2M rows when outer query applies `rnk <= N` | Outer query could re-scan and re-sort | Double disk-spilling sort |
+
+**When to drop MATERIALIZED:** In Postgres 12+, the planner sometimes does a better job with `NON-MATERIALIZED` (inlineable) CTEs. Benchmark both:
+
+```sql
+-- Test NON-MATERIALIZED variant:
+EXPLAIN ANALYZE WITH tenant_filter AS (
+  SELECT e.user_id, e.created_at, e.payload
+  FROM events e
+  WHERE e.tenant_id = 'abc' AND e.event_type = 'pageview'
+    AND e.created_at BETWEEN '2024-01-01' AND '2024-01-31'
+)
+SELECT ...;  -- same query body
+```
+
+Keep `MATERIALIZED` if the plan shows "InitPlan" nodes with high cost — that means the materialization is actually helping.
+
+### 6. Additional Configuration Tweaks
+
+```sql
+-- Increase work_mem for long analytical queries (session-level, not global)
+BEGIN;
+SET LOCAL work_mem = '512MB';       -- prevents disk spill on sort
+SET LOCAL maintenance_work_mem = '2GB';  -- speeds 
+...[truncated]
+---[Response C]:
+Since there's no existing SQL code for this scenario, I'll document the full diagnosis and fix here based on the EXPLAIN ANALYZE symptoms you described.
+
+---
+
+## Diagnosis: Node-by-Node Plan Breakdown
+
+### Symptom 1 — Sequential Scan on 800M Rows
+
+```
+Seq Scan on events  (cost=0.00..31M rows, width=...)
+  Filter: (tenant_id = 'abc' AND event_type IN ('click','view') AND created_at >= ...)
+  Rows Removed by Filter: 799,998,453
+```
+
+**Root cause:** No usable composite index exists on `(tenant_id, event_type, created_at)`. Without it, every single row must be examined. Even if an index on `created_at` alone exists, that won't help because `tenant_id` filtering is the most selective predicate.
+
+**Why a single-column index doesn't work well:** An index on `created_at` returns ~800K candidate rows across the time range, all of which still need a filter on `tenant_id` — effectively a bitmap scan on top of a seq scan anyway. A composite index puts the most-selective equality predicates first, cutting candidates before any heap access.
+
+### Symptom 2 — Sort Spilling to Disk
+
+```
+Sort  (cost=..., rows=2000000, width=...)
+  Sort Method: external merge  Disk: 145MB
+  -> WindowAgg  (cost=..., rows=2000000, width=...)
+        -> Sort  (cost=..., rows=2000000, width=...)
+              -> Hash Join  ...
+                    Hash: ...
+                    -> Materialize  (from subplan)
+                    -> Seq Scan on users  (2M rows)
+```
+
+**Root causes stacked together:**
+1. Stale estimates (planner thinks 100 rows → allocates tiny work_mem → spills)
+2. WindowAgg requires sorting ALL matching event rows per partition (likely `PARTITION BY tenant_id`)
+3. If `work_mem` < the required sort size, external merge spills to disk
+4. Hash Join materializes the entire 2M-row users table into memory
+
+### Symptom 3 — Stale Estimates (expects 100, gets 2M)
+
+```
+Actual Rows  = 2,048,000
+Planned Rows = 100
+```
+
+**Root cause:** Outdated statistics. This is either:
+- Column statistics are stale (`auto_vacuum_analyze_scale_factor` didn't trigger because enough rows changed)
+- Correlation between columns is misleading (e.g., the planner assumes uniform distribution across `tenant_id`, but one tenant dominates)
+- Missing extended statistics for correlated predicates
+
+---
+
+## Fix #1 — Index Strategy
+
+### The Right Composite Index
+
+```sql
+-- Primary: covers the WHERE clause + supports window function partition ordering
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_time
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Why this column order:**
+| Position | Column | Reason |
+|----------|--------|--------|
+| 1st | `tenant_id` | Equality predicate — highest cardinality/separation factor. Puts data on disk grouped by tenant so lookups are O(log N) for the specific tenant only |
+| 2nd | `event_type` | Equality predicate (IN). Further narrows within each tenant group |
+| 3rd | `created_at DESC` | Range predicate + satisfies the ORDER BY needed by `RANK() OVER (PARTITION BY tenant_id ORDER BY created_at)` |
+
+The key insight: **the 3rd column serves dual purpose** — it handles the range filter (`>=`, `<=`) AND pre-sorts data for the window function so the planner can use `IndexScan` with `IndexOnlyScan` instead of a separate sort node. This eliminates both the Seq Scan AND the Sort from the plan.
+
+### Covering Index Variant (if all selected columns fit)
+
+If the query selects a small set of columns beyond the indexes:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, payload);
+```
+
+Use `INCLUDE` (Postgres 11+) for non-key columns that are only needed for index-only scans. This adds them to the leaf level without using them for sorting or seek operations, keeping the index smaller than a traditional covering index while avoiding heap fetches.
+
+### Partial Index? Not Here
+
+A partial index like `WHERE tenant_id IS NOT NULL` is wasteful because `NULL` keys are almost never queried. But consider one if you have millions of "test" events you never report on:
+
+```sql
+-- Only indexes real production events (exclude test/staging tenants)
+CREATE INDEX CONCURRENTLY idx_events_production
+  ON events (tenant_id, event_type, created_at DESC)
+  WHERE tenant_id NOT LIKE '%test%';
+```
+
+This could shrink the index by 20-40% depending on test volume. Worth doing once you've profiled tenant distribution.
+
+---
+
+## Fix #2 — Stale Statistics
+
+```sql
+-- Immediate: update stats on just the filtered columns
+ANALYZE events (tenant_id, event_type, created_at, user_id);
+
+-- Long-term: ensure auto_analyze is tuned for this table
+ALTER TABLE events SET (autovacuum_analyze_threshold = 50000,
+                        autovacuum_analyze_scale_factor = 0);
+-- Forces analyze after every 50k new rows, not at 20% of 800M
+```
+
+If you see repeated stale estimates even after ANALYZE, collect extended statistics for correlated predicates:
+
+```sql
+CREATE STATISTICS events_corr_stats (mcv) ON tenant_id, event_type FROM events;
+ANALYZE events;
+```
+
+`mcv` (Most Common Values) captures the correlation between `tenant_id` and `event_type` that the default independent statistics miss. After this, the planner might correctly estimate that tenant X produces 2M events rather than distributing evenly.
+
+You can also set a per-table target:
+
+```sql
+ALTER TABLE events ALTER COLUMN tenant_id SET (STATISTICS = 1000);
+ANALYZE events;
+```
+
+---
+
+## Fix #3 — Partitioning (Is It Justified?)
+
+### Verdict: YES, for this workload.
+
+With 800M rows and queries always scoped to a `created_at` range, month-based list or range partitioning gives you two massive wins:
+
+1. **Partition pruning** — The planner skips entire partitions outside the date range before executing. For a 7-day query on 800M rows spanning 36 months, you skip 35/36 of the table immediately.
+2. **Smaller indexes per partition** — Each partition's index is ~1/30th the size, fitting entirely in memory/cacheline.
+
+```sql
+-- Create parent table WITHOUT data (or use ATTACH PARTITION on existing)
+CREATE TABLE events (
+    id          bigserial,
+    tenant_id   uuid NOT NULL,
+    event_type  text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    user_id     uuid,
+    payload     jsonb,
+    PRIMARY KEY (id, created_at)  -- PK must include partition key
+) PARTITION BY RANGE (created_at);
+
+-- Create monthly partitions (example for 3 months)
+CREATE TABLE events_2024_01 PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE events_2024_02 PARTITION OF events
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- Now create the index ON EACH partition (automatically when created on parent)
+CREATE INDEX idx_events_partitioned
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Migration path:** Use `pg_partman` or manual `ATTACH PARTITION` on the existing unpartitioned table to avoid reindexing the full 800M rows. With Postgres 11+, `ATTACH PARTITION` is metadata-only (just locks briefly), then you build indexes on each partition independently.
+
+For ongoing management, automate partition creation:
+
+```sql
+-- pg_partman does this automatically
+SELECT partman.create_parent(
+    p_parent_table   := 'public.events',
+    p_control        := 'created_at',
+    p_interval       := '1 month',
+    p_premake        := 3
+);
+```
+
+---
+
+## Fix #4 — Rewritten Query
+
+### Original (slow version)
+
+```sql
+WITH ranked AS (
+    SELECT
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        e.user_id,
+        e.payload,
+        RANK() OVER (
+            PARTITION BY e.tenant_id, e.event_type
+            ORDER BY e.created_at DESC
+        ) AS rnk
+    FROM events e
+    WHERE e.tenant_id = 'xxx'::uuid
+      AND e.event_type IN ('click', 'view')
+      AND e.created_at >= '2024-01-01'::timestamptz
+      AND e.created_at <  '2024-02-01'::timestamptz
+)
+SELECT
+    r.tenant_id,
+    r.event_type,
+    r.created_at,
+    u.name AS user_name,
+    u.email AS user_email
+FROM ranked r
+JOIN users u ON u.id = r.user_id
+WHERE r.rnk <= 5;
+```
+
+### Optimized (with explanations inline)
+
+```sql
+-- Step 1: Push filters down. Use a named CTE so the planner can merge
+--         or materialize (see explanation below).
+WITH filtered_events AS MATERIALIZED (
+    -- The MATERIALIZED keyword forces this CTE to evaluate once and cache.
+    -- For Postgres 12+: the planner may already choose this if the CTE is
+    -- referenced multiple times or contains LIMIT. Without MATERIALIZED,
+    -- PG16 tries to pushdown filters (good for simple cases) but sometimes
+    -- chooses wrong plans with complex window functions.
+    SELECT
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        e.user_id,
+        e.payload,
+        RANK() OVER w AS rnk
+    FROM events e
+    WHERE e.tenant_id = 'xxx'::uuid
+      AND e.event_type IN ('click', 'view')
+      AND e.created_at >= '2024-01-01'::timestamptz
+      AND e.created_at <  '2024-02-01'::timestamptz
+    WINDOW w AS (
+        PARTITION BY e.tenant_id, e.event_type
+        ORDER BY e.created_at DESC
+    )
+)
+SELECT
+    fe.tenant_id,
+    fe.event_type,
+    fe.created_at,
+    u.name  AS user_name,
+    u.email AS user_email
+FROM filtered_events fe
+JOIN users u ON u.id = fe.user_id
+WHERE fe.rnk <= 5;
+```
+
+### Key changes explained
+
+| Change | Why it matters |
+|--------|---------------|
+| Named CTE with explicit column alias | Makes the plan readable and gives the optimizer a clear boundary |
+| `AS MATERIALIZED` on the CTE | Prevents the planner from trying to inline/window-function-predicate-push which often causes bad plans with large intermediate results. Trade-off: caches the result in memory/disk, but avoids nested sorts |
+| `WINDOW w AS (...)` syntax | Cleaner but functionally equivalent — ensures consistent partitioning across all RANK() calls |
+| Filtering on `rnk <= 5` AFTER ranking | Can't push this past WindowAgg (it needs all rows to rank correctly). But with the right index, the window function uses the 
+...[truncated]
+---[Response D]:
+This is a great production perf problem. I don't see any SQL files in the repo, so I'll give you the complete analysis and code artifacts directly here — you can drop them wherever fits your project.
+
+## Node-by-Node Plan Breakdown
+
+Assuming this is what EXPLAIN ANALYZE shows (the classic posture), here's how to read each node:
+
+```
+                                                                 QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate  (cost=1847291.45..1898456.32 rows=1 width=72) (actual time=38291.224..40187.931 rows=15 loops=1)
+   Group Key: u.id
+   ->  Merge Join  (cost=1847291.45..1897441.32 rows=393750 width=72) (actual time=38290.991..40186.502 rows=1287 loops=1)
+         Merge Cond: (ranked.tenant_id = u.tenant_id)
+         ->  Sort  (cost=1847013.10..1856885.60 rows=393750 width=40) (actual time=38287.112..38901.224 rows=194032 loops=1)
+               Sort Method: external merge  Disk: 245760kB    <-- THE DISK SPILL
+               WorkMem: 4MB
+               ->  WindowAgg  (cost=1748290.75..1807665.75 rows=393750 width=40) (actual time=34021.014..37012.441 rows=194032 loops=1)
+                     ->  Sort  (cost=1748290.75..1758163.25 rows=393750 width=32) (actual time=34020.801..35102.331 rows=194032 loops=1)
+                           Sort Key: tenant_id, event_date DESC
+                           Sort Method: quicksort  Memory: 28MB
+                           ->  Append  (cost=1650000.00..1679375.00 rows=393750 width=32) (actual time=28310.012..31201.114 rows=194032 loops=1)
+                                 -> SubPlan 1
+                                       -> Hash Join  (cost=1650000.00..1675000.00 rows=196875 width=32) (actual time=28299.224..30120.331 rows=194032 loops=1)
+                                             Hash Cond: (events.tenant_id = u.id)
+                                             -> Seq Scan on events  (cost=0.00..1500000.00 rows=800000000 width=32) (actual time=0.043..24012.114 rows=800000000 loops=1)
+                                                   Filter: (tenant_id = 'abc123' AND event_type = 'page_view' AND created_at BETWEEN ...)
+                                                   Rows Removed by Filter: 799805968     <-- ~99.98% rejected here
+                                             -> Hash  (cost=1500000.00..1500000.00 rows=2000000 width=8)
+                                                   -> Seq Scan on users  (cost=0.00..1500000.00 rows=2000000 width=8)
+ Planning Time: 2.341 ms
+ Execution Time: 40188.224 ms
+```
+
+**What each node tells us:**
+
+| Node | Cost | Reality | Problem |
+|------|------|---------|---------|
+| **Seq Scan (events)** | `rows=800M` | got 800M, filtered to 194K | Planner expects 394K because stats say 100 rows match — actual reality is 2M matched by the join side, but the filter kills 99.97%. The estimator fundamentally has no idea how selective `tenant_id = 'abc123'` is. |
+| **Sort (quicksort)** | 32 bytes × 394K = ~12MB estimated | got 194K × 32 = ~6MB | Actually fine — small enough for memory. The real spill is downstream. |
+| **WindowAgg** | No sort needed if indexed | sorts every row before ranking | Without an index that *already* produces `(tenant_id, created_at DESC)` order, WindowAgg needs input sorted. |
+| **Sort (external merge)** | Expected 394K × 40 bytes = ~15MB | got 194K × 40 + merge overhead ≈ 300MB | Spills to disk because `work_mem` (default 4MB) is tiny compared to the intermediate result. After WindowAgg, the merge join needs both sides fully sorted. |
+| **Merge Join** | Depends on fully-sorted inputs | sorting 194K rows on disk dominates | If the join were hash-based instead, this could stream. But postgres picked merge join because the sort already happened. |
+
+The fundamental root cause chain: **stale stats → wrong cardinality estimate → wrong join strategy + undersized sorts**.
+
+---
+
+## Index Strategy
+
+### Why Composite Order Matters
+
+A B-tree index is ordered on its leading column(s). The planner uses an index scan only when the query's WHERE clause matches the index from left to right:
+
+```
+INDEX: (a, b, c)
+WHERE a = ?              → index scan ✓ (uses full index)
+WHERE a = ?, b = ?       → index scan ✓ (uses full index)
+WHERE a = ?, c > ?       → index scan ✓ (b is skipped, c still usable)
+WHERE b = ?              → seq scan ✗  (can't use b or c without a)
+WHERE c > ?              → seq scan ✗  (no prefix match)
+```
+
+Column order must follow this priority:
+
+1. **Equality predicates** first (`tenant_id = X`) — eliminates entire subtrees
+2. **Range predicates** last (`created_at BETWEEN A AND B`) — used for scanning within the equality-matched subtree
+3. **High-selectivity columns** second when no equality exists
+4. **INCLUDE columns** at the end — stored in the index leaf but not used for ordering/searching
+
+### Recommended Indexes
+
+**Primary index — covers the WHERE clause + window function ORDER BY:**
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_created
+ON events (tenant_id, event_type, created_at DESC);
+```
+
+This gives us:
+- Equality lookup on `tenant_id` ( narrows from 800M → ~O(tenant's rows))
+- Equality on `event_type` (further narrow)  
+- Range scan on `created_at DESC` (produces descending order natively)
+- The descending `created_at` means the window function `ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at DESC)` gets pre-sorted input → **eliminates the first sort entirely**
+
+**Covering variant — if you SELECT additional columns beyond keys:**
+
+If your query does `SELECT e.*, u.name FROM events e JOIN users u ON ...` and you frequently select the same columns, add an INCLUDE:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_covering
+ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, status, metadata);
+```
+
+Trade-off analysis:
+- **Pros**: Index-only scans avoid heap fetches entirely. With 800M rows, avoiding 2-byte page pointers + visibility map lookups per row saves meaningful I/O.
+- **Cons**: Each INSERT/UPDATE writes more data to the index, slowing writes 15-25%. Index size grows ~3-4×.
+- **Verdict**: Use INCLUDE only for columns accessed in 90%+ of reads. Don't blanket-cover wide JSONB/json fields.
+
+**Partial index — for the most common access pattern:**
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_active_tenants
+ON events (tenant_id, event_type, created_at DESC)
+WHERE tenant_id IS NOT NULL;
+```
+
+Actually, for a stronger partial: if 80% of queries target `event_type IN ('page_view', 'click', 'submit')`:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_common_types
+ON events (tenant_id, created_at DESC)
+WHERE event_type IN ('page_view', 'click', 'submit');
+```
+
+This index is ~30% smaller and serves the majority of queries. Postgres will choose it automatically when the WHERE matches.
+
+**Don't create this anti-pattern:**
+
+```sql
+-- BAD: separates range predicate, destroys sort benefit
+CREATE INDEX idx_events_bad ON events (tenant_id, created_at, event_type);
+-- WHERE tenant_id = ? AND event_type = ? AND created_at BETWEEN ...
+-- Gets an index scan but created_at is NOT ordered → still needs a sort!
+```
+
+### Users Table Index
+
+The 2M-row users table needs a proper join index:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_tenant_id
+ON users (tenant_id) INCLUDE (name, email, created_at);
+```
+
+Without this, the Merge Join does nested-loop-like behavior over unsorted users. With it, users are scanned sequentially in tenant_id order matching the ranked events.
+
+---
+
+## Fixing the Estimate Problem
+
+Stale stats mean the optimizer thinks 100 rows match when 2M actually do. Here's the escalation path:
+
+### Level 1: Immediate fix — ANALYZE the tables
+
+```sql
+ANALYZE events;
+ANALYZE users;
+```
+
+This repopulates `pg_statistic` with fresh histogram data for each column. Should bring estimates down from 40s toward <5s immediately. Do this **now** as a band-aid.
+
+### Level 2: Per-column statistics target
+
+Default statistics target is 100 buckets in the histogram. For highly skewed columns like `tenant_id` (one tenant may have millions of rows, another few thousand), 100 buckets is meaningless. Raise it:
+
+```sql
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+ANALYZE events;
+```
+
+With 1000 NDV buckets, the histogram captures the heavy-tail distribution of tenant_id much better. The planner will now understand that `tenant_id = 'abc123'` returns 2M rows, not 100.
+
+### Level 3: Multivariate (MCV list) statistics
+
+Postgres 15+ supports extended statistics for column correlations. If `tenant_id` and `event_type` are correlated (certain tenants only produce certain event types):
+
+```sql
+CREATE STATISTICS IF NOT EXISTS stx_events_tenant_event
+  (mcv, dependencies) ON tenant_id, event_type FROM events;
+
+ANALYZE events;
+```
+
+This learns which `(tenant_id, event_type)` pairs are common and adjusts join estimates accordingly.
+
+### Level 4: Query-level override (if stats still can't catch up)
+
+As a last resort, use `SET LOCAL` within a transaction for a specific call site:
+
+```sql
+BEGIN;
+SET LOCAL enable_seqscan = off;  -- force index for this query
+EXPLAIN ANALYZE ...;
+ROLLBACK;  -- or COMMIT after use
+```
+
+Or via `pg_hint_plan` extension for production-safe hinting without modifying application code.
+
+---
+
+## Partitioning: Is Monthly Justified?
+
+### The math
+
+- 800M rows / ~30 days = ~27M rows/month
+- At ~200 bytes/row (typical events): 27M × 200B = ~5.4 GB/month
+- Current table: 800M × 200B = ~160 GB
+
+### What partitioning buys you
+
+1. **Partition pruning**: If you query `WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31'`, Postgres skips all other partitions entirely. Instead of scanning 800M rows → pruning to 27M.
+2. **Smaller indexes**: Each partition's index is 30× smaller, fitting in cache.
+3. **Maintenance**: `VACUUM` runs on one month at 
+...[truncated]
+---[Response E]:
+I'll tackle this systematically — reading the plan node-by-node, choosing the right indexing strategy, fixing the stats problem, evaluating partitioning, and rewriting the query with proper CTE/materialization choices.
+
+## Root Cause Analysis
+
+The symptoms form a coherent chain: **stale row estimates → wrong join strategy → sort spilling to disk**. The planner thinks it's getting 100 rows from the events filter but actually gets 2M, so it picks a nested-loop hash join with an incorrect memory budget. When the real 2M rows arrive, the sort operation exceeds `work_mem` and spills to disk. Each spill costs O(n log n / B) I/O on multi-gigabyte intermediate results.
+
+---
+
+## Step 1: Fix Stale Statistics First (Quick Win)
+
+Stale estimates on an 800M-row table almost always mean the default `default_statistics_target` (100) is insufficient and/or `autovacuum` is falling behind due to write amplification on recent partitions.
+
+```sql
+-- Increase statistics target specifically on the hottest columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 500;
+
+-- Force a full ANALYZE after changing statistics targets
+ANALYZE events;
+
+-- Verify the plans now match reality
+EXPLAIN (COSTS OFF, SETTINGS) SELECT * FROM events
+WHERE tenant_id = 'abc' AND event_type = 'pageview'
+  AND created_at BETWEEN '2025-01-01' AND '2025-03-31';
+```
+
+**Why this matters**: With 500 samples, the planner can model multimodal distributions (e.g., bursty tenants). On PG 16, the internal representation also supports compressed hyperloglog sketches that capture cardinality much better at this setting.
+
+**Verify autovacuum is healthy:**
+
+```sql
+SELECT schemaname, relname, n_live_tup, n_dead_tup,
+       last_autovacuum, last_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'events'
+ORDER BY n_dead_tup DESC;
+
+-- If dead tuples exceed ~5% of live tuples, tune autovacuum per-partition:
+ALTER TABLE events_part_monthly PARTITION FOR VALUES FROM ('2025-07') TO ('2025-08')
+SET (autovacuum_enabled = true, autovacuum_vacuum_threshold = 50000,
+     autovacuum_analyze_threshold = 50000);
+```
+
+If ANALYZE alone doesn't bring estimates into line within ~2x, proceed to targeted histograms or custom statistics objects below.
+
+---
+
+## Step 2: Index Strategy — Choose the Right Shape
+
+### Column Selectivity Determines Order
+
+| Column | Approx Selectivity | Cardinality Estimate |
+|--------|-------------------|---------------------|
+| `tenant_id` | HIGH (millions of tenants) | Single value ≈ few hundred rows |
+| `event_type` | MEDIUM (dozens of types) | Single type ≈ thousands–hundreds of K |
+| `created_at` | LOW (continuous) | Range filter dominates I/O |
+| `user_id` (FK to users) | Medium | Used for join + window |
+
+The key principle: **equality columns first, then range columns, then covering columns via INCLUDE**.
+
+### The Primary Index (Covering Composite)
+
+```sql
+CREATE INDEX idx_events_tenant_type_created ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, id);
+-- Explanation:
+--   tenant_id  → equality filter (highest selectivity single-column)
+--   event_type → equality filter (second equality)
+--   created_at DESC → range scan in descending order; matches most reporting
+--                        queries that want recency-first ranking
+--   INCLUDE (user_id, id) → avoids heap fetch for the window function and join key.
+--                           This turns the entire filtered-and-sorted result set
+--                           into an index-only scan.
+```
+
+**Why INCLUDE over adding user_id to the leading keys:** Adding `user_id` before `created_at` would destroy the range-scannability of `created_at`. INCLUDE keeps the column in the index leaf pages but outside the B-tree sorting structure — it's metadata for index-only scans, not a sort key.
+
+### Partial Index (If Hot-Tenanted Reporting)
+
+If 90% of queries target the top 5 tenants:
+
+```sql
+CREATE INDEX idx_events_top_tenants
+ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, id)
+WHERE tenant_id IN ('tenant_a', 'tenant_b', 'tenant_c', 'tenant_d', 'tenant_e');
+-- Smaller, fits in cache, auto-updated only for these tenants.
+```
+
+### Secondary Index for User-Id Window Queries
+
+If you frequently do window functions scoped per-user within a tenant:
+
+```sql
+CREATE INDEX idx_events_tenant_user_created
+ON events (tenant_id, user_id, created_at DESC);
+-- Supports: ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC)
+--           filtered by tenant and time range
+```
+
+### FK Index on user_id (If Not Already Indexed)
+
+```sql
+-- Check if missing:
+SELECT conrelid::regclass, a.attname
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+WHERE c.contype = 'f' AND c.confrelid = 'users'::regclass
+AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid AND a.attnum = ANY(i.indkey)
+);
+
+-- Create if empty result above returns rows:
+CREATE INDEX IF NOT EXISTS idx_events_user_id ON events (user_id);
+-- Needed for efficient hash/join against the 2M-row users table.
+```
+
+---
+
+## Step 3: Partitioning — Is It Worth It?
+
+### Decision Framework
+
+| Criterion | Verdict |
+|-----------|---------|
+| Queries typically span ≤ 3 months? | **Yes** — partition pruning cuts 800M → ~50–200M scanned rows |
+| Table receives > 1M inserts/day? | **Yes** — younger partitions benefit from fresher autovacuum stats |
+| Cross-month aggregate queries are common? | **No** — partial merge adds overhead; consider quarterly instead |
+| Backup/restore per-tenant isolation needed? | **Yes** — logical backup one month at a time |
+
+### Implementation (Monthly Range Partitioning)
+
+```sql
+-- 1. If not already partitioned:
+ALTER TABLE events DROP CONSTRAINT events_pkey;  -- Must drop PK first
+-- Recreate PK on partition level only.
+
+CREATE TABLE events_partitioned (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    tenant_id   text        NOT NULL,
+    event_type  text        NOT NULL,
+    user_id     bigint      NOT NULL,
+    payload     jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, created_at)  -- Partition key included in PK
+) PARTITION BY RANGE (created_at);
+
+-- 2. Create current & upcoming partitions
+DO $$
+DECLARE
+    start_date date;
+    end_date   date;
+    part_name  text;
+BEGIN
+    FOR start_date IN
+        SELECT generate_series(
+            date_trunc('month', min(created_at))::date,
+            date_trunc('month', now() + interval '3 months')::date,
+            interval '1 month'
+        ) FROM events
+    LOOP
+        end_date   := start_date + interval '1 month';
+        part_name  := 'events_' || to_char(start_date, 'YYYY_MM');
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF events_partitioned
+             FOR VALUES FROM (%L) TO (%L)',
+            part_name, start_date, end_date
+        );
+        -- Apply the covering index on each new partition
+        EXECUTE format(
+            'CREATE INDEX %I ON %I (tenant_id, event_type, created_at DESC)
+             INCLUDE (user_id, id)',
+            part_name || '_tenant_type_idx', part_name
+        );
+    END LOOP;
+END $$;
+
+-- 3. Attach a future partition proactively (avoids lock during INSERT)
+ALTER TABLE events_partitioned
+ATTACH PARTITION events_2025_08 FOR VALUES FROM ('2025-08-01') TO ('2025-09-01');
+```
+
+**Key notes:**
+- Including `created_at` in the primary key is required for range-partitioned tables (the partition key must be part of every unique constraint).
+- Each partition gets its own index — smaller indexes fit in shared buffer pool, improving hit ratio dramatically.
+- Autovacuum now operates per-partition: the hot current month gets frequent vacuuming while historical data stays stable.
+
+If cross-month aggregation is dominant, switch to **quarterly** partitions — fewer partitions, still meaningful pruning.
+
+---
+
+## Step 4: Rewrite the Query
+
+### Original Problematic Query (Inferred)
+
+```sql
+-- Typical anti-pattern driving the 40s runtime:
+WITH ranked AS (
+    SELECT e.*,
+           RANK() OVER (
+               PARTITION BY e.tenant_id, u.id
+               ORDER BY e.created_at DESC
+           ) AS rn
+    FROM events e
+    JOIN users u ON u.id = e.user_id
+    WHERE e.tenant_id = 'abc'
+      AND e.event_type = 'pageview'
+      AND e.created_at BETWEEN '2025-01-01' AND '2025-03-31'
+)
+SELECT * FROM ranked WHERE rn <= 5;
+```
+
+Issues:
+1. **CTE is materialized by default** in PG 12+ — the entire join + window function runs before filtering to top-5.
+2. **Window function computed over all matching rows** (potentially millions) when only top-N matter.
+3. **Join happens before deduplication** — waste of CPU/memory.
+
+### Optimized Rewrite
+
+```sql
+-- Approach 1: Top-N optimization via LATERAL + LIMIT per tenant/user
+-- Best when you need exactly N winners per partition
+
+WITH candidates AS MATERIALIZED (
+    -- Filter to the exact subset using the composite index;
+    -- no join needed here because INCLUDE has user_id
+    SELECT tenant_id, user_id, created_at, id
+    FROM events
+    WHERE tenant_id = $1
+      AND event_type = $2
+      AND created_at >= $3 AND created_at < $4
+    ORDER BY created_at DESC
+    LIMIT 100000   -- Safety cap; adjust based on expected volume
+),
+top_users AS (
+    SELECT DISTINCT ON (tenant_id, user_id)
+           tenant_id,
+           user_id,
+           created_at,
+           id
+    FROM candidates
+    ORDER BY tenant_id, user_id, created_at DESC
+),
+ranked_with_limit AS (
+    SELECT
+        tu.tenant_id,
+        tu.user_id,
+        tu.created_at AS last_event_at,
+        tu.id         AS last_event_id,
+        u.email,
+        u.name,
+        u.plan_tier
+    FROM top_users tu
+    JOIN users u ON u.id = tu.user_id
+    WHERE u.deleted_at IS NULL           -- Skip soft-deleted; partial index on users helps
+    ORDER BY tu.tenant_id, tu.created_at DESC
+    LIMIT 5                      
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

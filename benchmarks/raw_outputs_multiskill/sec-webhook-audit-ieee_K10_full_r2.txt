@@ -1,0 +1,273 @@
+I'll analyze the vulnerabilities in your FastAPI payment webhook and provide a corrected implementation. The issues are serious and need immediate attention.
+
+## Vulnerability Assessment (by severity)
+
+### 1. CRITICAL: Signature Verification After JSON Parsing
+Parsing the body before verifying the signature means an attacker can exploit JSON parser vulnerabilities. You must verify the HMAC on the **raw bytes** first.
+
+### 2. CRITICAL: In-Memory Replay Ledger
+An in-memory dict is **completely broken** for replay prevention:
+- Lost on server restart (replays accepted immediately)
+- Not shared across multiple instances/dynos (each instance has its own dict)
+- Memory leak (grows unbounded forever)
+- No audit trail for compliance
+
+### 3. HIGH: Race Condition in Concurrent Processing
+Two simultaneous requests can both pass the "not seen" check before either writes the event-id, causing double processing.
+
+### 4. HIGH: Missing Timestamp Validation
+Without rejecting old events, an attacker can capture a valid signature and replay it later (within the secret's validity window).
+
+### 5. MEDIUM: Error Leakage
+Unhandled exceptions expose stack traces and internal details to the processor.
+
+---
+
+## Corrected Implementation
+
+```python
+# webhook_handler.py
+import hmac
+import hashlib
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import Column, String, DateTime, Boolean, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+import redis
+import structlog
+
+logger = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Configuration — secrets rotated via environment or secrets manager
+# ---------------------------------------------------------------------------
+WEBHOOK_SECRETS = [
+    "whsec_current_secret",      # primary
+    "whsec_previous_secret",     # during rotation grace period
+]
+MAX_EVENT_AGE_SECONDS = 300      # reject events older than 5 minutes
+
+# ---------------------------------------------------------------------------
+# Database — persistent, shared replay ledger with unique constraint
+# ---------------------------------------------------------------------------
+Base = declarative_base()
+
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
+    
+    event_id = Column(String(255), primary_key=True)
+    processed_at = Column(DateTime(timezone=True), nullable=False)
+    success = Column(Boolean, nullable=False)
+
+engine = create_engine("postgresql://...", pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
+
+# Redis for distributed lock during the check-and-insert window
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+LOCK_TIMEOUT_MS = 5000
+
+app = FastAPI()
+
+
+def verify_signature(payload: bytes, signature_header: str, secrets: list[str]) -> bool:
+    """
+    Verify HMAC-SHA256 signature against all valid secrets.
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    if not signature_header:
+        return False
+
+    # Expected format: "t=<timestamp>,v1=<hmac>"
+    try:
+        parts = signature_header.split(",")
+        timestamp_part = parts[0]
+        signature_part = parts[1]
+        
+        # Validate timestamp to prevent delayed replays
+        timestamp = int(timestamp_part.split("=")[1])
+        now = int(time.time())
+        if abs(now - timestamp) > MAX_EVENT_AGE_SECONDS:
+            logger.warning("event_expired", age=now - timestamp)
+            return False
+    except (IndexError, ValueError):
+        return False
+
+    for secret in secrets:
+        # Signed payload is timestamp + "." + body (standard processor format)
+        signed_payload = f"{timestamp}.".encode() + payload
+        expected = hmac.new(
+            secret.encode(),
+            signed_payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+        # Constant-time comparison — ALL secrets must be checked to avoid
+        # timing attacks that reveal which secret was valid
+        if hmac.compare_digest(expected, signature_part.split("=")[1]):
+            return True
+
+    return False
+
+
+def acquire_processing_lock(event_id: str) -> bool:
+    """
+    Distributed lock to prevent concurrent processing of the same event.
+    Returns True if lock acquired, False if already locked.
+    """
+    lock_key = f"webhook_lock:{event_id}"
+    return redis_client.set(lock_key, "1", nx=True, px=LOCK_TIMEOUT_MS)
+
+
+def release_processing_lock(event_id: str) -> None:
+    redis_client.delete(f"webhook_lock:{event_id}")
+
+
+@app.post("/webhooks/payment")
+async def payment_webhook(request: Request):
+    # ──────────────────────────────────────────────────────────────────
+    # Step 1: Get raw body BEFORE any parsing
+    # ──────────────────────────────────────────────────────────────────
+    raw_body = await request.body()
+    
+    signature = request.headers.get("X-Webhook-Signature", "")
+    
+    # ──────────────────────────────────────────────────────────────────
+    # Step 2: Verify signature on raw bytes — BEFORE JSON parsing
+    # ──────────────────────────────────────────────────────────────────
+    if not verify_signature(raw_body, signature, WEBHOOK_SECRETS):
+        logger.warning("invalid_signature", 
+                       client_ip=request.client.host,
+                       path=request.url.path)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature",  # Generic — no internal details
+        )
+    
+    # ──────────────────────────────────────────────────────────────────
+    # Step 3: NOW parse JSON — only after signature is verified
+    # ──────────────────────────────────────────────────────────────────
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid payload",
+        )
+    
+    event_id = payload.get("event_id")
+    if not event_id or not isinstance(event_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing event_id",
+        )
+    
+    # ──────────────────────────────────────────────────────────────────
+    # Step 4: Distributed lock prevents concurrent duplicate processing
+    # ──────────────────────────────────────────────────────────────────
+    if not acquire_processing_lock(event_id):
+        # Another worker is processing this event — return success to prevent
+        # the processor from retrying (idempotent behavior)
+        logger.info("event_already_being_processed", event_id=event_id)
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={"status": "ok"},
+        )
+    
+    try:
+        # ──────────────────────────────────────────────────────────────
+        # Step 5: Atomic insert into persistent ledger (DB-level unique
+        # constraint guarantees idempotency even if Redis lock fails)
+        # ──────────────────────────────────────────────────────────────
+        db = SessionLocal()
+        try:
+            # PostgreSQL UPSERT — atomic check-and-insert
+            stmt = pg_insert(ProcessedEvent).values(
+                event_id=event_id,
+                processed_at=datetime.now(timezone.utc),
+                success=False,  # Will update after processing
+            ).on_conflict_do_nothing(
+                index_elements=["event_id"]
+            )
+            
+            result = db.execute(stmt)
+            db.commit()
+            
+            if result.rowcount == 0:
+                # Event already in DB — duplicate, acknowledge and skip
+                logger.info("duplicate_event_skipped", event_id=event_id)
+                return JSONResponse(
+                    status_code=status.HTTP_200_OK,
+                    content={"status": "ok"},
+                )
+            
+            # ──────────────────────────────────────────────────────────
+            # Step 6: Process the payment event
+            # ──────────────────────────────────────────────────────────
+            await process_payment_event(payload)
+            
+            # Mark as successfully processed
+            db.execute(
+                ProcessedEvent.__table__.update()
+                .where(ProcessedEvent.event_id == event_id)
+                .values(success=True)
+            )
+            db.commit()
+            
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"status": "ok"},
+            )
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        # ──────────────────────────────────────────────────────────────
+        # CRITICAL: Log full details internally, return generic response
+        # ──────────────────────────────────────────────────────────────
+        logger.error(
+            "webhook_processing_failed",
+            event_id=event_id,
+            error=str(e),
+            exc_info=True,
+        )
+        # Return 500 so the processor retries — but NEVER expose internals
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Processing failed",  # Generic message
+        )
+    finally:
+        release_processing_lock(event_id)
+
+
+async def process_payment_event(payload: dict) -> None:
+    """Your actual business logic here."""
+    pass
+```
+
+## Key Security Improvements
+
+| Vulnerability | Original | Fixed |
+|---|---|---|
+| **Signature timing** | After JSON parse | Before JSON parse (raw bytes) |
+| **Replay ledger** | In-memory dict | PostgreSQL with unique constraint |
+| **Concurrency** | Race condition | Redis distributed lock + DB UPSERT |
+| **Timestamp validation** | None | 5-minute expiry window |
+| **Secret rotation** | Unknown | Multiple secrets with constant-time comparison |
+| **Error exposure** | Stack traces leak | Generic messages, detailed internal logging |
+| **Timing attacks** | `==` comparison | `hmac.compare_digest` across all secrets |
+
+## Additional Recommendations
+
+1. **Add a cleanup job** to archive old processed events (compliance)
+2. **Rate limit** the webhook endpoint by IP to slow brute-force signature attempts
+3. **Monitor** for signature failure spikes (attack indicator)
+4. **Use a secrets manager** (AWS Secrets Manager, Vault) instead of env vars for production
+
+The two critical fixes — verifying on raw bytes and using a persistent, atomic ledger — must be implemented immediately. The current implementation is exploitable in production.

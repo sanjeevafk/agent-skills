@@ -1,0 +1,303 @@
+I need to provide a containerization design for this PyTorch inference service. Let me work through the architecture and write up the full implementation.
+
+## Analysis
+
+The starting point is a 9GB monolithic single-stage image running as root — classic PyTorch bloat: CUDA stubs, development headers, pip caches, build artifacts, and root-owned filesystem layers all stacked together. The target of <2.5GB means we need ~72% reduction, which requires:
+
+1. **Multi-stage isolation** — never carry build-time artifacts into runtime
+2. **Pre-downloaded wheels** — avoid the runtime pip download overhead that bloats intermediate layers
+3. **Debian-slim (not Alpine)** — PyTorch CPU wheels require glibc; musl breaks them silently
+4. **Non-root user with surgical permissions** — drops unnecessary kernel capabilities
+
+---
+
+## Dockerfile
+
+```dockerfile
+# ═══════════════════════════════════════════════════════════
+# Stage 0: Download runtime wheels (isolated network/DNS cost)
+# ═══════════════════════════════════════════════════════════
+FROM python:3.12-slim-bookworm AS wheel-builder
+
+# --layer-0: Single RUN = single layer, cheap DNS resolution
+# Pin Debian snapshot date for reproducible metadata fetches.
+# If you want absolute immutability, lock apt pins per release.
+ARG DEBIAN_SNAPSHOT=20250101
+RUN sed -i "s|deb.debian.org/debian|snapshot.debian.org/debian|g" /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -t "${DEBIAN_SNAPSHOT}" && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --layer-1: System libs needed at runtime by torch/cpu ops.
+# Keep this minimal — no debug symbols, no dev headers.
+# libsasl2-dev, libssl-dev, etc. are ONLY if your app imports pyOpenSSL / cryptography.
+# Omit if your code is pure-Python + torch.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libbz2-1.0 \
+        liblzma5 \
+        libsqlite3-0 \
+        zlib1g \
+        libpng16-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /wheels
+
+# --layer-2: Copy requirement spec → pull wheels.
+# This layer is invalidated ONLY when requirements.txt changes,
+# giving strong cache reuse for pure-code commits.
+COPY requirements.txt ./
+
+RUN pip install --no-deps \
+        --no-build-isolation \
+        --dest /wheels \
+        --platform manylinux_2_17_x86_64 \
+        --only-binary=:all: \
+        --index-url https://download.pytorch.org/whl/cpu \
+        $(cat requirements.txt) \
+    && find /wheels ! -name '*.whl' ! -name '*.tar.gz' -delete \
+    # --layer-3: Clean wheel directory down to wheels only.
+    # Without this, pip puts METADATA/, WHEEL, INSTALLER, RECORD,
+    # and __pycache__ into /wheels, costing ~100-200MB wasted space.
+    && find /wheels -type d -not -name '.' -empty -delete || true
+
+# ──────────────────────────────────────────────────────────
+# Stage 1: Production runtime (< 2.5GB)
+# ──────────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS runtime
+
+LABEL maintainer="engineering@company.com"
+LABEL org.opencontainers.image.description="PyTorch CPU inference service"
+
+# --layer-0: Recreate the minimal lib set (glibc deps from Stage 0).
+# Because this is a fresh FROM, nothing from the builder leaks in.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libbz2-1.0 \
+        liblzma5 \
+        libsqlite3-0 \
+        zlib1g \
+        libpng16-16 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1001 --system appgroup && \
+       useradd --uid 1001 --gid appgroup --system --no-create-home --shell /usr/sbin/nologin appuser
+
+# --layer-1: Install Python packages FROM pre-built wheels ONLY.
+# Copies the entire /wheels dir (small, static artifact), then installs.
+# Hash-verified → no supply-chain tampering via compromised indexes.
+COPY --from=wheel-builder /wheels/*.whl ./wheels/
+COPY --from=wheel-builder /wheels/*.tar.gz ./wheels/
+
+RUN pip install --no-index \
+        --find-links=file:///app/wheels \
+        --require-hashes \
+        --no-cache-dir \
+        -r requirements-hash.txt \
+    && rm -rf /app/wheels \
+    # --layer-2: Remove the wheels dir immediately after install.
+    # pip's cache (~10-50MB) and any extracted sdist build dirs would remain.
+    # require-hashes is enforced at install time; post-install, the files are dead weight.
+
+# --layer-3: Application source goes LAST.
+# Code changes invalidate only this layer — previous layers (deps) stay cached.
+WORKDIR /app
+COPY --chown=appuser:appgroup src/ ./src/
+COPY --chown=appuser:appgroup pyproject.toml setup.cfg README.md ./
+
+# Set entrypoint env defaults (never bake secrets):
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTORCH_NO_CUDA_MEMORY_CACHED=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
+EXPOSE 8000
+CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### Supporting Files
+
+**requirements.txt** (build-stage input — specifies packages, NO versions):
+```text
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu
+torchvision==0.20.1+cpu
+transformers==4.48.0
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+sentence-transformers==3.3.0
+```
+
+**requirements-hash.txt** (runtime-stage input — pinned versions with SHA256 hashes):
+```text
+# Generated by: pip-compile --generate-hashes requirements.in
+# Or: pip hash <existing-wheels> >> requirements-hash.txt
+torch==2.5.1+cpu \
+    --hash=sha256:a1 ...long hex...
+torchaudio==2.5.1+cpu \
+    --hash=sha256:b2 ...long hex...
+transformers==4.48.0 \
+    --hash=sha256:c3 ...long hex...
+# ...one line per package with --hash=sha256:<expected_digest>
+```
+
+**Docker Compose** (`docker-compose.yml`):
+```yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        - DEBIAN_SNAPSHOT=20250101
+    ports:
+      - "8000:8000"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - TORCH_HOME=/tmp/torch_cache  # ephemeral, cleared on restart
+    volumes:
+      - models:/app/models           # Persistent model weights
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=512M
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+volumes:
+  models:
+```
+
+**.dockerignore**:
+```gitignore
+# Runtime exclusions
+.git/
+.gitignore
+.github/
+.env*
+!env.example
+
+# Data — never ship terabytes of datasets into images
+datasets/
+data/
+*.tsv
+*.csv
+*.jsonl
+*.parquet
+
+# Virtual environments (leak into COPY if not excluded)
+.venv/
+venv/
+env/
+
+# Build artefacts
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+
+# CI / docs / scratch
+.dockerignore
+docker-compose*.yml
+Dockerfile
+Makefile
+README*
+LICENSE
+tests/
+.bumpversion.cfg
+.mypy.ini
+pytest.ini
+setup.cfg
+.tox/
+.coverage*
+htmlcov/
+.nyc_output/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+.DS_Store
+Thumbs.db
+*.md.tmp
+```
+
+---
+
+## Layer-by-Layer Justification
+
+| Layer | What It Does | Cache Behavior | Size Impact |
+|-------|-------------|----------------|-------------|
+| **Stage 0, L0** — apt metadata + curl | One-shot curl/ca-cert install for `pip download`. Uses Debian snapshot for reproducible metadata fetch. | Invaluable only on OS/base-image change. | ~30MB |
+| **Stage 0, L1** — runtime libs | Installs `libgomp1`, `libbz2`, `liblzma`, `libsqlite3`, `zlib1g`, `libpng`. These are the ONLY glibc deps PyTorch CPU needs at runtime. No `--dev` packages, no `strace`/`valgrind`. | Stale-proofed: pinned apt lists + `rm -rf /var/lib/apt/lists/*` eliminates stale cache. | ~80MB |
+| **Stage 0, L2** — pip download wheels | `pip install --dest /wheels` downloads ALL wheels (including transitive deps like `numpy`, `safetensors`, `regex`) from PyTorch CPU index. Single `COPY requirements.txt` pattern means code-only commits don't re-download. | Invalidated ONLY when `requirements.txt` changes. | Wheels themselves: ~600MB (discarded after install) |
+| **Stage 0, L3** — prune non-wheel files | Deletes `__pycache__`, METADATA dirs, WHEEL files inside `/wheels`. Pip stores auxiliary files alongside wheels; they serve no purpose at install time. | Always runs (tiny operation). | Saves ~150-200MB from intermediate layer |
+| **Runtime L0** — libs + user | Mirrors the exact lib set + creates unprivileged `appuser` (UID 1001). User created early so subsequent `COPY --chown` works. | Independent of everything else. | ~75MB base + ~0.5MB user |
+| **Runtime L1** — install from wheels | `pip install --no-index --find-links --require-hashes` installs packages from local wheel copies with cryptographic hash verification. Prevents man-in-the-middle replacement. The `requirements-hash.txt` must be generated once per pin. | Invaluable when `requirements-hash.txt` or wheels change. | Final installed packages: ~900MB |
+| **Runtime L1 post-install cleanup** — `rm -rf /app/wheels` | Removes the copied wheels dir immediately after pip extracts them. Wheels are needed for extraction, not at runtime. | Always runs after pip install completes. | Frees ~900MB from final image |
+| **Runtime L2** — source code | Copies `src/`, `pyproject.toml`, etc. With `--chown=appuser:appgroup` ensuring no root-owned files. | Invalidated on ANY code change — but because layers below are dep-stable, this is a cheap invalidation (just one layer, not 12). | App-specific; typically 5-20MB |
+| **Runtime L3** — env + user switch + healthcheck | Sets runtime-only env vars, switches from root to `appuser`, declares the port and healthcheck. Healthcheck uses `curl` with `--start-period=60s` because PyTorch model loading can take 30-60s on first invocation. | N/A (metadata-only directives) | 0 bytes |
+
+---
+
+## How We Get Under 2.5GB
+
+| Component | Size |
+|-----------|------|
+| `python:3.12-slim-bookworm` base | ~75MB |
+| System libraries (minimal set) | ~40MB |
+| PyTorch CPU + torchaudio + torchvision | ~500MB |
+| transformers + sentence-transformers ecosystem | ~350MB |
+| numpy, safetensors, regex, tokenizers, accelerate | ~200MB |
+| FastAPI + uvicorn + stdlib extras | ~80MB |
+| Application source + config | ~15MB |
+| Docker layer overhead / misc | ~100MB |
+| **Estimated total** | **~1,360MB** |
+
+The real savings come from:
+- **No CUDA toolkit/stubs** (~3GB removed from the original 9GB image)
+- **No pip cache** (`--no-cache-dir` on both stages)
+- **No build isolation** (`--no-build-isolation` skips rebuilding from sdist)
+- **No dev/debug tools** (no gdb, strace, valgrind, coverage)
+- **No Python bytecode** (`PYTHONDONTWRITEBYTECODE=1` avoids `.pyc` bloat)
+- **Wheels cleaned immediately** (the `rm -rf /app/wheels` right after install frees the largest single layer)
+
+Even with generous estimates, this sits comfortably under 2.5GB.
+
+---
+
+## Security & Operational Decisions
+
+- **Non-root user** (`appuser`, UID 1001): Even with `read_only: true` in compose, running as root in a container is a blast-radius multiplier. `cap_drop: ALL` + `no-new-privileges:true` makes privilege escalation impossible inside the container.
+- **`read_only: true` + `tmpfs: /tmp`**: The writable `/tmp` allows PyTorch to create temporary tensors and huggingface to download models. Without it, the container crashes on first inference.
+- **Secrets via compose env, never ENV in Dockerfile**: Database passwords, API keys, and HuggingFace tokens come from `.env` or CI secret injection. The Dockerfile declares zero sensitive values. `HF_HUB_DISABLE_TELEMETRY` is a config flag, not a secret.
+- **Hash verification on runtime install**: `--require-hashes` catches supply-chain attacks where a PyPI mirror or CDN returns poisoned wheels. You generate hashes once: `pip hash *.whl > requirements-hash.txt` after the wheel download stage succeeds.
+- **Model persistence via named volume**: `models:/app/models` survives container restarts. Model weights are large; redownloading on every deployment is wasteful and violates the "ephemeral container" philosophy.

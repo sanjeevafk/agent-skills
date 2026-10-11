@@ -1,0 +1,226 @@
+I'll analyze the vulnerabilities and provide a corrected implementation.
+
+## Security Review: FastAPI Payment Webhook
+
+### Vulnerabilities (ordered by severity)
+
+| # | Severity | Vulnerability | Impact |
+|---|----------|---------------|--------|
+| 1 | **CRITICAL** | Signature verified AFTER JSON parsing | Deserialization attacks, resource exhaustion via crafted payloads |
+| 2 | **CRITICAL** | In-memory replay store | Race conditions allow duplicate processing; lost on restart; not shared across workers |
+| 3 | **HIGH** | No constant-time HMAC comparison | Timing side-channel leaks signature byte-by-byte |
+| 4 | **HIGH** | Processor errors exposed to clients | Information leakage aids attacker reconnaissance |
+| 5 | **MEDIUM** | No payload size limit | Memory exhaustion via large bodies |
+| 6 | **MEDIUM** | No timestamp validation | Replay window unbounded without TTL |
+
+---
+
+### Corrected Implementation
+
+```python
+# webhook.py
+import hashlib
+import hmac
+import time
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Header, Depends
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+import redis.asyncio as redis
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# ─── Configuration (from environment, never hardcoded) ───────────────────────
+import os
+
+WEBHOOK_SECRET_CURRENT = os.environ["WEBHOOK_SECRET_CURRENT"]
+WEBHOOK_SECRET_PREVIOUS = os.environ.get("WEBHOOK_SECRET_PREVIOUS")  # rotation grace
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+MAX_PAYLOAD_BYTES = 1024 * 1024  # 1MB
+REPLAY_TTL_SECONDS = 86400  # 24 hours
+TIMESTAMP_TOLERANCE_SECONDS = 300  # 5 minutes
+
+
+# ─── Redis connection pool ────────────────────────────────────────────────────
+async def get_redis() -> redis.Redis:
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# ─── Pydantic model for validated payload ─────────────────────────────────────
+class WebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    timestamp: float
+    data: dict
+
+
+# ─── Signature verification (constant-time, on raw bytes) ─────────────────────
+def verify_signature(raw_body: bytes, signature: str, secret: str) -> bool:
+    """Constant-time HMAC-SHA256 verification on raw request bytes."""
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def verify_with_rotation(raw_body: bytes, signature: str) -> bool:
+    """Try current secret, then previous secret for rotation grace period."""
+    if verify_signature(raw_body, signature, WEBHOOK_SECRET_CURRENT):
+        return True
+    if WEBHOOK_SECRET_PREVIOUS and verify_signature(
+        raw_body, signature, WEBHOOK_SECRET_PREVIOUS
+    ):
+        return True
+    return False
+
+
+# ─── Replay detection (atomic Redis SET NX) ──────────────────────────────────
+async def is_replay(event_id: str, redis_client: redis.Redis) -> bool:
+    """
+    Atomically check-and-set the event_id.
+    Returns True if this event_id was seen before (replay).
+    Uses SET NX with TTL for automatic expiry.
+    """
+    key = f"webhook:processed:{event_id}"
+    # SET NX returns True if key was set (new), False if exists (replay)
+    was_set = await redis_client.set(key, "1", nx=True, ex=REPLAY_TTL_SECONDS)
+    return not was_set
+
+
+# ─── Idempotency lock (prevents concurrent duplicate processing) ──────────────
+async def acquire_processing_lock(
+    event_id: str, redis_client: redis.Redis, ttl: int = 30
+) -> bool:
+    """Acquire a distributed lock for processing this event."""
+    lock_key = f"webhook:lock:{event_id}"
+    acquired = await redis_client.set(lock_key, "1", nx=True, ex=ttl)
+    return bool(acquired)
+
+
+async def release_processing_lock(event_id: str, redis_client: redis.Redis):
+    lock_key = f"webhook:lock:{event_id}"
+    await redis_client.delete(lock_key)
+
+
+# ─── Webhook endpoint ─────────────────────────────────────────────────────────
+@app.post("/webhooks/payment")
+async def payment_webhook(
+    request: Request,
+    x_signature: str = Header(..., alias="X-Signature"),
+    x_timestamp: Optional[str] = Header(None, alias="X-Timestamp"),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    # ── Step 1: Read raw bytes (BEFORE any parsing) ──────────────────────────
+    raw_body = await request.body()
+
+    # ── Step 2: Enforce payload size limit ───────────────────────────────────
+    if len(raw_body) > MAX_PAYLOAD_BYTES:
+        logger.warning("Oversized webhook payload: %d bytes", len(raw_body))
+        raise HTTPException(status_code=413, detail="Payload too large")
+
+    # ── Step 3: Verify signature on raw bytes ────────────────────────────────
+    if not verify_with_rotation(raw_body, x_signature):
+        logger.warning("Invalid webhook signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # ── Step 4: Parse JSON only AFTER signature verification ─────────────────
+    try:
+        json_data = await request.json()
+        payload = WebhookPayload(**json_data)
+    except (ValidationError, Exception) as e:
+        logger.warning("Invalid webhook payload structure: %s", type(e).__name__)
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    # ── Step 5: Validate timestamp freshness ─────────────────────────────────
+    if x_timestamp:
+        try:
+            ts = float(x_timestamp)
+            if abs(time.time() - ts) > TIMESTAMP_TOLERANCE_SECONDS:
+                logger.warning("Stale webhook timestamp: %s", x_timestamp)
+                raise HTTPException(status_code=400, detail="Request expired")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid timestamp")
+
+    # ── Step 6: Replay detection (atomic) ────────────────────────────────────
+    if await is_replay(payload.event_id, redis_client):
+        logger.info("Duplicate webhook ignored: %s", payload.event_id)
+        return JSONResponse(
+            {"status": "already_processed", "event_id": payload.event_id},
+            status_code=200,
+        )
+
+    # ── Step 7: Acquire distributed lock for concurrent idempotency ───────────
+    if not await acquire_processing_lock(payload.event_id, redis_client):
+        # Another worker is processing this event — return success
+        logger.info("Concurrent duplicate detected: %s", payload.event_id)
+        return JSONResponse(
+            {"status": "processing", "event_id": payload.event_id},
+            status_code=200,
+        )
+
+    try:
+        # ── Step 8: Process the webhook ──────────────────────────────────────
+        await process_payment_event(payload)
+
+        logger.info("Webhook processed: %s (%s)", payload.event_id, payload.event_type)
+        return JSONResponse(
+            {"status": "processed", "event_id": payload.event_id},
+            status_code=200,
+        )
+    except Exception as e:
+        # ── Step 9: Never leak internal errors to client ──────────────────────
+        logger.exception(
+            "Webhook processing failed for %s: %s", payload.event_id, str(e)
+        )
+        # Release lock so retry can acquire it
+        await release_processing_lock(payload.event_id, redis_client)
+        # Return generic error — details are in server logs only
+        raise HTTPException(status_code=500, detail="Internal processing error")
+
+
+# ─── Business logic (placeholder) ────────────────────────────────────────────
+async def process_payment_event(payload: WebhookPayload):
+    """Process the validated, deduplicated webhook payload."""
+    # Your payment processing logic here
+    pass
+```
+
+---
+
+### Key Security Properties
+
+| Property | Implementation |
+|----------|---------------|
+| **Signature on raw bytes** | `hmac.new(secret, raw_body, sha256)` — body parsed only after verification |
+| **Constant-time comparison** | `hmac.compare_digest()` — prevents timing attacks |
+| **Secret rotation** | Tries current + previous secret for zero-downtime rotation |
+| **Atomic replay check** | `SET NX` in Redis — no race window between check and write |
+| **Concurrent idempotency** | Distributed lock prevents parallel processing of same event_id |
+| **No error leakage** | Generic 500 to client; full traceback in server logs only |
+| **Payload size limit** | 1MB cap before any processing |
+| **Timestamp freshness** | 5-minute tolerance window prevents stale replays |
+| **Auto-expiry** | Redis TTL on replay keys prevents unbounded growth |
+
+### Required Environment Variables
+
+```bash
+export WEBHOOK_SECRET_CURRENT="whsec_..."
+export WEBHOOK_SECRET_PREVIOUS="whsec_..."  # optional, for rotation
+export REDIS_URL="redis://..."
+```
+
+### Dependencies
+
+```txt
+fastapi>=0.100.0
+redis>=5.0.0
+pydantic>=2.0.0
+```
+
+The critical fix is **verifying the signature on raw bytes before any JSON parsing** — this eliminates the entire class of deserialization attacks. The Redis-based atomic `SET NX` eliminates both the race condition and the in-memory store's fragility across restarts and workers.

@@ -1,0 +1,282 @@
+## Diagnosis & Fix: 40s Events Query
+
+### 1. Node-by-Node EXPLAIN ANALYZE Breakdown
+
+```
+# ── Node 1: Seq Scan on events (800M rows) ──
+Seq Scan on events  (cost=0.00..28000000.00 rows=100 width=64)
+  Actual Rows: 2,000,000
+  Filter: tenant_id = 'abc' AND event_type = 'page_view' AND created_at > ...
+  Rows Removed by Filter: 798,000,000
+```
+**Problem**: Planner estimated 100 rows, actual was 2M — **20,000x underestimate**. No usable index exists, so it scans all 800M rows sequentially and discards 798M. The cost model trusts outdated pg_statistic values.
+
+```
+# ── Node 2: Hash Join → Seq Scan on users (2M rows) ──
+Hash Join  (cost=15000..45000 rows=2M)
+  Hash Cond: events.user_id = users.id
+  -> Seq Scan on events ...
+  -> Hash  -> Seq Scan on users
+```
+**Problem**: Users table has no index on `id` (or id isn't primary key), forcing another full sequential scan to build the hash. This is almost certainly a missing primary key index.
+
+```
+# ── Node 3: Materialize + Window Function ──
+WindowAgg  (actual rows matching events output)
+  Sort Key: rank() over (partition by ... order by ...)
+  Work_mem exhausted → spilled to disk
+  Disk: 2.4 GB temp file
+```
+**Problem**: The window function requires sorting 2M rows. Default `work_mem` is 4MB — not nearly enough for 2M-row sorts with partition keys and ordering columns. Spill to disk kills performance.
+
+```
+# ── Node 4: Final Sort / Aggregate ──
+Sort  (spill again)
+  Work_mem: 4MB
+  Disk usage: additional 1.8 GB
+```
+**Problem**: Cascading disk spills from insufficient memory allocation.
+
+---
+
+### 2. Root Causes Summary
+
+| Symptom | Root Cause | Impact |
+|---------|-----------|--------|
+| Seq Scan on 800M rows | No composite index on `(tenant_id, event_type, created_at)` | Full table scan, 798M filtered rows |
+| Estimates: 100 vs 2M rows | Stale statistics, low `stats_target` on selective columns | Wrong plan choice throughout |
+| Disk spill (2.4 GB) | `work_mem = 4MB` for multi-key window sort | 10–50x slower than in-memory sort |
+| Seq Scan on users table | Missing primary key index on `users.id` | Costly hash join build phase |
+
+---
+
+### 3. Index Strategy
+
+#### Primary Composite Index
+
+```sql
+-- Equality columns (tenant_id, event_type) FIRST, then range (created_at)
+-- This allows: WHERE tenant_id = $1 AND event_type = $2 AND created_at BETWEEN $3 AND $4
+CREATE INDEX idx_events_tenant_type_time 
+    ON events (tenant_id, event_type, created_at);
+```
+
+**Why this order?** B-tree indexes can seek on prefix columns and use the last column for range scans. `(tenant_id, event_type, created_at)` lets PostgreSQL:
+1. Seek directly to the tenant
+2. Seek within tenant to the event type
+3. Sequential-scan the index entries across the date range
+4. Avoid returning to the heap if we use INCLUDE
+
+Without equality columns before the range column, you lose the seek advantage and get an index-scan that still touches most of the index.
+
+#### Covering Variant (Recommended if the query selects predictable columns)
+
+```sql
+-- If the query SELECTs user_id, event_data alongside the ranking columns:
+CREATE INDEX idx_events_covering 
+    ON events (tenant_id, event_type, created_at)
+    INCLUDE (user_id, event_data);
+-- Avoids heap fetches entirely → "index-only scan" possible
+```
+
+INCLUDE columns don't affect sort order but are stored in the index. If your query frequently reads `user_id`, `event_data`, or `metadata` alongside the filtered/ranked columns, this pays for itself by eliminating random I/O into the main table. Trade-off: larger index (~30–50% bigger). At 800M rows, expect ~150–200 GB vs ~60 GB for the non-covering version. Only use this if index-only scans are beneficial for your workload.
+
+#### Partial Index? Decision: NO for this case.
+
+```sql
+-- Would look like:
+CREATE INDEX idx_events_partial 
+    ON events (tenant_id, event_type, created_at)
+    WHERE event_type != 'heartbeat';
+```
+
+**Why not:** Your query already filters `WHERE event_type = 'page_view'`, which makes the partial index redundant for that predicate. A partial index is only justified when:
+- You query the same subset repeatedly across *different* queries (e.g., "is_active = true")
+- The WHERE clause of the partial index doesn't overlap with query predicates
+
+Since each query targets different `tenant_id` values, you'd need one partial index per tenant — impractical. Skip it.
+
+#### BRIN Index on created_at (Secondary, cheap)
+
+```sql
+-- Add a BRIN index for pure range scans on created_at (no tenant filter):
+CREATE INDEX idx_events_brin_created_at 
+    ON events USING brin (created_at);
+-- Block-size default 128 pages ≈ works well for time-series appended tables
+```
+
+BRIN indexes are tiny (≈1 MB for 800M rows) and great for naturally ordered columns like timestamps. Useless here when you have a composite B-tree because the B-tree subsumes the range scan, but useful for queries that only filter on `created_at` without a tenant/event_type filter.
+
+#### Users Table
+
+```sql
+-- Ensure primary key (if not already):
+ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+-- If id is already PK, make sure statistics are fresh:
+ANALYZE users;
+```
+
+---
+
+### 4. Fix the Stale Estimates Problem
+
+The planner expecting 100 rows when actual is 2M means `pg_statistic` is severely out of date. Two fixes:
+
+```sql
+-- Increase statistics collection depth on the most selective columns:
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- Then collect fresh statistics:
+ANALYZE events;
+
+-- Or force a sample-based analyze for accuracy on an 800M-row table:
+ANALYZE events;
+-- (Postgres uses n_distinct/from_correlation heuristics at high STATISTICS levels)
+```
+
+`STATISTICS 1000` tells the collector to keep 1000 MCV (Most Common Values) entries and histogram buckets instead of the default 100. For `event_type` especially (likely 10–50 distinct values), this makes the planner much more accurate about selectivity.
+
+**Ongoing maintenance:**
+
+```sql
+-- Set permanently for autoanalyze to pick up changes:
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+
+-- If updates are heavy, consider increasing autovacuum_analyze_scale_factor:
+ALTER TABLE events SET (autovacuum_analyze_scale_factor = 0.01);
+-- Triggers analyze after every 1M row changes instead of 20% of 800M
+```
+
+---
+
+### 5. Is Partitioning by Month Justified?
+
+**Verdict: Not yet, but plan for it.**
+
+Arguments against partitioning now:
+- 800M rows is large but Postgres handles it fine with good indexes
+- Partitioning adds overhead: cross-partition joins, higher maintenance cost
+- Your query already filters by `created_at` range, so index skip/sparse indexing already benefits
+- Maintenance: adding 30+ partitions, managing retention policies, VACUUM becomes more complex
+
+Arguments for partitioning later:
+- If you regularly purge old data (DELETE), partitioned DELETE is O(1) vs O(n)
+- If the table grows beyond ~2B rows significantly hurt index traversal times
+- If you run analytical queries across many months simultaneously (partial aggregation)
+
+**If you do partition later**, use range partitioning on `created_at`:
+
+```sql
+CREATE TABLE events_y2024m01 PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+-- Repeat per month...
+```
+
+But wait until you have a data-retention/purge requirement or hit measurable performance cliffs. Right now, indexing + stats + work_mem will give you the biggest win.
+
+---
+
+### 6. Rewritten Query
+
+Here's the corrected query assuming the original looked something like a ranking report:
+
+```sql
+-- ─── Step 1: Raise work_mem for this session only (temporary, safe) ───
+SET LOCAL work_mem = '256MB';
+
+-- ─── Step 2: Pre-aggregate with CTE rather than joining raw events ───
+WITH ranked_events AS (
+    -- Subquery limits rows early using the index, reducing what flows to the join
+    SELECT
+        e.tenant_id,
+        e.user_id,
+        e.event_type,
+        e.created_at,
+        e.event_data,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.tenant_id, DATE_TRUNC('day', e.created_at)
+            ORDER BY e.created_at DESC
+        ) AS rn
+    FROM events e
+    WHERE e.tenant_id = 'abc123'                     -- equality → index seek col 1
+      AND e.event_type = 'page_view'                  -- equality → index seek col 2
+      AND e.created_at >= NOW() - INTERVAL '30 days'  -- range → index range scan col 3
+)
+SELECT
+    re.*,
+    u.email,
+    u.signup_date,
+    u.plan_tier                              -- pulled from users via indexed lookup
+FROM ranked_events re
+INNER JOIN users u ON u.id = re.user_id     -- pk index makes this a nested-loop or hash with small probe set
+WHERE re.rn <= 100                            -- limit early: most reporting queries only need top-N
+ORDER BY re.created_at DESC;
+```
+
+#### Why CTE, why not just rewrite the original?
+
+A CTE (inline view) here serves two purposes:
+
+1. **Index isolation**: The inner query hits `idx_events_tenant_type_time` and returns only the rows matching the tenant/type/date-range filter. Without the CTE, the optimizer might choose to join first and filter later. The CTE forces the execution order: filter → rank → join → limit.
+
+2. **Rank-before-join semantics**: By computing `ROW_NUMBER()` inside the CTE, you're ranking within the already-filtered dataset. If you computed rank across all events and *then* filtered, you'd waste compute on rows you discard.
+
+#### Materialization Alternative
+
+In Postgres 12+, CTEs are inlined by default. If the planner still merges them incorrectly, force materialization:
+
+```sql
+WITH rated_events AS MATERIALIZED (
+    -- same inner query
+) SELECT ... FROM rated_events re INNER JOIN users u ON u.id = re.user_id;
+```
+
+`MATERIALIZED` forces a physical spool (hash table) between the CTE and the outer query, preventing the planner from merging them back together. Use this if the CTE output is large and reused, or if you see the planner trying to push predicates through the CTE boundary incorrectly.
+
+For your specific case (top-100 results), the CTE approach is likely sufficient without `MATERIALIZED`. Monitor with `EXPLAIN` to verify.
+
+#### Additional Configuration Fix
+
+```sql
+-- Permanent fix for the disk-spill problem:
+ALTER SYSTEM SET work_mem = '64MB';    -- raise globally (from 4MB default)
+ALTER SYSTEM SET maintenance_work_mem = '1GB';  -- helps VACUUM/index builds
+SELECT pg_reload_conf();
+-- Then restart connections for work_mem to take effect
+```
+
+With `work_mem = 64MB` (global) or `256MB` (session-local), your 2M-row sort stays in RAM. The disk spills disappear entirely, cutting query time from ~40s to sub-second.
+
+---
+
+### 7. Execution Plan (Apply in Order)
+
+```sql
+-- 1. Create the composite index (concurrent so no lock on reads):
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_time 
+    ON events (tenant_id, event_type, created_at);
+
+-- 2. Raise statistics targets:
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- 3. Analyze to apply new statistics:
+ANALYZE events;
+
+-- 4. Ensure users PK exists:
+ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+-- 5. Increase work_mem:
+ALTER SYSTEM SET work_mem = '64MB';
+SELECT pg_reload_conf();
+
+-- 6. Verify the plan improved:
+EXPLAIN (ANALYZE, BUFFERS, TIMING)
+-- [run your query here]
+-- Should show: Index Scan using idx_events_tenant_type_time, Hash Join, in-memory sort
+```
+
+**Expected result**: 40s → <500ms. The sequence is: index seeks narrow to ~2M rows → in-memory sort computes ranks → hash join probes users PK → final output. All operations stay in RAM, all paths are index-driven.

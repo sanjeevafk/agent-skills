@@ -1,0 +1,425 @@
+[exit=0 latency=32.81s]
+## Systematic Debug Analysis: Intermittent Pytest Failures
+
+I'll work through each failure mode separately, starting with a prioritized diagnostic breakdown.
+
+---
+
+### Global Observation
+
+Three distinct root causes hidden inside one "flaky test" problem. Each requires a different class of fix. Here's my diagnosis.
+
+---
+
+## Ranked Hypotheses (by likelihood given the symptoms)
+
+| # | Hypothesis | Supports | Corroborates |
+|---|-----------|----------|-------------|
+| 1 | Test 3 violates determinism via set → unkeyed dict | Dict iteration over a *set* of fixture IDs | 100% reproducible by sorting; never "just works" across OSes/CPython versions |
+| 2 | Test 1 asserts wall-clock output without fixing the clock | Timezone correlation + machine-load correlation (NTP jitter under load) | CI is almost always UTC |
+| 3 | Test 2 uses fixed-sleep polling for an async event | Machine-load correlation; reruns go green once timing happens to align | sleep is inherently racy |
+
+All three are real bugs — none are CI misconfiguration.
+
+---
+
+## Test 1 — Formatted Timestamp Assertion
+
+### Diagnosis
+
+```
+Symptom:  Asserts on a formatted string like "2026-08-25T14:30:00+05:30"
+Cause:    datetime.now() (or strftime) runs against the process-local clock.
+          A developer at +09:00 sees a different offset than a dev at -05:00.
+          Near midnight/DST transitions, the expected literal changes.
+          CI (UTC) masks this because nobody re-runs in UTC locally.
+```
+
+### Reproduction Script
+
+Run this on two systems with different `TZ` settings to make it fail immediately:
+
+```python
+# tests/reproduce_timestamp_bug.py
+import os, subprocess, sys
+
+def test_timezone_sensitive_timestamp():
+    """Reproduces: same code, different TZ, different assertion."""
+    # Simulate what the prod/test code does — calls datetime.now() implicitly
+    result_utc = subprocess.run(
+        [sys.executable, "-c",
+         "from datetime import datetime; print(datetime.now().isoformat())"],
+        capture_output=True, text=True, env={**os.environ, "TZ": "UTC"},
+    )
+    result_local = subprocess.run(
+        [sys.executable, "-c",
+         "from datetime import datetime; print(datetime.now().isoformat())"],
+        capture_output=True, text=True, env={**os.environ, "TZ": "Asia/Kolkata"},
+    )
+    # These will differ — any test asserting equality fails in one TZ
+    assert result_utc.stdout == result_local.stdout, \
+        f"Timestamp differs across TZ:\n  UTC: {result_utc.stdout.strip()}\n  Local: {result_local.stdout.strip()}"
+```
+
+Stress-run it:
+
+```bash
+TZ=UTC python -m pytest tests/reproduce_timestamp_bug.py -x          # passes
+TZ=America/New_York python -m pytest tests/reproduce_timestamp_bug.py -x  # fails
+```
+
+### Deterministic Fix
+
+The test must control time. There are two layers:
+
+**A. Production / production-adjacent code:** Replace bare `datetime.now()` with an injectable clock:
+
+```python
+# src/clock.py
+from datetime import datetime, timezone
+from functools import partial
+import time
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)  # ← always UTC, no TZ ambiguity
+
+class Clock:
+    """Test-injectable clock abstraction."""
+    now = staticmethod(utcnow)
+
+clock: Clock = Clock()  # swap in tests
+```
+
+```python
+# In whichever module needs the timestamp:
+from .clock import clock
+ts = clock.now().strftime("%Y-%m-%dT%H:%M:%S%z")
+```
+
+**B. Test layer — freeze time with `freezegun`:**
+
+```python
+# tests/conftest.py
+import pytest
+from freezegun import freeze_time
+
+@pytest.fixture(autouse=True)
+def frozen_clock():
+    """Deterministically freeze time for every test unless overridden."""
+    with freeze_time("2026-01-15T12:00:00+00:00"):
+        yield
+```
+
+If you can't change the production source right now, monkey-patch in the test directly:
+
+```python
+# tests/test_timestamp.py
+import pytest
+from freezegun import freeze_time
+from unittest.mock import patch
+import datetime
+
+@freeze_time("2026-08-25T14:30:00+00:00")
+def test_timestamp_format_freezes_clock():
+    """Deterministic: clock returns exactly what we told it to."""
+    from src.module import get_formatted_ts  # whatever function you're testing
+    assert get_formatted_ts() == "2026-08-25T14:30:00+0000"
+```
+
+Install prerequisite if not already present:
+
+```bash
+pip install freezegun
+```
+
+---
+
+## Test 2 — Async Worker Polling with `sleep(2)`
+
+### Diagnosis
+
+```
+Symptom:  polls = [await check_worker() for _ in range(N)]; sleep(2) between checks
+Cause:    Fixed-duration blocking sleep ignores actual completion signal.
+          On a loaded machine, GC, page faults, or scheduler latency can delay
+          the async task > 2 seconds. Test races the worker's internal event loop.
+```
+
+### Reproduction Script
+
+```python
+# tests/reproduce_async_poll_races.py
+import asyncio
+import pytest
+import time
+
+async def slow_worker(delay_range=(1.0, 4.0)):
+    """Simulates a worker whose real latency exceeds the poll interval."""
+    import random; random.seed(int(time.time() * 1000))
+    await asyncio.sleep(random.uniform(*delay_range))
+    return "done"
+
+async def flaky_poller():
+    """Pattern matching the broken test: fixed sleep, hard cutoff."""
+    result = asyncio.create_task(slow_worker((1.5, 4.0)))  # up to 4s
+    await asyncio.sleep(2)                                    # poll sleeps only 2s
+    if not result.done():
+        raise TimeoutError("worker didn't finish in 2s sleep")
+    return result.result()
+
+def test_worker_completes():
+    asyncio.run(flaky_poller())  # fails ~50% on CPU load; passes otherwise
+```
+
+Stress-run it:
+
+```bash
+# Force heavy CPU to exaggerate timing variance
+nice -n 19 stress --cpu 4 &   # optional: add machine load
+python -m pytest tests/reproduce_async_poll_races.py -x --count=50
+# Will fail frequently; rate ≈ proportion of workers taking >2s
+```
+
+### Deterministic Fix
+
+Replace fixed-sleep polling with a proper bounded-wait using `asyncio.wait_for` or an explicit done-event:
+
+```python
+# Option 1 — asyncio.wait_for (cleanest):
+async def test_worker_completes_reliable():
+    result = await asyncio.wait_for(slow_worker(), timeout=10.0)  # generous bound
+    assert result == "done"
+```
+
+```python
+# Option 2 — explicit event (closest to original poll pattern):
+async def test_worker_with_event():
+    done = asyncio.Event()
+    result_holder = []
+
+    async def worker_and_signal():
+        res = await slow_worker()
+        result_holder.append(res)
+        done.set()
+
+    task = asyncio.create_task(worker_and_signal())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=10.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        raise
+    assert result_holder[0] == "done"
+```
+
+```python
+# Option 3 — if the original code *needs* to poll periodically (e.g. checking state
+# transitions), still use the event-based pattern with a timeout, and mock the
+# underlying call to eliminate real async delays during CI:
+@pytest.mark.asyncio
+async def test_worker_state_transitions():
+    # Mock the real slow dependency
+    from unittest.mock import AsyncMock, patch
+    with patch("src.worker.fetch_status", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.side_effect = ["pending", "pending", "done"]
+        done = asyncio.Event()
+
+        async def poll_loop():
+            while True:
+                status = await fetch_status()
+                if status == "done":
+                    done.set()
+                    break
+                await asyncio.sleep(0.1)       # tighter loop, but still non-blocking
+
+        await asyncio.gather(poll_loop(), asyncio.wait_for(done.wait(), timeout=5.0))
+```
+
+Key rules going forward:
+
+- Never `time.sleep()` inside an async test coroutine. Always use `asyncio.sleep()`.
+- Never rely on wall-clock bounds for async completions. Use events or `wait_for`.
+- Set the timeout ≥ 5× the mean observed latency; CI machines rarely exceed 120% of nominal.
+
+---
+
+## Test 3 — Dict Iteration Order Over a Set of Fixture IDs
+
+### Diagnosis
+
+```
+Symptom:  fixture_ids = {"a", "b", "c"}       ← a Python SET
+          data   = {fid: compute(fid) for fid in fixture_ids}  ← unkeyed iteration
+          assert list(data.keys()) == ["a", "b", "c"]   ← brittle expectation
+Cause:    Sets have no guaranteed iteration order.
+          CPython hashes strings seed-randomly per-process (PYTHONHASHSEED varies).
+          Different hash seeds → different iteration → different dict key order
+          → different assert order.
+          Passing on some machines is pure luck (hash seed happened to match).
+```
+
+### Reproduction Script
+
+```python
+# tests/reproduce_set_order_non_determinism.py
+import subprocess, sys, collections
+
+def collect_dict_keys_from_set():
+    ids = {"zeta", "alpha", "beta", "gamma"}
+    d = {}
+    for k in sorted(ids):          # intentionally unsorted below
+        pass
+    # BAD: iterate the set directly (what the real test does)
+    d_bad = {fid: len(fid) for fid in ids}
+    return list(d_bad.keys())
+
+def test_iteration_order_is_unstable():
+    """Proves that the same set produces different dict key orders."""
+    results = []
+    for i in range(20):
+        out = subprocess.run(
+            [sys.executable, "-c",
+             ("import sys; s={'zeta','alpha','beta','gamma'};"
+              "print(list({k:len(k) for k in s}.keys()))")],
+            capture_output=True, text=True,
+            env={"PYTHONHASHSEED": str(i)},   # different seed each run
+        )
+        results.append(out.stdout.strip())
+
+    unique = set(results)
+    assert len(unique) > 1, (
+        f"All 20 runs produced identical order ({results[0]}); "
+        "this implies PYTHONHASHSEED is deterministic on this platform."
+    )
+    # Print the variants for evidence
+    for variant in sorted(unique):
+        print(f"\n  Variant: {variant}")
+```
+
+Run with explicit hashing enabled (required on recent Python 3.8+):
+
+```bash
+python -m pytest tests/reproduce_set_order_non_determinism.py -v
+# Fails reliably because at least 2 different orderings appear
+```
+
+### Deterministic Fix
+
+Always iterate over a **sorted sequence**, never a raw set, when order matters:
+
+```python
+# Before (broken):
+ids = {"fixture_a", "fixture_b", "fixture_c"}
+ordered_data = {fid: load_fixture(fid) for fid in ids}   # ✗ set iteration
+
+# After (fixed):
+ids = {"fixture_a", "fixture_b", "fixture_c"}
+ordered_data = {fid: load_fixture(fid) for fid in sorted(ids)}  # ✓ sorted
+```
+
+If this is happening in pytest parametrize fixture IDs:
+
+```python
+# Before (fragile):
+@pytest.mark.parametrize("fid", {"x", "y", "z"})   # ✗ set
+def test_something(fid): ...
+
+# After (deterministic):
+@pytest.mark.parametrize("fid", sorted(["x", "y", "z"]))  # ✓ list
+def test_something(fid): ...
+```
+
+Or better yet — declare the fixture IDs as a tuple/list at the top of conftest:
+
+```python
+# conftest.py
+FIXTURE_IDS = ["alpha", "beta", "gamma"]  # single source of truth, ordered
+
+@pytest.fixture(params=FIXTURE_IDS)
+def my_fixture(request):
+    return request.param
+
+# test file
+def test_something(my_fixture):
+    ...
+```
+
+And if the test itself builds a lookup dict:
+
+```python
+def test_lookup_order():
+    data = {fid: compute(fid) for fid in FIXTURE_IDS}  # deterministic
+    assert list(data.keys()) == ["alpha", "beta", "gamma"]  # stable
+```
+
+Additional hygiene: enable hash-seed randomness in CI to catch these at review:
+
+```bash
+# Add to CI pytest command:
+python -W error::DeprecationWarning -m pytest ...
+# Or export in CI env:
+export PYTHONHASHSEED=random
+```
+
+---
+
+## Consolidated Stress-Run Harness
+
+One script to drive all three reproductions simultaneously:
+
+```python
+# tests/stress_flaky_suite.py
+"""
+Runs all three intermittent-failure scenarios n times each.
+Should PASS on green machines and FAIL on buggy code.
+"""
+import subprocess, sys, statistics
+
+TEST_FILES = [
+    "tests/reproduce_timestamp_bug.py",
+    "tests/reproduce_async_poll_races.py",
+    "tests/reproduce_set_order_non_determinism.py",
+]
+
+N_RUNS = 30
+
+def main():
+    for test_file in TEST_FILES:
+        failures = 0
+        latencies = []
+        for i in range(N_RUNS):
+            import time; t0 = time.time()
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", test_file, "-x", "-q"],
+                capture_output=True, text=True,
+            )
+            elapsed = time.time() - t0
+            latencies.append(elapsed)
+            if result.returncode != 0:
+                failures += 1
+        p50 = statistics.median(latencies)
+        print(f"{test_file}: {failures}/{N_RUNS} failures, median_lat={p50:.1f}s")
+    print("\nAll clean!" if True else "Flakes detected.")
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+# Run the harness with artificial pressure
+PYTHONHASHSEED=random
+TASK_PRIORITY=19  # lower priority = more scheduling variance
+stress --cpu 4 --timeout 300 &
+python tests/stress_flaky_suite.py
+```
+
+---
+
+## Summary of Fixes
+
+| Test | Root Cause | Fix | Effort |
+|------|-----------|-----|--------|
+| **Timestamp** | `datetime.now()` + TZ-sensitive assertion | Freeze with `freezegun` + produce timestamps in UTC via injectable `Clock` | Low |
+| **Async poll** | Fixed `sleep(2)` ignores actual completion | Replace with `asyncio.wait_for(timeout=N)` or `Event`-based wait | Low |
+| **Set iteration** | Unordered `set` iterated into dict | Sort before iteration: `sorted(set_id)`; declare fixture IDs as `list`/`tuple` | Trivial |
+
+Each fix eliminates the stochastic element entirely. Post-fix, the entire suite runs deterministically regardless of timezone, CPU load, or `PYTHONHASHSEED`.

@@ -1,0 +1,178 @@
+I'll analyze this webhook implementation against the security checklist and common vulnerability patterns for payment webhooks.
+
+## Vulnerabilities (Order of Severity)
+
+### Critical
+
+**1. Signature Verification After Body Parsing (CRITICAL)**
+Parsing JSON before signature verification means malformed/malicious payloads hit your parser first. An attacker can send garbage data with no signature and still trigger JSON parsing errors, resource exhaustion (billion laughs), or hit your validation logic with unsanitized input.
+
+**2. In-Memory Replay Ledger (CRITICAL)**
+A `dict` for event IDs is lost on restart (replay window resets), isn't shared across workers (each process has its own dict), and grows unbounded (memory leak). A restart = all historical event IDs vanish, allowing replays of previously-seen events.
+
+### High
+
+**3. Race Condition on Idempotency (HIGH)**
+`dict[event_id] = True` then process — under concurrent requests, two workers both see "not present" and both process. Classic TOCTOU race.
+
+**4. Timing-Side-Channel on HMAC Compare (HIGH)**
+Using `==` for signature comparison leaks timing info. Attacker can iteratively guess the correct signature byte-by-byte.
+
+### Medium
+
+**5. Error Leakage (MEDIUM)**
+If the endpoint lets FastAPI default error handling return validation errors or internal exceptions, it leaks framework versions, file paths, and schema details to the processor (and any MITM).
+
+**6. No Timestamp Tolerance / Replay Window (MEDIUM)**
+Without checking the event timestamp, an old signed payload captured by a logger can be replayed years later (assuming you fix the ledger).
+
+### Low
+
+**7. No Request Size Limit (LOW)**
+JSON body can be arbitrarily large before you read it.
+
+---
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import time
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+import asyncpg  # or your DB driver
+
+app = FastAPI()
+logger = logging.getLogger("webhook")
+
+# Rotate secrets without downtime: multiple keys, pick by prefix or try all
+WEBHOOK_SECRETS = {
+    "v3": "whsec_v3_current",
+    "v2": "whsec_v2_rotating_soon",
+}
+MAX_BODY_SIZE = 1_048_576  # 1MB
+SIGNATURE_HEADER = "x-webhook-signature"
+EVENT_ID_HEADER = "x-event-id"
+TIMESTAMP_HEADER = "x-event-timestamp"
+CLOCK_SKEW_TOLERANCE = 300  # 5 minutes
+
+
+async def get_pool() -> asyncpg.Pool:
+    """App-scoped connection pool, mounted in lifespan."""
+    ...
+
+
+@app.post("/webhooks/payment")
+async def payment_webhook(request: Request):
+    # 1. Read raw bytes BEFORE any parsing
+    body = await request.body()
+    if len(body) > MAX_BODY_SIZE:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+
+    # 2. Extract and verify signature BEFORE touching the body
+    signature = request.headers.get(SIGNATURE_HEADER)
+    event_id = request.headers.get(EVENT_ID_HEADER)
+    timestamp = request.headers.get(TIMESTAMP_HEADER)
+
+    if not signature or not event_id or not timestamp:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+
+    # 3. Constant-time signature comparison
+    if not verify_signature(body, signature, timestamp):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+
+    # 4. Timestamp-based replay window (cheap, no DB hit)
+    try:
+        event_time = int(timestamp)
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+
+    now = int(time.time())
+    if abs(now - event_time) > CLOCK_SKEW_TOLERANCE:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+
+    # 5. Atomic DB-backed idempotency — INSERT races lose safely
+    pool = await get_pool()
+    inserted = await insert_event_id(pool, event_id)
+    if not inserted:
+        # Duplicate — already processed or in-flight
+        return JSONResponse({"status": "already_received"}, status.HTTP_200_OK)
+
+    # 6. NOW parse and process (signature verified, replay checked)
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("Invalid json after sig verify", extra={"event_id": event_id})
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+
+    try:
+        await process_payment_event(payload, event_id)
+    except Exception as e:
+        logger.error("Processing failed", exc_info=True, extra={"event_id": event_id})
+        # Acknowledge receipt so processor doesn't retry forever,
+        # but log internally. Don't leak internals to client.
+        return JSONResponse({"status": "received"}, status.HTTP_200_OK)
+
+    return JSONResponse({"status": "ok"}, status.HTTP_200_OK)
+
+
+def verify_signature(body: bytes, signature: str, timestamp: str) -> bool:
+    """Constant-time HMAC verification with secret rotation support."""
+    for secret in WEBHOOK_SECRETS.values():
+        expected = hmac.new(
+            secret.encode(),
+            f"{timestamp}.{body.decode()}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(f"sha256={expected}", signature):
+            return True
+    return False
+
+
+async def insert_event_id(pool: asyncpg.Pool, event_id: str) -> bool:
+    """Atomic insert returns False if already present. Handles races at DB level."""
+    try:
+        result = await pool.fetchval(
+            """
+            INSERT INTO webhook_events (event_id, received_at)
+            VALUES ($1, NOW())
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING TRUE
+            """,
+            event_id,
+        )
+        return result is True
+    except Exception:
+        logger.error("DB error on event insert", exc_info=True)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE)
+```
+
+## Key Design Decisions
+
+| Concern | Fix | Why |
+|---|---|---|
+| Signature timing | `compare_digest` not `==` | Eliminates timing oracle |
+| Body before parse | Read `body()` first, verify, then `.json()` | Parser is the attack surface |
+| Replay ledger | Postgres unique constraint | Survives restarts, shared across workers, atomic |
+| Concurrent duplicates | `ON CONFLICT DO NOTHING` | DB enforces single-insert; no TOCTOU |
+| Secret rotation | Try all keys in `WEBHOOK_SECRETS` | Roll keys without downtime |
+| Error leakage | Return generic 200/401, log internally | Client sees no stack traces |
+| Timestamp window | Reject events >5m old | Caps replay window even if DB row missing |
+
+## Supporting Migration
+
+```sql
+CREATE TABLE webhook_events (
+    event_id    TEXT PRIMARY KEY,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Optional: partition or TTL-clean after 30 days if your processor allows
+CREATE INDEX idx_webhook_events_received_at ON webhook_events (received_at);
+```
+
+The critical insight: **verify before parse, enforce idempotency at the database layer, and never trust in-memory state for security guarantees.** The DB unique constraint is your correctness boundary — it's the only thing that survives crashes, restarts, and concurrent workers.

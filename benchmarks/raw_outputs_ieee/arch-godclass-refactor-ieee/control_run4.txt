@@ -1,0 +1,485 @@
+[exit=0 latency=43.12s]
+# Refactoring Campaign: Monolith OrderService → Clean Architecture
+
+## 1. Characterization / Golden-Master Tests
+
+This is non-negotiable. Every method gets a characterization test *before* any structural change. You're building a behavioral mirror.
+
+### What gets snapshot per test run
+
+| Category | What | How |
+|---|---|---|
+| **Return values** | Method return objects, status codes | Serialize entire object graph (deep copy, strip runtime-only fields like lazy proxies) |
+| **DB mutations** | Rows inserted/updated/deleted + full row payloads | Capture the executed SQL text + bound parameters, then dump affected rows after the method returns |
+| **Emails sent** | To/from/CC, subject, HTML/text body, attachments, template name | Intercept the `Mailer` call — capture the `Message` DTO payload |
+| **Audit entries** | Log lines written to audit table | Query audit log filtered by trace/request ID before/after |
+| **Exceptions thrown** | Type + message + stack frame | Catch and record instead of rethrowing during golden runs |
+
+### Capturing SQL without modifying domain logic
+
+**Option A (preferred): DB-layer hook.** Hook into whatever ORMs/connection pool you use:
+
+```java
+// Pseudocode — adapt to your ORM
+public class SqlCaptureInterceptor implements ConnectionInterceptor {
+    private final List<CapturedStatement> buffer = new ArrayList<>();
+
+    @Override
+    public void beforeExecute(Connection conn, PreparedStatement ps) {
+        String sql = ps.toString();
+        Object[] params = collectBoundParameters(ps); // driver-specific
+        buffer.add(new CapturedStatement(sql, params));
+    }
+
+    @Override
+    public void afterExecute(...) {}
+
+    public List<CapturedStatement> drain() {
+        return Collections.unmodifiableList(new ArrayList<>(buffer));
+    }
+}
+```
+
+Register this interceptor for the test transaction only (scoped to the thread/transaction). No code path in the production OrderService changes.
+
+**Option B: Proxy the repository layer.** If your app uses a DAO/repository pattern:
+
+```java
+public class SqlCaptureRepositoryProxy implements OrderRepository {
+    private final OrderRepository delegate;
+    private final AtomicReference<List<String>> capturedSql = new AtomicReference<>(new ArrayList<>());
+
+    @Override
+    public void save(Order order) {
+        capturedSql.get().add("INSERT INTO orders ...");
+        delegate.save(order);
+    }
+    // ... proxy every method, appending SQL strings
+}
+```
+
+Option A is better because it requires zero changes to the Service class itself. It's a wiring swap, not a code edit.
+
+### Capturing email side effects
+
+```python
+# Example — adapt to your mailer abstraction
+class EmailCaptureTransport:
+    """Drop-in replacement for the SMTP transport that records every message."""
+
+    def __init__(self, real_transport):
+        self.real = real_transport
+        self.sent_messages: list[dict] = []
+
+    async def send(self, message: Message) -> str:
+        self.sent_messages.append({
+            "from": str(message.sender),
+            "to": [str(r) for r in message.recipients],
+            "cc": [str(r) for r in message.cc],
+            "subject": message.subject,
+            "body_text": message.body.text if message.body else None,
+            "body_html": message.body.html if message.body else None,
+            "attachments": [{"name": a.filename, "content_type": a.content_type}
+                           for a in message.attachments],
+            "message_id": message.message_id,
+        })
+        return await self.real.send(message)
+```
+
+Wire this into DI before calling `orderService.placeOrder(...)`, assert on `captured_sent_messages`.
+
+### Test structure
+
+```gherkin
+Scenario: placeOrder creates order, charges correctly, sends confirmation, logs audit
+    Given items [productId:A, qty:2], customerId:CUST-42, couponCode:SAVE10
+    And currentTaxRate(jurisdiction=US-CA) = 8.75%
+    When service.placeOrder(request)
+    Then database rows match snapshot "placeOrder_001_expected_db_rows.json"
+    And emails sent match snapshot "placeOrder_001_expected_emails.json"
+    And audit_log matches snapshot "placeOrder_001_expected_audit.json"
+    And return value matches snapshot "placeOrder_001_expected_result.json"
+```
+
+Use data-driven tests — one method = many scenario variations (valid, invalid, boundary, edge cases). Write them *first*. Let them fail red for anything that diverges from the recorded baseline.
+
+### Snapshot management
+
+Store goldens in `tests/golden/{methodName}/`. Each golden has:
+- `db_rows.json` — ordered array of affected rows (primary key visible)
+- `emails.json` — array of message DTOs
+- `audit.json` — array of log entries
+- `result.json` — deserialized return value
+
+Use JSON diffs as error output when assertions fail. This gives deterministic diffs even when dates/IDs shift (you normalize those during capture).
+
+---
+
+## 2. Seam Extraction Order
+
+You extract from the *highest-impact, lowest-risk seams* outward. The dependency direction matters more than alphabetical ordering.
+
+### Dependency map (conceptual)
+
+```
+┌──────────────────────────────────────┐
+│           OrderService               │
+│  ┌────────┐ ┌────────┐ ┌─────────┐  │
+│  │Validate│ │ Price  │ │ TaxCalc │  │
+│  └───┬────┘ └───┬────┘ └────┬────┘  │
+│      │          │           │        │
+│      ▼          ▼           ▼        │
+│   Rules      Computed      Applied   │
+│                │              │       │
+│                ▼              ▼       │
+│         ┌─────────────────────┐       │
+│         │    Persistence     │       │
+│         │  (DAO/Repository)  │       │
+│         └────────┬───────────┘       │
+│                  │                    │
+│   ┌──────────────┼───────────┐       │
+│   ▼              ▼           ▼       │
+│ ┌─────┐    ┌────────┐  ┌─────────┐  │
+│ │ Email│    │ Audit  │  │ Metrics │  │
+│ └─────┘    └────────┘  └─────────┘  │
+└──────────────────────────────────────┘
+```
+
+### Extraction priority sequence
+
+#### Priority 1 — **Persistence/Repository seam** (extract FIRST)
+
+**Why:** Direct SQL is the highest-coupling code. Once you have a repository interface, every subsequent layer can depend on an abstraction instead of raw SQL. This single move also collapses 70%+ of the SQL scatter. It breaks the hard dependency between business logic and storage mechanism.
+
+**Risk:** Low — the interface mirrors what already exists. You wire the concrete impl, run golden tests. No behavior changes yet.
+
+```java
+// Day 1 — add interface, wire through constructor, pass-through
+public interface OrderPersistencePort {
+    OrderEntity findById(String orderId);
+    void persist(OrderEntity entity);
+    int updateQuantity(String orderId, int newQty);
+    Stream<OrderEntity> findOpenOrders(LocalDate asOf);
+}
+
+// In the Service constructor — wire the existing implementation behind the port
+public OrderService(
+    Validator validator,
+    PricingEngine pricingEngine,
+    TaxCalculator taxCalculator,
+    OrderPersistencePort persistence,  // ← existing impl injected here
+    EmailGateway emailGateway,
+    AuditLogger auditLogger) {
+    // ... init remaining deps
+}
+```
+
+#### Priority 2 — **Email Gateway seam**
+
+**Why:** After persistence is abstracted, the next most isolatable concern is email — pure external call, completely decoupled from business invariants. Swapping transports is trivially verified by golden snapshots.
+
+```java
+public interface EmailGateway {
+    SendResult send(OrderConfirmation email);
+}
+```
+
+#### Priority 3 — **Pricing Engine**
+
+**Why:** Pricing is arguably the hardest sub-domain. Complex conditional logic often hidden inside service methods. Extract now so you can unit-test pricing independently without spinning up the whole orchestration.
+
+```java
+public interface PricingRules {
+    Money compute(LineItem[] items, CustomerContext ctx, Coupon coupon);
+    boolean appliesDiscount(ProductId productId);
+}
+```
+
+#### Priority 4 — **Tax Calculator**
+
+**Why:** Often just formulaic (rate × amount). Can be tested mathematically in isolation. But depends on knowing the jurisdiction/context set up during order creation, which lives in the orchestrating flow — hence after pricing.
+
+```java
+public interface TaxCalculation {
+    TaxResult calculate(Money subtotal, Jurisdiction jurisdiction, Address shippingAddr);
+}
+```
+
+#### Priority 5 — **Validation**
+
+**Why:** Last because validation logic is the thinnest layer. Often inline `if` checks embedded in the service methods. Worth extracting for testability, but lower ROI than pricing/tax/persistence.
+
+```java
+public interface OrderValidator {
+    ValidationResult validate(CreateOrderRequest request);
+    ValidationResult validateExistingOrder(String orderId, UpdateAction action);
+}
+```
+
+#### Priority 6 — **Audit Logger**
+
+**Why:** Pure side-effect. Least impactful on correctness. Can be replaced later with a noop during stress testing or swapped to async logging. Not blocking any other refactor.
+
+### Why NOT this order?
+
+Some teams extract interfaces bottom-up (validation first). This is wrong here because validation touches no SQL or persistence — extracting it leaves the heaviest coupling untouched, and the intermediate layers (pricing/tax still write raw SQL) cannot benefit. You want each extraction to unlock the next one. Persistence-first is the bottleneck remover.
+
+---
+
+## 3. Incremental Strangler Steps
+
+Each step is a shippable commit. Every commit passes golden tests. No multi-step features ship.
+
+### Phase 0 — Baseline (0 commits into campaign)
+
+```
+Before:                    After:
+┌──────────┐    Wire     ┌──────────┐ ┌──────────────┐
+│  Order   │ ──────────► │  Order   │ │Persistence   │
+│ Service  │             │ Service  │◄├─ RepoImpl    │
+│ (raw)    │             │          │ │              │
+└──────────┘             └────┬─────┘ └──────────────┘
+                             │
+                    Golden tests capture & verify
+```
+
+**Actions:**
+1. Run golden suite against all methods, store goldens in `tests/golden/`
+2. Add `OrderPersistencePort` interface + wire existing impl
+3. **Ship:** Zero behavioral change. Build still compiles. Tests identical.
+
+### Phase 1 — Extract Email (1-2 commits)
+
+```
+After:                     After:
+┌──────────┐               ┌──────────┐ ┌──────────────┐ ┌────────────┐
+│  Order   │    Ship       │  Order   │ │Persistence   │ │EmailGateway│
+│ Service  │ ──────────►  │ Service  │◄├─ RepoImpl    │◄├─ SmtpImpl  │
+│          │               │          │ │              │ │            │
+└──────────┘               └──────────┘ └──────────────┘ └────────────┘
+Golden tests pass ✓       Golden tests pass ✓
+```
+
+**Actions:**
+1. Add `EmailGateway` interface
+2. Replace internal `smtp.send()` calls with `emailGateway.send()`
+3. Ship: Golden test confirms exact same emails sent.
+
+### Phase 2 — Extract Pricing/Tax as domain services (3-4 commits)
+
+```
+After:
+┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌────────────┐
+│  Order   │ │Pricing   │ │  TaxCalc     │ │Persistence │ │Email     │
+│ Service  │◄├─ Rules   │◄├─ Calculator  │◄├─ RepoImpl  │◄├─ SmtpImpl│
+│          │ │          │ │              │ │            │ │         │
+└──────────┘ └──────────┘ └──────────────┘ └────────────┘ └──────────┘
+                    Golden tests pass ✓
+```
+
+**Actions:**
+1. Move `calculateSubtotal()`, `applyDiscount()`, `computeTax()` out of service into dedicated classes
+2. Constructor injection replaces private field assignments
+3. Ship: All methods produce identical results. Goldens pass.
+
+### Phase 3 — Split validation into its own pipeline (commit N)
+
+```
+After:
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌────────────┐
+│  Order   │ │Validation│ │Pricing   │ │  TaxCalc │ │Persistence   │ │Email      │
+│ Service  │◄├─ Pipeline │◄├─ Rules   │◄├─ Calc    │◄├─ RepoImpl    │◄├─ SmtpImpl │
+│          │ │          │ │          │ │          │ │              │ │          │
+└──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘ └────────────┘
+```
+
+**Actions:**
+1. Create `OrderValidationPipeline` with chain-of-responsibility pattern
+2. Replace inline validation blocks
+3. Ship: Identical validation failures, same exception types/suppressed info
+
+### Phase 4 — Remove direct SQL remnants (final commits)
+
+By this point, every SQL statement should be channeled through the persistence port. Any stray SQL gets moved.
+
+### Phase 5 — Strip unused 34th-field dependencies (optional cleanup)
+
+With all methods tested through goldens, analyze field usage:
+
+```bash
+# Find fields never read or written after refactoring
+grep -rn "this\.fieldX" src/order-service.ts | wc -l
+# 0 matches = dead field, safe to remove once committed behind stable API
+```
+
+Remove fields with zero usage across the entire codebase (not just OrderService). Re-run goldens.
+
+---
+
+## 4. Target Module Boundaries
+
+```
+order-service/                        # Orchestrates, thin veneer
+├── application/                      # Use-case coordination
+│   ├── PlaceOrderHandler.ts          # 80-120 lines max
+│   ├── UpdateOrderHandler.ts
+│   ├── CancelOrderHandler.ts
+│   └── GenerateInvoiceHandler.ts
+├── domain/                           # Pure business logic, no I/O
+│   ├── orders/
+│   │   ├── ValueObjects/
+│   │   │   ├── OrderId.ts
+│   │   │   ├── Money.ts
+│   │   │   └── LineItem.ts
+│   │   ├── Entities/
+│   │   │   ├── Order.ts              # Rich domain model (~200 LOC)
+│   │   │   └── AggregateRoot.ts
+│   │   ├── ValueObjects/
+│   │   │   ├── TaxRate.ts
+│   │   │   ├── DiscountCoupon.ts
+│   │   │   └── Jurisdiction.ts
+│   │   └── Services/
+│   │       ├── PricingRules.ts       # ~100 lines, pure function
+│   │       ├── TaxCalculator.ts      # ~80 lines, pure function
+│   │       └── ValidationError.ts    # Typed result type
+│   └── events/
+│       ├── OrderPlacedEvent.ts
+│       ├── OrderUpdatedEvent.ts
+│       └── OrderCancelledEvent.ts
+├── infrastructure/                   # External concerns
+│   ├── persistence/
+│   │   ├── OrderRepositoryImpl.ts    # SQL implementation
+│   │   ├── Mappers/
+│   │   │   ├── OrderEntityMapper.ts  # DDD Entity ↔ Database Row
+│   │   │   └── OrderDTOFactory.ts
+│   │   └── sql/
+│   │       ├── order_queries.sql     # All SQL centralized here
+│   │       └── migrations/
+│   ├── notification/
+│   │   ├── EmailNotificationSender.ts
+│   │   └── TemplateRenderer.ts
+│   └── audit/
+│       ├── AuditLogWriter.ts
+│       └── AuditEventPublisher.ts
+└── adapters/                         # Entry points
+    ├── http/
+    │   └── OrderController.ts        # Thin HTTP handling
+    └── cli/
+        └── OrderImportCommand.ts
+```
+
+The original `OrderService` becomes `PlaceOrderHandler` (~100 LOC) that: validates → loads entity → applies pricing → calculates tax → persists → publishes event. The heavy lifting is delegated to domain services.
+
+---
+
+## 5. Proving Behavior Preservation at Every Commit
+
+This is the discipline that makes the campaign safe. Four layers, each gate before merge.
+
+### Layer 1: Golden-master assertions (every test run)
+
+Every commit triggers the golden suite. Each method's result is compared structurally against its stored baseline:
+
+```typescript
+// Golden assertion helper
+async function assertGoldenMatch<T>(testName: string, actual: T, goldenDir: string) {
+    const normalized = normalize(actual); // strip IDs, timestamps, seq numbers
+    const goldenPath = `${goldenDir}/${testName}.json`;
+
+    if (!fs.existsSync(goldenPath)) {
+        fs.writeFileSync(goldenPath, JSON.stringify(normalized, null, 2));
+        console.warn(`[GOLDEN CREATED] ${goldenPath}`);
+        return;
+    }
+
+    const expected = JSON.parse(fs.readFileSync(goldenPath, 'utf-8'));
+    if (deepEqual(normalized, expected)) return;
+
+    const diff = generateDiff(expected, normalized);
+    throw new Error(`Golden mismatch:\n${diff}`);
+}
+```
+
+Normalization is critical. Strip or replace:
+- UUIDs → `"REPLACED_UUID"`
+- Timestamps → `"REPLACED_TIMESTAMP"`
+- Auto-increment IDs → `"REPLACED_SEQ"`
+- Transaction tokens → `"REPLACED_TOKEN"`
+
+### Layer 2: Delta comparison for DB rows
+
+Rather than comparing entire tables, compare only the rows touched by the operation:
+
+```sql
+-- Capture only affected rows after the method-under-test executes
+SELECT id, status, total_amount, updated_at
+FROM orders WHERE order_id IN (:captured_order_ids)
+ORDER BY id;
+```
+
+Then compare against the golden-set row payloads (normalized).
+
+### Layer 3: Side-effect comparison (email + audit)
+
+Each golden test includes structured assertions:
+
+```typescript
+await expect(capture.emails.length).toBe(expectedCount);
+await expect(capture.emails).toEqual(expectedEmailsJson);
+await expect(capture.auditEntries.length).toBe(expectedAuditCount);
+await expect(capture.auditEntries).toMatchObject(expectedAuditJson);
+```
+
+### Layer 4: Contract tests for public API
+
+Beyond golden tests, keep lightweight contract tests:
+
+| Check | Mechanism |
+|---|---|
+| Return type shape unchanged | TypeScript strict mode + serialized comparison |
+| Exception types/unwinding unchanged | Try/catch wrapper asserts type and message pattern |
+| HTTP response codes/status unchanged | Integration-level test hitting real controller layer |
+| Field accessibility (if migrating to readonly/private) | Compile-time check — if it compiles, nothing broke externally |
+
+### Gate policy
+
+```
+Commit → Build → Unit tests (golden suite) → Contract tests → Merge
+                          ↑
+                   All three must PASS.
+                   One failure = blocked. Rollback or fix.
+                   No exceptions.
+```
+
+Run the golden suite in CI on every PR. Store the golden baselines in git so the baseline itself evolves intentionally (when behavior legitimately changes, you update the golden with a deliberate commit message explaining why).
+
+### Measuring confidence over time
+
+Track two metrics per commit:
+
+1. **Golden coverage %** — what fraction of `placeOrder()`, `cancelOrder()`, etc. have a passing golden test
+2. **Uncovered SQL paths** — statements reachable through untested code paths
+
+```
+Week 1:  100% golden coverage, 0 uncovered SQL paths
+Week 2:  100% golden coverage, 0 uncovered SQL paths  ← maintained throughout
+```
+
+If either metric degrades, the commit doesn't ship.
+
+---
+
+## Campaign Timeline (Conceptual)
+
+```
+Days 1-2:   Write all characterization/golden tests. Establish baselines.
+Day 3:      Extract Persistence port. Wire through. Goldens pass.
+Day 4:      Extract Email gateway. Goldens pass.
+Day 5-6:    Extract Pricing + Tax engines. Goldens pass.
+Day 7-8:    Extract Validation pipeline. Goldens pass.
+Day 9:      Consolidate remaining SQL. Centralize queries. Goldens pass.
+Day 10:     Delete unused fields/paths. Run goldens. Shrink public API surface.
+Day 11-12:  Verify no regressions. Full regression suite. Ship.
+```
+
+Each day's work ships independently. Each day's goldens pass. That's how you go from 1,400 lines with scattered SQL to clean boundaries with zero behavioral breakage.

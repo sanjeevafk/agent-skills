@@ -1,0 +1,477 @@
+# FastAPI Webhook Security Review
+
+## Vulnerabilities (Ordered by Severity)
+
+### CRITICAL: Signature Verification After JSON Parsing
+The current code parses the body before verifying the signature. This means untrusted input reaches your application logic — an attacker can send malformed JSON, oversized payloads, or exploit parser vulnerabilities before any authentication check. **Always verify on raw bytes first.**
+
+### CRITICAL: In-Memory Replay Ledger
+A `dict` for replay IDs fails in production: (1) multiple workers don't share memory, (2) restart wipes all tracked IDs, (3) unbounded memory growth, (4) no TTL means old IDs live forever. This makes replay attacks trivial in any real deployment.
+
+### HIGH: No Atomic Idempotency Under Concurrency
+Two simultaneous duplicate webhooks can both pass the replay check before either writes the ID. You need an atomic check-and-set operation (Redis SETNX, DB unique constraint) to guarantee exactly-once processing.
+
+### HIGH: Error Leakage to Clients
+Unhandled exceptions return stack traces, library versions, and internal paths. Attackers use this for reconnaissance. All errors must be caught and logged internally; clients get only generic responses.
+
+### MEDIUM: No Timing Attack Protection
+Using `==` for signature comparison leaks timing information. Use `hmac.compare_digest()` for constant-time comparison.
+
+### MEDIUM: No Timestamp/Expiry Validation
+Without checking the webhook timestamp, old signed requests can be replayed forever (even within the replay window if the ledger is lost).
+
+---
+
+## Corrected Implementation
+
+```python
+# webhooks/payments.py
+import hashlib
+import hmac
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel, ValidationError
+
+from .config import settings
+from .dependencies import get_redis, get_db
+from .models import WebhookEvent
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+# Constants
+MAX_BODY_SIZE = 1_048_000  # 1MB — reject oversized payloads
+SIGNATURE_TTL_SECONDS = 300  # 5-minute window for replay protection
+WEBHOOK_MAX_AGE_SECONDS = 300  # Reject webhooks older than 5 minutes
+SIGNATURE_HEADER = "X-Webhook-Signature"
+TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+EVENT_ID_HEADER = "X-Webhook-Id"
+
+
+class WebhookPayload(BaseModel):
+    """Validated payload structure — only define what you need."""
+    event_type: str
+    data: dict
+
+
+class WebhookResponse(BaseModel):
+    status: str
+    event_id: str
+
+
+def _verify_signature(raw_body: bytes, signature: str, timestamp: str) -> bool:
+    """
+    Verify HMAC-SHA256 signature on the RAW body bytes.
+    Uses the rotating secret based on the timestamp to select the correct key.
+    Constant-time comparison to prevent timing attacks.
+    """
+    # Build the signed payload: timestamp.body (prevents replay with different timestamp)
+    signed_payload = f"{timestamp}.{raw_body.decode('utf-8')}".encode('utf-8')
+
+    # Select secret based on rotation window
+    secret = _get_secret_for_timestamp(timestamp)
+    if not secret:
+        return False
+
+    expected = hmac.new(
+        secret.encode('utf-8'),
+        signed_payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+def _get_secret_for_timestamp(timestamp: str) -> Optional[str]:
+    """
+    Retrieve the valid secret for a given timestamp window.
+    Supports rotation: current + previous secret are both valid during transition.
+    """
+    try:
+        ts = int(timestamp)
+    except (ValueError, TypeError):
+        return None
+
+    now = int(time.time())
+    # Reject if timestamp is too far in the future (clock skew tolerance: 30s)
+    if ts > now + 30:
+        return None
+
+    # Current rotation window
+    current_window = now // settings.WEBHOOK_SECRET_ROTATION_SECONDS
+    request_window = ts // settings.WEBHOOK_SECRET_ROTATION_SECONDS
+
+    # Allow current and previous window (grace period during rotation)
+    if request_window == current_window:
+        return settings.WEBHOOK_SECRET_CURRENT
+    elif request_window == current_window - 1:
+        return settings.WEBHOOK_SECRET_PREVIOUS
+
+    return None
+
+
+async def _is_replay(event_id: str, redis) -> bool:
+    """
+    Atomic check-and-set for replay prevention.
+    Returns True if this event_id was already processed.
+    Uses SET NX EX for atomicity across concurrent workers.
+    """
+    # SET NX: only succeeds if key doesn't exist. EX: auto-expire after TTL.
+    was_set = await redis.set(
+        f"webhook:event:{event_id}",
+        "1",
+        nx=True,  # Only set if not exists
+        ex=SIGNATURE_TTL_SECONDS  # Auto-cleanup
+    )
+    # If was_set is None, the key already existed → replay
+    return was_set is None
+
+
+async def _acquire_processing_lock(event_id: str, redis) -> bool:
+    """
+    Acquire a lock for concurrent idempotency.
+    Prevents two workers from processing the same event simultaneously.
+    """
+    acquired = await redis.set(
+        f"webhook:lock:{event_id}",
+        "1",
+        nx=True,
+        ex=30  # Lock expires after 30s (processing timeout)
+    )
+    return acquired is not None
+
+
+async def _release_processing_lock(event_id: str, redis):
+    await redis.delete(f"webhook:lock:{event_id}")
+
+
+@router.post("/payments", response_model=WebhookResponse)
+async def payment_webhook(
+    request: Request,
+    x_webhook_signature: str = Header(..., alias=SIGNATURE_HEADER),
+    x_webhook_timestamp: str = Header(..., alias=TIMESTAMP_HEADER),
+    x_webhook_id: str = Header(..., alias=EVENT_ID_HEADER),
+    redis=Depends(get_redis),
+    db=Depends(get_db),
+):
+    """
+    Payment webhook endpoint with:
+    - HMAC-SHA256 signature verification on raw bytes (BEFORE parsing)
+    - Timestamp-based expiry (reject stale requests)
+    - Atomic replay prevention via Redis SET NX
+    - Concurrent idempotency via processing locks
+    - Generic error responses (no internal leakage)
+    """
+
+    # ── Step 1: Read raw body (do NOT parse yet) ──────────────────────
+    raw_body = await request.body()
+
+    # ── Step 2: Size check (before any processing) ────────────────────
+    if len(raw_body) > MAX_BODY_SIZE:
+        logger.warning("Oversized webhook rejected", extra={
+            "event_id": x_webhook_id,
+            "size": len(raw_body),
+            "source_ip": request.client.host,
+        })
+        raise HTTPException(status_code=413, detail="Payload too large")
+
+    # ── Step 3: Verify signature on RAW bytes (BEFORE parsing) ────────
+    if not _verify_signature(raw_body, x_webhook_signature, x_webhook_timestamp):
+        logger.warning("Invalid webhook signature", extra={
+            "event_id": x_webhook_id,
+            "source_ip": request.client.host,
+        })
+        # Generic 400 — don't reveal whether it was signature or timestamp
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    # ── Step 4: Check webhook age (reject stale timestamps) ───────────
+    try:
+        webhook_time = int(x_webhook_timestamp)
+        age = abs(int(time.time()) - webhook_time)
+        if age > WEBHOOK_MAX_AGE_SECONDS:
+            logger.warning("Stale webhook rejected", extra={
+                "event_id": x_webhook_id,
+                "age_seconds": age,
+            })
+            raise HTTPException(status_code=400, detail="Invalid request")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    # ── Step 5: Replay check (atomic SET NX) ──────────────────────────
+    if await _is_replay(x_webhook_id, redis):
+        logger.info("Duplicate webhook ignored", extra={
+            "event_id": x_webhook_id,
+        })
+        # Return 200 to prevent processor retries — we already processed this
+        return WebhookResponse(status="already_processed", event_id=x_webhook_id)
+
+    # ── Step 6: Acquire processing lock (concurrent idempotency) ──────
+    if not await _acquire_processing_lock(x_webhook_id, redis):
+        # Another worker is processing this event — return 202 to signal acceptance
+        # The other worker will persist the result
+        logger.info("Concurrent duplicate detected", extra={
+            "event_id": x_webhook_id,
+        })
+        return WebhookResponse(status="processing", event_id=x_webhook_id)
+
+    try:
+        # ── Step 7: NOW parse and validate the body ───────────────────
+        try:
+            payload = WebhookPayload.model_validate_json(raw_body)
+        except ValidationError as e:
+            logger.warning("Invalid webhook payload structure", extra={
+                "event_id": x_webhook_id,
+                "errors": e.errors(),
+            })
+            raise HTTPException(status_code=422, detail="Invalid payload")
+
+        # ── Step 8: Process the webhook (your business logic) ─────────
+        result = await _process_payment_event(payload, x_webhook_id, db)
+
+        # ── Step 9: Persist to database for audit trail ───────────────
+        await db.webhook_events.insert_one(WebhookEvent(
+            event_id=x_webhook_id,
+            event_type=payload.event_type,
+            processed_at=datetime.now(timezone.utc),
+            payload=payload.data,
+            result=result,
+        ).model_dump())
+
+        logger.info("Webhook processed successfully", extra={
+            "event_id": x_webhook_id,
+            "event_type": payload.event_type,
+        })
+
+        return WebhookResponse(status="processed", event_id=x_webhook_id)
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is (they're already sanitized)
+        raise
+
+    except Exception as e:
+        # ── CRITICAL: Catch-all to prevent error leakage ──────────────
+        logger.exception("Unhandled webhook processing error", extra={
+            "event_id": x_webhook_id,
+            "error_type": type(e).__name__,
+            # Log the actual error internally — never to the client
+        )
+        # Remove the replay marker so the processor can retry
+        await redis.delete(f"webhook:event:{x_webhook_id}")
+        # Generic response — no internal details exposed
+        raise HTTPException(
+            status_code=500,
+            detail="Internal processing error"
+        )
+
+    finally:
+        # Always release the lock
+        await _release_processing_lock(x_webhook_id, redis)
+
+
+async def _process_payment_event(
+    payload: WebhookPayload,
+    event_id: str,
+    db,
+) -> dict:
+    """Your actual business logic here."""
+    handlers = {
+        "payment.success": _handle_payment_success,
+        "payment.failed": _handle_payment_failed,
+        "payment.refunded": _handle_payment_refunded,
+    }
+
+    handler = handlers.get(payload.event_type)
+    if not handler:
+        logger.warning("Unknown event type", extra={
+            "event_id": event_id,
+            "event_type": payload.event_type,
+        })
+        raise HTTPException(status_code=422, detail="Unknown event type")
+
+    return await handler(payload.data, db)
+```
+
+```python
+# webhooks/config.py
+from pydantic_settings import BaseSettings
+
+
+class WebhookSettings(BaseSettings):
+    # Rotating secrets — load from environment, never hardcode
+    WEBHOOK_SECRET_CURRENT: str
+    WEBHOOK_SECRET_PREVIOUS: str = ""  # Empty if no rotation in progress
+    WEBHOOK_SECRET_ROTATION_SECONDS: int = 86400  # Daily rotation
+
+    class Config:
+        env_file = ".env"
+        env_prefix = ""
+
+
+settings = WebhookSettings()
+```
+
+```python
+# webhooks/dependencies.py
+import redis.asyncio as redis
+from fastapi import Request
+
+
+async def get_redis(request: Request) -> redis.Redis:
+    """Dependency-injected Redis connection."""
+    return request.app.state.redis
+
+
+async def get_db(request: Request):
+    """Dependency-injected database connection."""
+    return request.app.state.db
+```
+
+```python
+# webhooks/models.py
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class WebhookEvent(BaseModel):
+    event_id: str
+    event_type: str
+    processed_at: datetime
+    payload: dict
+    result: dict
+```
+
+```python
+# tests/test_webhook_security.py
+import hashlib
+import hmac
+import json
+import time
+
+import pytest
+from httpx import AsyncClient
+
+
+def _sign_payload(body: bytes, secret: str, timestamp: str) -> str:
+    signed = f"{timestamp}.{body.decode()}".encode()
+    return hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_rejects_oversized_payload(client: AsyncClient):
+    """Must reject payloads exceeding size limit BEFORE processing."""
+    huge_body = b"{" + b'"x":' * 100000
+    response = await client.post(
+        "/webhooks/payments",
+        content=huge_body,
+        headers={
+            "X-Webhook-Signature": "any",
+            "X-Webhook-Timestamp": str(int(time.time())),
+            "X-Webhook-Id": "test-001",
+        },
+    )
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_rejects_invalid_signature(client: AsyncClient):
+    """Must reject requests with invalid HMAC before parsing body."""
+    body = json.dumps({"event_type": "payment.success", "data": {}}).encode()
+    response = await client.post(
+        "/webhooks/payments",
+        content=body,
+        headers={
+            "X-Webhook-Signature": "invalid_signature",
+            "X-Webhook-Timestamp": str(int(time.time())),
+            "X-Webhook-Id": "test-002",
+        },
+    )
+    assert response.status_code == 400
+    # Must NOT reveal which check failed
+    assert "signature" not in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_rejects_stale_timestamp(client: AsyncClient):
+    """Must reject webhooks older than the max age window."""
+    body = json.dumps({"event_type": "payment.success", "data": {}}).encode()
+    old_timestamp = str(int(time.time()) - 600)  # 10 minutes old
+    signature = _sign_payload(body, "secret", old_timestamp)
+
+    response = await client.post(
+        "/webhooks/payments",
+        content=body,
+        headers={
+            "X-Webhook-Signature": signature,
+            "X-Webhook-Timestamp": old_timestamp,
+            "X-Webhook-Id": "test-003",
+        },
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_replays_return_200(client: AsyncClient, redis):
+    """Duplicate event IDs must return 200 (not error) to prevent retries."""
+    body = json.dumps({"event_type": "payment.success", "data": {}}).encode()
+    timestamp = str(int(time.time()))
+    signature = _sign_payload(body, "secret", timestamp)
+    headers = {
+        "X-Webhook-Signature": signature,
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Id": "test-004",
+    }
+
+    # First request: should process
+    r1 = await client.post("/webhooks/payments", content=body, headers=headers)
+    assert r1.status_code == 200
+    assert r1.json()["status"] == "processed"
+
+    # Second request (replay): should return already_processed
+    r2 = await client.post("/webhooks/payments", content=body, headers=headers)
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "already_processed"
+
+
+@pytest.mark.asyncio
+async def test_error_responses_are_generic(client: AsyncClient):
+    """Internal errors must NOT leak details to the client."""
+    # Send valid signature but invalid JSON structure
+    body = json.dumps({"not_a_valid_field": "value"}).encode()
+    timestamp = str(int(time.time()))
+    signature = _sign_payload(body, "secret", timestamp)
+
+    response = await client.post(
+        "/webhooks/payments",
+        content=body,
+        headers={
+            "X-Webhook-Signature": signature,
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Id": "test-005",
+        },
+    )
+    assert response.status_code in (400, 422)
+    # Must not contain internal details
+    detail = response.json().get("detail", "")
+    assert "traceback" not in detail.lower()
+    assert "exception" not in detail.lower()
+    assert "stack" not in detail.lower()
+```
+
+## Key Security Properties
+
+| Property | Implementation |
+|----------|---------------|
+| **Signature on raw bytes** | `hmac.new()` on `timestamp.body` before any parsing |
+| **Timing-safe comparison** | `hmac.compare_digest()` — not `==` |
+| **Replay prevention** | Redis `SET NX EX` — atomic across workers |
+| **Concurrent idempotency** | Processing lock via `SET NX` with TTL |
+| **Secret rotation** | Current + previous secret both valid during transition |
+| **Stale request rejection** | Timestamp must be within 5-minute window |
+| **Error containment** | Catch-all returns generic 500, logs internally |
+| **Size limit** | 1MB cap before any processing |
+| **Auto-cleanup** | Redis TTL on replay markers prevents unbounded growth |

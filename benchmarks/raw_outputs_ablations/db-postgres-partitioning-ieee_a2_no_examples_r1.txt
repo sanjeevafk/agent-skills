@@ -1,0 +1,562 @@
+# Zero-Downtime Declarative Partitioning Migration: `audit_logs` (500M rows)
+
+---
+
+## 1. Pre-Migration Audit & Baseline
+
+```sql
+-- Verify current state before touching anything
+SELECT
+    schemaname, relname,
+    n_live_tup::bigint AS estimated_rows,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size,
+    pg_size_pretty(pg_relation_size(schemaname || '.' || relname)) AS table_size
+FROM pg_stat_user_tables
+WHERE relname = 'audit_logs';
+
+-- Identify existing indexes, constraints, triggers
+SELECT indexname, indexdef
+FROM pg_indexes WHERE tablename = 'audit_logs';
+
+-- Check for foreign keys, rules, views referencing audit_logs
+SELECT
+    rdef.relname          AS dependent_name,
+    rdef.relkind          AS object_type,
+    pg_get_constraintdef(c.oid) AS constraint_def
+FROM pg_depend d
+JOIN pg_class rdef ON rdef.oid = d.objid
+LEFT JOIN pg_constraint c ON c.oid = d.refobjid
+WHERE d.refclassid = 'pg_class'::regclass
+  AND d.refobjid = 'audit_logs'::regclass
+  AND d.deptype = 'n';
+```
+
+**Safety checklist**: confirm row count, capture sizes, catalog all dependents. If FKs exist, they must be re-created on the partitioned table before switching.
+
+---
+
+## 2. Target Schema — Monthly Range Partitions
+
+```sql
+-- ── 2a. Create the partitioned parent (no data) ──
+CREATE TABLE audit_logs_partitioned (
+    id          bigint       NOT NULL,
+    tenant_id   bigint       NOT NULL,
+    user_id     bigint,
+    action      text         NOT NULL,
+    resource_type text       NOT NULL,
+    resource_id text,
+    payload     jsonb        NOT NULL DEFAULT '{}'::jsonb,
+    ip_address  inet,
+    user_agent  text,
+    occurred_at timestamptz  NOT NULL DEFAULT now(),
+    created_at  timestamptz  NOT NULL DEFAULT now()
+) PARTITION BY RANGE (occurred_at);
+
+-- Add the primary key (partition column MUST be part of PK)
+ALTER TABLE audit_logs_partitioned
+    ADD CONSTRAINT audit_logs_pk
+    PRIMARY KEY (occurred_at, id);
+
+-- Essential unique/constrained indexes
+ALTER TABLE audit_logs_partitioned
+    ADD CONSTRAINT audit_logs_tenant_action_idx
+    UNIQUE (tenant_id, occurred_at, id);
+
+-- ── 2b. Create historical partitions (adjust ranges to match your data span) ──
+-- Pattern: [start, end) for each month
+
+CREATE TABLE audit_logs_y2021m01 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2021-01-01') TO ('2021-02-01');
+CREATE TABLE audit_logs_y2021m02 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2021-02-01') TO ('2021-03-01');
+CREATE TABLE audit_logs_y2021m03 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2021-03-01') TO ('2021-04-01');
+-- ... generate for every month you have data ...
+CREATE TABLE audit_logs_y2026m09 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+-- Current month + next two months as a buffer
+CREATE TABLE audit_logs_y2026m10 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE audit_logs_y2026m11 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+```
+
+> **Note**: Use the script in §2b-Auto to generate these, then run them as one transaction.
+
+### 2b-Auto: Generate Partition DDL Programmatically
+
+```sql
+-- Generates CREATE TABLE statements for monthly partitions covering
+-- min(occurred_at) through max(occurred_at) from the old table,
+-- plus 2 future months as a default safety buffer.
+
+WITH date_range AS (
+    SELECT
+        date_trunc('month', min(occurred_at))   AS first_month,
+        date_trunc('month', max(occurred_at))   AS last_month,
+        date_trunc('month', now())              AS current_month,
+        date_trunc('month', now() + interval '2 months') AS future_end
+    FROM audit_logs
+)
+SELECT format(
+    'CREATE TABLE IF NOT EXISTS audit_logs_%s PARTITION OF audit_logs_partitioned FOR VALUES FROM (%L) TO (%L);',
+    to_char(m, "YYYY" || "MM"),
+    m,
+    m + interval '1 month'
+) AS create_stmt
+FROM date_range,
+     generate_series(date_range.first_month, date_range.last_month, interval '1 month') AS m;
+```
+
+Review the output, copy-paste into a migration file, and execute.
+
+---
+
+## 3. Backfill Strategy — Incremental, Low-Lock Copy
+
+The core challenge: move 500M rows without holding long locks or blocking inserts. The strategy uses the old table's `id` as the chunking key with a cursor-driven loop.
+
+```sql
+-- ── 3a. Disable triggers on target during copy to speed things up ──
+ALTER TABLE audit_logs_partitioned DISABLE TRIGGER ALL;
+
+-- ── 3b. The backfill procedure ──
+DO $$
+DECLARE
+    v_chunk_start  BIGINT := (SELECT COALESCE(MAX(id), 0) FROM audit_logs_partitioned) + 1;
+    v_low          BIGINT;
+    v_high         BIGINT;
+    v_count        BIGINT := 0;
+    v_min_id       BIGINT := (SELECT MIN(id) FROM audit_logs);
+    v_max_id       BIGINT := (SELECT MAX(id) FROM audit_logs);
+    v_batch_size   CONSTANT BIGINT := 50000;  -- tune based on your hardware / pg settings
+    v_elapsed      INTERVAL;
+BEGIN
+    -- Safety: if no data, bail
+    IF v_min_id IS NULL THEN
+        RAISE NOTICE 'No rows to migrate';
+        RETURN;
+    END IF;
+
+    WHILE v_chunk_start <= v_max_id LOOP
+        BEGIN
+            v_low  := v_chunk_start;
+            v_high := LEAST(v_chunk_start + v_batch_size - 1, v_max_id);
+
+            -- Single-row INSERT with a statement-level lock timeout
+            INSERT INTO audit_logs_partitioned (
+                id, tenant_id, user_id, action, resource_type,
+                resource_id, payload, ip_address, user_agent,
+                occurred_at, created_at
+            )
+            SELECT
+                id, tenant_id, user_id, action, resource_type,
+                resource_id, payload, ip_address, user_agent,
+                occurred_at, created_at
+            FROM audit_logs
+            WHERE id BETWEEN v_low AND v_high
+              AND NOT EXISTS (
+                  SELECT 1 FROM audit_logs_partitioned p
+                  WHERE p.id = audit_logs.id
+              )
+            ON CONFLICT (occurred_at, id) DO NOTHING
+            ;
+
+            GET DIAGNOSTICS v_count = ROW_COUNT;
+
+            COMMIT;  -- release row locks immediately
+
+            UPDATE pg_stat_progress_insert
+               SET query_state = 'copying tuples'
+             WHERE phase = 'copying tuples';  -- visibility hook only
+
+            PERFORM pg_sleep(0);  -- yield scheduler
+
+            IF mod(v_count, 100000) = 0 THEN
+                RAISE NOTICE 'Backfilled % total rows so far (chunk %..% -> %, % rows)',
+                    v_high - v_min_id + 1, v_low, v_high, v_count;
+            END IF;
+
+            v_chunk_start := v_high + 1;
+        EXCEPTION WHEN OTHERS THEN
+            -- Log but don't abort the whole migration
+            RAISE WARNING 'Batch %..% failed: %', v_low, v_high, SQLERRM;
+            ROLLBACK;
+            PERFORM pg_sleep(1);
+        END;
+    END LOOP;
+
+    RAISE NOTICE 'Backfill complete. Total migrated: %, Estimated source: %',
+        v_max_id - v_min_id + 1, v_max_id - v_min_id + 1;
+END $$;
+```
+
+**Key design decisions:**
+| Decision | Rationale |
+|----------|-----------|
+| `id`-based chunks (not time-based) | Avoids hot-spotting; parallelizable across tenants |
+| `ON CONFLICT ... DO NOTHING` | Idempotent by design — safe to retry partial failures |
+| 50k batch size | ~1-2 sec per batch at typical write throughput; adjusts via `v_batch_size` |
+| `COMMIT` after each batch | Prevents WAL bloat; releases deadlocks instantly |
+| `statement_timeout = 10s` set session-wide | Prevents runaway batches from starving writes |
+
+Set this in your connection before running:
+```sql
+SET statement_timeout = '10s';
+SET lock_timeout = '5s';
+SET idle_in_transaction_session_timeout = '30s';
+```
+
+---
+
+## 4. Concurrent Index Creation (Postgres ≥ 12)
+
+Build indexes on partitions concurrently so reads aren't blocked:
+
+```sql
+-- These are built on each existing partition individually.
+-- For new partitions created later, use pg_partman's defaults below.
+
+DO $$
+DECLARE
+    rec RECORD;
+BEGIN
+    FOR rec IN
+        SELECT inhrelid::regclass::text AS partition_name
+        FROM pg_inherits
+        WHERE inhparent = 'audit_logs_partitioned'::regclass
+    LOOP
+        EXECUTE format($$
+            CREATE INDEX CONCURRENTLY idx_%I_tenant_occurred_at
+            ON %I (tenant_id, occurred_at)
+        $$, rec.partition_name, rec.partition_name);
+
+        EXECUTE format($$
+            CREATE INDEX CONCURRENTLY idx_%I_resource
+            ON %I (resource_type, resource_id)
+        $$, rec.partition_name, rec.partition_name);
+
+        EXECUTE format($$
+            CREATE INDEX CONCURRENTLY idx_%I_payload_gin
+            ON %I USING gin (payload)
+        $$, rec.partition_name, rec.partition_name);
+    END LOOP;
+END $$;
+```
+
+For GIN indexes on JSONB, consider adding a `gin_trunc_ops` modifier if values are very large to reduce index size by ~30%.
+
+---
+
+## 5. Data Validation & Cutover
+
+### 5a. Row counts and spot-checks
+
+```sql
+-- Overall parity check
+SELECT
+    (SELECT COUNT(*) FROM audit_logs)                           AS old_total,
+    (SELECT COUNT(*) FROM audit_logs_partitioned)               AS new_total,
+    abs(
+        (SELECT COUNT(*) FROM audit_logs) -
+        (SELECT COUNT(*) FROM audit_logs_partitioned)
+    )                                                            AS diff,
+    CASE
+        WHEN (SELECT COUNT(*) FROM audit_logs) =
+             (SELECT COUNT(*) FROM audit_logs_partitioned)
+        THEN 'PASS' ELSE 'FAIL'
+    END                                                          AS status;
+
+-- Per-month distribution comparison
+SELECT
+    date_trunc('month', occurred_at)::date AS month_start,
+    COUNT(*) FILTER (WHERE id IN (SELECT id FROM audit_logs)) AS old_count,
+    COUNT(*)                                                             AS new_count
+FROM audit_logs_partitioned
+GROUP BY 1
+ORDER BY 1
+HAVING COUNT(*) FILTER (WHERE id IN (SELECT id FROM audit_logs)) != COUNT(*);
+-- Above should return zero rows
+
+-- Spot-check random sample: pick 10 IDs and compare payloads byte-for-byte
+SELECT
+    old.id,
+    old.payload IS NOT DISTINCT FROM newt.payload AS payload_match
+FROM LATERAL (
+    SELECT * FROM audit_logs ORDER BY random() LIMIT 10
+) old
+JOIN LATERAL (
+    SELECT * FROM audit_logs_partitioned WHERE id = old.id
+) newt ON TRUE;
+```
+
+### 5b. Table Swap (atomic switch)
+
+Wrap in a single transaction that holds a short exclusive lock:
+
+```sql
+BEGIN;
+
+-- 1. Block ALL writes for < 5 seconds
+LOCK TABLE audit_logs IN EXCLUSIVE MODE;
+LOCK TABLE audit_logs_partitioned IN ACCESS EXCLUSIVE MODE;
+
+-- 2. Final incremental sync (catches last N inserts)
+INSERT INTO audit_logs_partitioned (
+    id, tenant_id, user_id, action, resource_type,
+    resource_id, payload, ip_address, user_agent,
+    occurred_at, created_at
+)
+SELECT id, tenant_id, user_id, action, resource_type,
+       resource_id, payload, ip_address, user_agent,
+       occurred_at, created_at
+FROM audit_logs o
+WHERE NOT EXISTS (
+    SELECT 1 FROM audit_logs_partitioned p WHERE p.id = o.id
+)
+ON CONFLICT (occurred_at, id) DO NOTHING;
+
+-- 3. Atomic rename swap
+ALTER TABLE audit_logs        RENAME TO audit_logs_old;
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+COMMIT;
+
+-- 4. Re-enable triggers (do it AFTER the swap)
+ALTER TABLE audit_logs ENABLE TRIGGER ALL;
+
+-- 5. Post-swap indexes on any newly created partitions (handled by pg_partman)
+```
+
+The `EXCLUSIVE LOCK` on the source table ensures the final catch-up window is measured in milliseconds, not minutes.
+
+### 5c. Rollback Plan (if something goes wrong within 10 minutes)
+
+```sql
+-- Quick rollback: reverse the renames
+BEGIN;
+LOCK TABLE audit_logs           IN EXCLUSIVE MODE;
+LOCK TABLE audit_logs_old       IN ACCESS EXCLUSIVE MODE;
+ALTER TABLE audit_logs_old       RENAME TO audit_logs_partitioned;
+ALTER TABLE audit_logs          RENAME TO audit_logs;
+COMMIT;
+-- Then restore app config to point at old connection string
+```
+
+---
+
+## 6. Partition Pruning Verification
+
+### 6a. Explain plan with pruning enabled
+
+```sql
+-- Show that partition pruning eliminates irrelevant branches
+EXPLAIN (COSTS OFF, ANALYZE, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE occurred_at BETWEEN '2023-06-01' AND '2023-06-30'
+  AND tenant_id = 42;
+
+-- Expected output includes only audit_logs_202306 in the Plan node list.
+-- Before fixing: you'd see multiple partitions scanned.
+-- After fixing: you see exactly the matched partition.
+```
+
+Look for `"Plan type: Result"` or partition names like `audit_logs_202306` in the actual scan nodes. If all expected partitions appear and none outside the range do — pruning works.
+
+### 6b. Programmatic pruning test suite
+
+```sql
+-- Returns true if pruning correctly limits to 1 partition for a given month query
+SELECT
+    CASE
+        WHEN sum(CASE WHEN parent.relname = 'audit_logs_partitioned' THEN 1 ELSE 0 END) = 0
+        AND count(*) >= 1
+        THEN 'PRUNING CORRECT'
+        ELSE 'PRUNING FAILED'
+    END AS result
+FROM pg_plan_querytrees(
+    'EXPLAIN SELECT 1 FROM audit_logs WHERE occurred_at >= ''2023-07-01'' AND occurred_at < ''2023-08-01'''
+)
+JOIN lateral unnest(plan) AS plan_node ON true
+JOIN lateral unnest(plan_node.scan_nodes) AS scan_node ON true
+JOIN lateral unnest(scan_node.relations) AS rel ON true
+JOIN pg_class parent ON rel.relid = parent.oid;
+
+-- Simplest valid approach: use set_config to disable pruning, then compare costs
+SET enable_partition_pruning = off;
+EXPLAIN (COSTS OFF) SELECT 1 FROM audit_logs
+    WHERE occurred_at >= '2023-07-01' AND occurred_at < '2023-08-01';
+-- Will show all partitions in plan
+
+SET enable_partition_pruning = on;
+EXPLAIN (COSTS OFF) SELECT 1 FROM audit_logs
+    WHERE occurred_at >= '2023-07-01' AND occurred_at < '2023-08-01';
+-- Should show only audit_logs_202307
+
+RESET enable_partition_pruning;
+```
+
+### 6c. Query routing confirmation for common access patterns
+
+```sql
+-- Point lookup on specific row (should hit exactly 1 partition)
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM audit_logs WHERE id = 123456789
+  AND occurred_at = '2023-06-15 14:30:00+00';
+
+-- Tenant-wide monthly scan (should hit 1 partition)
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM audit_logs
+WHERE tenant_id = 42
+  AND occurred_at >= '2023-06-01' AND occurred_at < '2023-07-01';
+
+-- Cross-month range (expected to scan >1 partition — verify cost)
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM audit_logs
+WHERE occurred_at >= '2023-01-01' AND occurred_at < '2023-12-31';
+```
+
+---
+
+## 7. Automated Future Partition Management with `pg_partman`
+
+### 7a. Install pg_partman
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA partman;
+
+-- Verify installation
+SELECT partman.check_extension_version();
+```
+
+### 7b. Configure automatic partition creation & management
+
+```sql
+-- Set default templates for the partitioned table
+SELECT partman.create_parent(
+    p_parent_table   := 'public.audit_logs_partitioned',
+    p_control        := 'occurred_at',
+    p_type           := 'range',
+    p_interval       := '1 month',
+    p_premake        := 4,              -- pre-create 4 months ahead
+    p_start_partition:= '2026-10-01'    -- start from current+future buffer
+);
+
+-- Set per-partition template (indexes, tablespace, etc.)
+UPDATE partman.part_config
+SET
+    infinite_time_partitions = false,       -- keep bounded
+    retention_schema         = null,
+    retention                  = '18 months',
+    retention_keep_table     = true,          -- soft-delete: keep data, drop partition
+    retention_keep_index     = true,
+    epoch                      = null,
+    preset_null_values         = '{}',
+    inherit_privileges         = true,
+    inherit_permissions        = true,
+    template_tablespaces       = '{audit_logs_ts}',
+    premake                      = 4
+WHERE parent_table = 'public.audit_logs_partitioned';
+```
+
+### 7c. Template table definition (auto-applied to new partitions)
+
+```sql
+-- Create the template partition once — pg_partman copies its structure
+-- to every new child automatically
+CREATE TABLE audit_logs_template (
+    LIKE audit_logs_partitioned INCLUDING ALL
+);
+
+-- Ensure template gets updated whenever we alter the parent schema
+-- pg_partman propagates template changes to children retroactively when
+-- alter_default_partitions = true
+UPDATE partman.part_config
+SET alter_default_partitions = true
+WHERE parent_table = 'public.audit_logs_partitioned';
+```
+
+### 7d. Scheduled maintenance job
+
+```sql
+-- Run hourly (or via cron/pg_cron)
+-- This creates future partitions and drops expired ones
+SELECT partman.run_maintenance('public.audit_logs_partitioned');
+
+-- Recommended crontab entry:
+-- 0 * * * *  psql -d yourdb -c "SELECT partman.run_maintenance('public.audit_logs_partitioned');"
+```
+
+### 7e. Full pg_partman configuration reference
+
+```sql
+-- View current config
+SELECT * FROM partman.part_config WHERE parent_table = 'public.audit_logs_partitioned';
+
+-- Verify which partitions exist right now
+SELECT partition_table_name, partition_from, partition_to
+FROM partman.partitions
+WHERE parent_table = 'public.audit_logs_partitioned'
+ORDER BY partition_from DESC
+LIMIT 20;
+```
+
+---
+
+## 8. Monitoring & Observability
+
+```sql
+-- Monitor partition health over time
+SELECT
+    schemaname,
+    relname AS partition_name,
+    n_live_tup,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)),
+    seq_scan,
+    idx_scan
+FROM pg_stat_user_tables
+WHERE relname LIKE 'audit_logs_%'
+ORDER BY n_live_tup DESC;
+
+-- Detect unpartitioned rows leaking into the parent
+SELECT count(*) AS orphan_rows
+FROM audit_logs_partitioned
+WHERE ctid IN (
+    SELECT ctid FROM audit_logs_partitioned
+    GROUP BY ctid HAVING count(*) > 1
+);
+
+-- Watch pg_partman's internal state
+SELECT * FROM partman.part_config_watch
+WHERE parent_table = 'public.audit_logs_partitioned';
+```
+
+---
+
+## 9. Complete Migration Timeline Summary
+
+| Phase | Duration | Lock Type | Blocks Writes? |
+|-------|----------|-----------|----------------|
+| Deploy partitioned table DDL | Instant | AccessExclusive on parent only | No (empty table) |
+| Concurrent backfill loop | Hours (batch by batch) | None (row-level only) | No |
+| Concurrent index builds | Minutes each | ShareUpdateExclusive (concurrent) | No |
+| Validation | Seconds | None | No |
+| Atomic swap | < 5 sec | Exclusive | **Yes (brief)** |
+| Cleanup (drop old table) | Instant | AccessExclusive | No |
+
+Total application downtime: **sub-5-second atomic swap window**, achievable during low-traffic hours. The entire backfill runs transparently alongside live traffic.
+
+---
+
+## 10. Risk Mitigation Matrix
+
+| Risk | Mitigation |
+|------|-----------|
+| Backfill falls behind live inserts | `ON CONFLICT DO NOTHING` makes final sync trivial; rerunnable |
+| OOM during large batches | 50k batch size ≈ 50MB; tune `work_mem` to 256MB+ |
+| WAL pressure | Stream checkpoints (`checkpoint_completion_target = 0.9`); monitor `pg_stat_activity` |
+| Partition count explosion | `retention = '18 months'` auto-drops old partitions via pg_partman |
+| App cache inconsistency during swap | Cache-invalidation sweep in the same transaction as the rename |
+| Index bloat from concurrent builds | Rebuild post-cutover if needed: `REINDEX CONCURRENTLY audit_logs_tenant_occurred_at_idx` |

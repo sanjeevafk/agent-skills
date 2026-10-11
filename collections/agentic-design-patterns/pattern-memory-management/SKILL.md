@@ -1,6 +1,6 @@
 ---
 name: pattern-memory-management
-description: Implement tiered agent memory: short-term working context, sliding window buffers, episodic vector retrieval, and persistent key-value state.
+description: "Implement tiered agent memory: short-term working context, sliding window buffers, episodic vector retrieval, and persistent key-value state."
 metadata:
   category: agent-architecture
   tier: advanced

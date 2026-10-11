@@ -1,0 +1,210 @@
+[exit=0 latency=23.44s]
+## Diagnosis & Solution
+
+### Root Cause Analysis (Node-by-Node)
+
+**Seq Scan on events →** The planner has no usable index. With 800M rows, every query does a full table scan. A Seq Scan reads sequentially (fast-ish), but scanning 800M rows just to find 2M matching rows is wasteful — you're reading ~40x more data than needed.
+
+**Sort Spilling to Disk →** The window function (`RANK() OVER (...)`) sorts rows in memory. When `work_mem` is exceeded (default 4MB), PostgreSQL spills to disk on `.tmp` files, which is orders of magnitude slower than RAM sorting.
+
+**Stale Estimates (expects 100, got 2M) →** `statistics_target` defaults to 100 samples per column. The planner sees skewed distribution (e.g., hot tenants, bursty event types) but only has 100 histogram buckets to model it. It wildly underestimates, picks a nested-loop join instead of a hash join, and plans for tiny result sets — compounding the disaster.
+
+---
+
+### Fix 1: Composite Index (Priority #1)
+
+```sql
+-- PRIMARY FIX: Covers the WHERE + ORDER BY for the window function
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_tenant_event_created
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+**Why this column order:**
+- `tenant_id` first — high-cardinality equality filter, narrows from 800M → tens/hundreds of millions
+- `event_type` second — another equality filter, further narrows
+- `created_at` third — range filter comes LAST in B-tree ordering (B-trees support one range predicate per index). Also provides natural sort order for `RANK() OVER (PARTITION BY tenant_id, event_type ORDER BY created_at)` — avoids an explicit sort entirely
+
+**Composite indexes are ordered because a B-tree is a sorted tree.** You can efficiently seek on `(tenant_id = X, event_type = 'click')` and then read all rows in `created_at` order without re-sorting. But `(created_at, tenant_id, event_type)` would force a full scan within the time range to filter by tenant — the exact opposite of what you want when tenant selectivity is much higher than time-range selectivity.
+
+---
+
+### Fix 2: Covering Index (Eliminates Heap Fetches)
+
+```sql
+-- Optional but powerful if the query selects key columns frequently
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, payload, id);
+-- Replace payload/id with whatever columns your query SELECTs
+```
+
+**INCLUDE eliminates heap fetches** — normally after reading an index entry, Postgres follows the TID back to the heap row to get other columns. With INCLUDE, those columns live in the index leaf pages, so the query is satisfied purely from the index (a "Index Only Scan"). Tradeoff: larger index = more I/O for random access, but faster sequential scans. Worth it if you select 5+ columns beyond the index keys.
+
+---
+
+### Fix 3: Partial Index (If Data Is Skewed in Time)
+
+```sql
+-- Only if >80% of events are <6 months old and queries always hit recent data
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_recent
+  ON events (tenant_id, event_type, created_at DESC)
+  WHERE created_at >= NOW() - INTERVAL '6 months';
+```
+
+A partial index is physically smaller (only recent rows), so it fits in cache better. But it only helps queries whose WHERE clause matches the `WHERE` condition. Test with `EXPLAIN` — if the plan shows "Index Condition" referencing the partial index, it's being used.
+
+---
+
+### Fix 4: Stale Statistics (Fix Cardinality Estimates)
+
+```sql
+-- Immediate fix:
+ANALYZE events;
+ANALYZE users;
+
+-- Persistent fix: increase sampling density on skewed columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;   -- default 100
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- Then refresh stats (requires reconnect or ANALYZE):
+ANALYZE events;
+ANALYZE users;
+```
+
+With `STATISTICS 1000`, Postgres builds 10x more histogram buckets and MCV (most-common-values) lists, giving far more accurate estimates on skewed columns. The 100→1000 change alone often switches the planner from nested-loop→hash join.
+
+---
+
+### Fix 5: Partitioning Assessment
+
+**Should you partition by month? Here's the decision framework:**
+
+| Scenario | Verdict |
+|----------|---------|
+| Queries always filter `created_at` AND retention policy deletes old data | **YES** – partition pruning eliminates entire partitions |
+| Queries span multiple months without deletion | **Debatable** – adds complexity, marginal gain |
+| Table write rate < 50K events/sec | **NOT YET** – bloat and VACUUM cost grow linearly with partition count |
+| Table already 800M rows | **Consider, but test** – indexing a partitioned table is harder |
+
+**If partitioning is justified:**
+
+```sql
+-- Migration approach: create new partitioned table, move data, swap
+CREATE TABLE events_partitioned (
+  LIKE events INCLUDING ALL
+) PARTITION BY RANGE (created_at);
+
+-- Monthly partitions (create ahead, not online)
+CREATE TABLE events_y2024m01 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE events_y2024m02 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+-- ... continue for future months
+
+-- Each partition gets its own index automatically:
+-- CREATE INDEX on (tenant_id, event_type, created_at) runs once per partition
+-- Smaller individual tables = faster seq scans + better cache locality
+
+-- Swap atomically:
+ALTER TABLE events RENAME TO events_old;
+ALTER TABLE events_partitioned RENAME TO events;
+```
+
+Partitioning doesn't speed up unpartitioned queries (they still scan all partitions), but combined with `created_at` range filters, partition pruning can eliminate 90%+ of the table before the index even kicks in.
+
+---
+
+### Fix 6: Rewritten Query
+
+```sql
+WITH ranked_events AS MATERIALIZED (
+    SELECT
+        e.id,
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        e.user_id,
+        e.payload,
+        RANK() OVER (
+            PARTITION BY e.tenant_id, e.event_type
+            ORDER BY e.created_at DESC
+        ) AS event_rank
+    FROM events e
+    WHERE e.tenant_id = $1
+      AND e.event_type = ANY($2::text[])              -- parameterized list
+      AND e.created_at >= $3                          -- range start
+      AND e.created_at <  $4                          -- range end (exclusive)
+)
+SELECT
+    r.*,
+    u.email,
+    u.name,
+    u.tier
+FROM ranked_events r
+JOIN users u ON u.id = r.user_id
+WHERE r.event_rank <= 100                          -- push filter down into CTE
+ORDER BY r.tenant_id, r.event_type, r.created_at DESC;
+```
+
+**Key decisions explained:**
+
+- **`MATERIALIZED` CTE** — tells the planner "execute this once, store results, don't inline." Without this, Postgres (v12+) tries to merge/push down the CTE into the outer query, which can explode the plan. Since the window function computes ranks over the filtered set, materializing prevents the outer `WHERE event_rank <= 100` from being mis-pushed above the window function.
+
+- **Push `event_rank <= 100` inside the CTE?** If you only need top-100 per group, add `FETCH FIRST 100 ROWS WITH TIES` or filter inside:
+```sql
+WHERE r.event_rank <= 100
+```
+This lets the sort abort early if Postgres uses `Top-N Heapsort`. But window functions must compute the FULL ranking first — so this filter only matters for the outer `SELECT`, not the sort itself. For true early-exit, use a different approach (see below).
+
+- **`ANY($2::text[])`** instead of `IN (...)` — cleaner array binding, same plan.
+
+- **`<` for end bound** instead of `<=` — avoids inclusive/exclusive confusion and works correctly with timestamps that have sub-second precision.
+
+- **Index-driven sort elimination** — because the index order `(tenant_id, event_type, created_at DESC)` matches the `PARTITION BY / ORDER BY` of the window function, Postgres can often skip the explicit sort node entirely and read rows in the right order from the index.
+
+**Aggressive optimization — if you truly only need TOP-N per group:**
+
+```sql
+-- Avoid computing full ranks: use lateral join with LIMIT
+SELECT
+    e.id,
+    e.tenant_id,
+    e.event_type,
+    e.created_at,
+    e.user_id,
+    e.payload,
+    (SELECT COUNT(*)
+     FROM events e2
+     WHERE e2.tenant_id = e.tenant_id
+       AND e2.event_type = e.event_type
+       AND e2.created_at >= e.created_at          -- same-or-later events
+    ) AS event_rank,
+    u.email, u.name, u.tier
+FROM events e
+WHERE e.tenant_id = $1
+  AND e.event_type = ANY($2::text[])
+  AND e.created_at >= $3 AND e.created_at < $4
+  AND (SELECT COUNT(*)
+       FROM events e2
+       WHERE e2.tenant_id = e.tenant_id
+         AND e2.event_type = e.event_type
+         AND e2.created_at >= e.created_at
+      ) <= 100                                   -- prune eagerly
+JOIN users u ON u.id = e.user_id
+ORDER BY e.tenant_id, e.event_type, e.created_at DESC;
+```
+This uses the same index for both sides of the correlated subquery, but can short-circuit once `event_rank > 100`. Benchmark both approaches — sometimes the window function + materialized CTE is faster because the correlated subquery does O(n²) index lookups.
+
+---
+
+### Summary of Recommended Order
+
+1. **`CREATE INDEX CONCURRENTLY`** on `(tenant_id, event_type, created_at DESC)` — biggest single impact
+2. **`ALTER TABLE ... SET STATISTICS 1000`** + **`ANALYZE`** — fixes the 100 vs 2M estimate gap
+3. **Verify with `EXPLAIN (ANALYZE, BUFFERS)`** — confirm Index Scan replaces Seq Scan, Sort no longer spills
+4. **Add `INCLUDE` columns** if heap fetches are still dominant (check `Buffers: heap=...` in EXPLAIN output)
+5. **Rewrite query** with `MATERIALIZED` CTE and proper parameterization
+6. **Consider partitioning** only if you have DELETE/retention policies OR >70% of queries hit narrow `created_at` windows
+
+Expected outcome: 40s → 200-500ms with steps 1-5. Partitioning (step 6) can push it lower for time-bounded queries but adds operational overhead.

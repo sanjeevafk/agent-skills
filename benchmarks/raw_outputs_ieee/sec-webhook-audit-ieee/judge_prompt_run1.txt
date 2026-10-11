@@ -1,0 +1,891 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+Security-review a FastAPI payment webhook endpoint that accepts POSTs from a third-party processor. It must verify HMAC signatures against a rotating secret, reject replayed deliveries using an event-id ledger, enforce idempotent processing under concurrent duplicate webhooks, and avoid leaking processor errors to clients. The current implementation verifies the signature AFTER parsing the JSON body and stores replay-ids in an in-memory dict. Identify the vulnerabilities in order of severity, then provide a corrected implementation with code.
+
+---
+[Response A]:
+**Verifying signatures over parsed JSON and relying on an in-memory replay ledger exposes the endpoint to double-spend replays across worker processes and unauthenticated denial-of-service.**
+
+---
+
+### Vulnerability Analysis (Ordered by Severity)
+
+**1 → In-memory replay ledger fails across multi-worker deployments and restarts.** In-memory dictionaries are isolated to a single process. In multi-worker ASGI environments (e.g., Uvicorn with multiple workers or Kubernetes pods), duplicate webhooks routed to different workers will bypass the check and execute duplicate financial actions.
+
+**2 → Lack of atomic lock allows concurrent duplicate race conditions.** A non-atomic check-then-insert pattern allows simultaneous duplicate webhooks to pass the replay check before either records the event, causing double processing.
+
+**3 → Parsing JSON before HMAC verification creates unauthenticated resource exhaustion and payload mutation.** Deserializing unauthenticated payloads exposes the server to CPU/memory exhaustion (JSON bombs). Re-serializing parsed data alters whitespace and key order, invalidating HMAC verification. HMAC must always run directly on raw incoming bytes (`request.body()`).
+
+**4 → Inflexible single-secret verification breaks payment ingestion during key rotations.** Verifying against only one secret forces zero-tolerance cutovers, dropping legitimate webhooks sent during secret transitions. The verifier must evaluate candidate secrets (current and previous) in a defined rotation window.
+
+**5 → Missing timestamp validation allows replay of validly signed historical payloads.** Without validating a signed timestamp header (e.g., rejecting events older than 300 seconds), an attacker capturing a valid payload can replay it once the ledger key expires.
+
+**6 → Verbose exception responses leak processor and database internals.** Propagating raw exceptions or stack traces to the caller exposes internal system topology and database structures to external clients.
+
+---
+
+### Corrected Implementation
+
+```python
+import hmac
+import hashlib
+import json
+import logging
+import time
+from typing import Optional, Set
+from fastapi import FastAPI, Request, HTTPException, status, Header
+from fastapi.responses import JSONResponse
+import redis.asyncio as redis
+
+logger = logging.getLogger("payment_webhook")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+# Configuration
+SIGNATURE_TOLERANCE_SECONDS = 300
+EVENT_LOCK_TTL_SECONDS = 86400  # 24-hour retention for replay ledger
+
+# Active and retiring secrets for seamless rotation
+WEBHOOK_SECRETS: Set[str] = {
+    "whsec_primary_live_current_key_2026",
+    "whsec_secondary_retiring_key_2026",
+}
+
+# Distributed Redis client for atomic state and idempotency
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+
+def verify_hmac_signature(
+    raw_body: bytes,
+    timestamp: str,
+    signature_header: str,
+    secrets: Set[str]
+) -> bool:
+    """Verifies HMAC-SHA256 signature against candidate secrets using constant-time comparison."""
+    try:
+        ts = int(timestamp)
+        now = int(time.time())
+        # Reject deliveries outside the tolerance window to prevent replay of old payloads
+        if abs(now - ts) > SIGNATURE_TOLERANCE_SECONDS:
+            logger.warning("Webhook timestamp drift exceeded: %s (now: %s)", ts, now)
+            return False
+    except ValueError:
+        return False
+
+    # Standard signed payload format: t={timestamp}.v1={raw_body}
+    signed_payload = f"{timestamp}.".encode("utf-8") + raw_body
+
+    for secret in secrets:
+        expected_sig = hmac.new(
+            secret.encode("utf-8"),
+            signed_payload,
+            hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison prevents timing side-channels
+        if hmac.compare_digest(expected_sig, signature_header):
+            return True
+
+    return False
+
+
+async def process_payment_business_logic(event_data: dict) -> None:
+    """Simulated business logic execution."""
+    logger.info("Executing payment business logic for event: %s", event_data.get("id"))
+
+
+@app.post("/webhooks/payments", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_webhook_signature: Optional[str] = Header(None),
+    x_webhook_timestamp: Optional[str] = Header(None)
+):
+    if not x_webhook_signature or not x_webhook_timestamp:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication credentials"
+        )
+
+    # 1. Read exact raw byte stream BEFORE parsing
+    raw_body = await request.body()
+
+    # 2. Authenticate payload against rotating secret pool
+    if not verify_hmac_signature(
+        raw_body=raw_body,
+        timestamp=x_webhook_timestamp,
+        signature_header=x_webhook_signature,
+        secrets=WEBHOOK_SECRETS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature"
+        )
+
+    # 3. Parse JSON only after HMAC verification
+    try:
+        payload = json.loads(raw_body)
+        event_id = payload.get("id")
+        if not event_id or not isinstance(event_id, str):
+            raise ValueError("Missing or invalid event id")
+    except Exception:
+        # Generic error message to prevent leaking schema expectations
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid payload structure"
+        )
+
+    # 4. Enforce atomic idempotency with distributed lock / state in Redis
+    redis_key = f"webhook:event:{event_id}"
+
+    # Atomic SETNX: sets state to 'PROCESSING' only if the key does not already exist
+    acquired = await redis_client.set(
+        redis_key,
+        "PROCESSING",
+        nx=True,
+        ex=EVENT_LOCK_TTL_SECONDS
+    )
+
+    if not acquired:
+        current_state = await redis_client.get(redis_key)
+        if current_state in ("PROCESSING", "PROCESSED"):
+            # Acknowledge 200/202 to stop third-party retries without duplicate execution
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"status": "duplicate", "message": "Event already processed or in progress"}
+            )
+
+    # 5. Process business logic inside a safe execution boundary
+    try:
+        await process_payment_business_logic(payload)
+        # Mark event as successfully completed
+        await redis_client.set(redis_key, "PROCESSED", ex=EVENT_LOCK_TTL_SECONDS)
+        return {"status": "success"}
+    except Exception as exc:
+        # Release or mark failed so genuine downstream retries can be re-evaluated
+        await redis_client.delete(redis_key)
+        logger.error("Internal webhook execution error for event %s: %s", event_id, str(exc), exc_info=True)
+        # Return generic error to caller without leaking internal exceptions
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "An error occurred while processing the event"}
+        )
+```
+
+---[Response B]:
+**The current design fails under multi-process deployments and leaves the server vulnerable to unauthenticated DoS, timing leaks, and double-processing race conditions.**
+
+**1 → In-memory replay ledger causes double-processing in production.** A Python `dict` is local to a single worker process and wipes on restart, allowing duplicate concurrent webhooks across multiple Uvicorn workers or server instances to execute the payment logic twice.
+
+**2 → Parsing JSON before HMAC verification allows unauthenticated resource exhaustion.** Parsing the request body prior to authentication lets attackers flood the endpoint with malformed or nested JSON payloads that consume memory and CPU without a valid signature.
+
+**3 → Single-secret verification and non-constant-time comparisons break key rotation and leak timing data.** Verifying with standard equality (`==`) leaks key timing signatures, while supporting only one key causes dropped webhooks during provider secret rotation grace periods.
+
+**4 → Unsanitized error bubbling leaks internal architecture and stack traces.** Propagating internal processing or database exceptions directly to the webhook caller exposes backend details and third-party credentials.
+
+---
+
+### Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import json
+import logging
+from typing import List
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from redis import asyncio as aioredis
+
+logger = logging.getLogger("webhook")
+app = FastAPI()
+
+# Configure Redis connection for distributed locking and replay tracking
+redis_client = aioredis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+# Support multiple secrets during rotation (primary, grace period keys)
+ACTIVE_WEBHOOK_SECRETS: List[str] = ["secret_v2_current", "secret_v1_retiring"]
+SIGNATURE_HEADER = "X-Signature-SHA256"
+EVENT_LOCK_TTL_SECONDS = 86400  # 24 hours retention for event IDs
+
+
+def verify_hmac_signature(raw_body: bytes, signature_header: str | None, secrets: List[str]) -> bool:
+    if not signature_header or not secrets:
+        return False
+    
+    # Strip prefix if provider prefixes hash (e.g. 'sha256=...')
+    provided_signature = signature_header.removeprefix("sha256=").strip()
+
+    for secret in secrets:
+        computed_hmac = hmac.new(
+            secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Constant-time comparison prevents timing attacks
+        if hmac.compare_digest(computed_hmac, provided_signature):
+            return True
+            
+    return False
+
+
+@app.post("/webhooks/payments", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_signature_sha256: str | None = Header(default=None, alias=SIGNATURE_HEADER)
+):
+    # 1. Read raw byte stream before parsing JSON
+    raw_body = await request.body()
+
+    # 2. Verify signature against active secret rotation list
+    if not verify_hmac_signature(raw_body, x_signature_sha256, ACTIVE_WEBHOOK_SECRETS):
+        logger.warning("Rejected webhook with invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature."
+        )
+
+    # 3. Parse JSON only after authenticity is verified
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+        event_id = payload["id"]
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid payload structure."
+        )
+
+    # 4. Atomic distributed lock to enforce idempotency and replay rejection
+    ledger_key = f"webhook:event:{event_id}"
+    is_new_event = await redis_client.set(
+        ledger_key,
+        "PROCESSING",
+        nx=True,
+        ex=EVENT_LOCK_TTL_SECONDS
+    )
+
+    if not is_new_event:
+        # Acknowledge duplicates with 200 OK so the provider stops retrying
+        logger.info(f"Duplicate webhook received for event {event_id}. Skipping.")
+        return {"status": "ignored", "reason": "duplicate_event"}
+
+    # 5. Process business logic inside a guarded try-block
+    try:
+        await process_payment_event(payload)
+        await redis_client.set(ledger_key, "COMPLETED", xx=True, ex=EVENT_LOCK_TTL_SECONDS)
+        return {"status": "success"}
+
+    except Exception as exc:
+        # Release lock or mark failed to allow legitimate retries if desired
+        await redis_client.delete(ledger_key)
+        logger.error(f"Error processing webhook {event_id}: {exc}", exc_info=True)
+        
+        # Return generic error; do not expose internal exception details
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal processing error."
+        )
+
+
+async def process_payment_event(payload: dict):
+    # Business logic execution goes here
+    pass
+```
+
+---[Response C]:
+**Verifying signatures after JSON parsing and using in-memory replay tracking leaves your payment pipeline vulnerable to unauthenticated DoS attacks, cluster-wide double-processing, and timing side-channels.**
+
+---
+
+### Vulnerability Analysis (Ranked by Severity)
+
+**1 → Critical: In-memory replay storage fails across workers, restarts, and concurrent requests.** A Python `dict` is local to a single process; multiple Uvicorn workers or multi-instance deployments cannot share state. A server restart wipes the ledger entirely, and simultaneous identical requests cause a check-then-act race condition that executes duplicate payouts or double-credits customer balances.
+
+**2 → High: JSON deserialization before signature verification exposes the server to DoS and parser exploits.** Parsing untrusted payloads with Pydantic or `request.json()` consumes CPU and memory before proving authenticity. Attackers can flood the endpoint with deeply nested JSON bombs or malformed payloads that crash the parser before authentication ever runs.
+
+**3 → High: Lack of rotating secret support causes payment dropouts during credential rollover.** Third-party processors rotate secrets by providing both the old and new secrets during a grace window. Enforcing a single static key forces downtime or dropped webhook deliveries during key rotations.
+
+**4 → Medium: Non-constant-time signature comparison leaks HMAC digests via timing attacks.** Using standard `==` string equality terminates comparison on the first mismatched byte, allowing attackers to incrementally deduce valid signatures through microsecond-level response time measurements.
+
+**5 → Medium: Missing timestamp verification permits replay attacks after cache eviction.** If the event ledger relies solely on an event ID with a time-to-live expiration, an attacker can re-send intercepted valid webhooks after the cache entry expires.
+
+**6 → Low: Uncaught internal exceptions leak stack traces and processor internals.** Bubbling raw exceptions up to the HTTP response exposes infrastructure topology, database schema details, and third-party error structures to unauthorized clients.
+
+---
+
+### Corrected Production Implementation
+
+```python
+import hashlib
+import hmac
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+import redis.asyncio as redis
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field, ValidationError
+
+# Configure structured logging without sensitive data
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("webhook_processor")
+
+app = FastAPI(title="Secure Payment Webhook Handler")
+
+# -----------------------------------------------------------------------------
+# Configuration & Environment Validation
+# -----------------------------------------------------------------------------
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+PRIMARY_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_PRIMARY")
+FALLBACK_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_FALLBACK")  # Used during rotation
+
+if not PRIMARY_WEBHOOK_SECRET:
+    raise RuntimeError("CRITICAL: WEBHOOK_SECRET_PRIMARY environment variable is not configured.")
+
+ACTIVE_SECRETS: List[str] = [PRIMARY_WEBHOOK_SECRET]
+if FALLBACK_WEBHOOK_SECRET:
+    ACTIVE_SECRETS.append(FALLBACK_WEBHOOK_SECRET)
+
+# -----------------------------------------------------------------------------
+# Schema Definitions
+# -----------------------------------------------------------------------------
+class PaymentData(BaseModel):
+    transaction_id: str = Field(..., min_length=1, max_length=128)
+    amount_cents: int = Field(..., gt=0)
+    currency: str = Field(..., min_length=3, max_length=3)
+    customer_id: str = Field(..., min_length=1, max_length=128)
+
+class WebhookPayload(BaseModel):
+    event_id: str = Field(..., min_length=1, max_length=128)
+    event_type: str = Field(..., min_length=1, max_length=64)
+    timestamp: int = Field(..., gt=0)
+    data: PaymentData
+
+# -----------------------------------------------------------------------------
+# Redis Client for Distributed Locking & Replay Ledger
+# -----------------------------------------------------------------------------
+redis_client: Optional[redis.Redis] = None
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global redis_client
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if redis_client:
+        await redis_client.aclose()
+
+# -----------------------------------------------------------------------------
+# Security Helpers
+# -----------------------------------------------------------------------------
+def verify_hmac_signature(
+    raw_body: bytes,
+    signature_header: Optional[str],
+    secrets: List[str],
+    tolerance_seconds: int = 300
+) -> bool:
+    """
+    Validates HMAC signature and timestamp tolerance in constant time.
+    Expected header format: t=<timestamp>,v1=<hex_signature>
+    """
+    if not signature_header:
+        return False
+
+    header_parts: Dict[str, str] = {}
+    for item in signature_header.split(","):
+        if "=" in item:
+            k, v = item.strip().split("=", 1)
+            header_parts[k] = v
+
+    timestamp_str = header_parts.get("t")
+    received_signature = header_parts.get("v1")
+
+    if not timestamp_str or not received_signature:
+        return False
+
+    # Prevent replay attacks by checking timestamp drift (5 minutes default)
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError:
+        return False
+
+    current_time = int(time.time())
+    if abs(current_time - timestamp) > tolerance_seconds:
+        logger.warning("Webhook timestamp rejected: drift exceeds tolerance window.")
+        return False
+
+    # Compute expected signature over: timestamp.raw_body
+    signed_payload = f"{timestamp}.".encode("utf-8") + raw_body
+
+    # Support zero-downtime secret rotation by testing active secrets
+    for secret in secrets:
+        expected_signature = hmac.new(
+            key=secret.encode("utf-8"),
+            msg=signed_payload,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison prevents timing attacks
+        if hmac.compare_digest(expected_signature, received_signature):
+            return True
+
+    return False
+
+# -----------------------------------------------------------------------------
+# Core Webhook Endpoint
+# -----------------------------------------------------------------------------
+@app.post("/api/v1/webhooks/payment", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_signature: Optional[str] = Header(None, alias="X-Signature")
+) -> Response:
+    # 1. Read raw body before parsing to protect parser and generate accurate HMAC
+    try:
+        raw_body = await request.body()
+    except Exception:
+        logger.error("Failed to read raw request body.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Bad request")
+
+    # 2. Authenticate signature BEFORE parsing or allocating JSON resources
+    if not verify_hmac_signature(raw_body, x_signature, ACTIVE_SECRETS):
+        logger.warning("Unauthorized webhook delivery: invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid signature"
+        )
+
+    # 3. Parse and validate JSON structure against strict Pydantic schema
+    try:
+        payload = WebhookPayload.model_validate_json(raw_body)
+    except ValidationError:
+        logger.warning("Webhook payload schema validation failed.")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid payload")
+
+    # 4. Distributed atomic ledger check using Redis (SET NX EX)
+    # Prevents duplicate processing and race conditions across multiple instances
+    ledger_key = f"webhook:ledger:{payload.event_id}"
+    lock_ttl_seconds = 86400  # 24-hour replay protection window
+
+    if not redis_client:
+        logger.error("Redis client unavailable for idempotency validation.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Processing error")
+
+    # Atomically acquire lock / mark event as 'processing'
+    is_new_event = await redis_client.set(ledger_key, "processing", nx=True, ex=lock_ttl_seconds)
+
+    if not is_new_event:
+        current_status = await redis_client.get(ledger_key)
+        if current_status == "completed":
+            logger.info("Duplicate webhook received; already processed: %s", payload.event_id)
+            return Response(content='{"status":"already_processed"}', media_type="application/json")
+        
+        # Another worker is actively handling this event
+        logger.info("Concurrent webhook duplicate detected; currently in progress: %s", payload.event_id)
+        return Response(content='{"status":"in_progress"}', status_code=status.HTTP_202_ACCEPTED, media_type="application/json")
+
+    # 5. Process business logic with safe error isolation
+    try:
+        logger.info("Processing webhook event: %s, type: %s", payload.event_id, payload.event_type)
+
+        # Execute business logic (e.g., fulfill orders, update balances)
+        await execute_payment_fulfillment(payload)
+
+        # Mark event as successfully completed in ledger
+        await redis_client.set(ledger_key, "completed", ex=lock_ttl_seconds)
+
+        return Response(content='{"status":"success"}', media_type="application/json")
+
+    except Exception:
+        # Release lock so processor retries can re-attempt delivery
+        await redis_client.delete(ledger_key)
+        
+        # Redact stack trace and internal database errors from HTTP response
+        logger.exception("Internal error processing webhook event: %s", payload.event_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal processing error"
+        )
+
+async def execute_payment_fulfillment(payload: WebhookPayload) -> None:
+    """Isolated business logic placeholder."""
+    pass
+```
+
+---
+
+### Key Architectural Fixes Applied
+
+**→ Atomic distributed state ledger.** Replaced the in-memory dictionary with Redis `SET key status NX EX 86400`, resolving both cross-worker memory isolation and concurrent TOCTOU race conditions.
+
+**→ Raw body signature verification.** `await request.body()` runs before JSON parsing, rejecting forged or malicious payloads before computing expensive deserialization logic.
+
+**→ Rotating secret loop.** Supports simultaneous active and grace keys with constant-time `hmac.compare_digest()` to eliminate timing side-channels and prevent downtime during key rollovers.
+
+**→ Enforced timestamp tolerance.** Webhook timestamp headers are bounded to a 300-second window, preventing replayed valid requests even after the cache expires.
+
+**→ Sanitized error boundaries.** Internal exceptions, database connection details, and processor stack traces are logged locally with identifiers only, returning generic JSON errors to the client.
+
+---[Response D]:
+**The primary security failures are an in-memory replay ledger that breaks concurrency and multi-worker safety, and verifying HMAC signatures after JSON parsing instead of on raw request bytes.**
+
+---
+
+### Identified Vulnerabilities (Ordered by Severity)
+
+**1 → Critical: In-Memory Ledger Causes Double-Processing and Multi-Worker TOCTOU Races.** An in-process `dict` is not shared across multi-process workers (e.g., Gunicorn/Uvicorn), resets on deployment/restart, and suffers from a **Time-of-Check to Time-of-Use (TOCTOU) race condition** where concurrent duplicate deliveries bypass the check and trigger duplicate payment processing.
+
+**2 → High: Post-Parsing HMAC Verification Enables Parser DoS and Canonicalization Bypass.** Parsing JSON before authentication consumes CPU and memory on untrusted data (exposing the app to hash-collision or large-payload DoS). Re-serializing parsed JSON to verify signatures alters byte order, whitespace, and formatting, causing either **false signature rejections or forged payloads**.
+
+**3 → Medium: Single Secret Checking Breaks Zero-Downtime Key Rotation.** Checking against only one active secret causes legitimate webhook drops when the payment processor transitions to a new signing key. The verifier must validate against a **list of active and transitioning secrets** using **`hmac.compare_digest`** to prevent timing attacks.
+
+**4 → Medium: Detailed Error Leaks Expose Internal Stack Traces and DB State.** Propagating unhandled exceptions or processor traceback messages back in HTTP responses provides attackers with **internal schema, database state, and network topology**.
+
+**5 → Low: Unbounded Memory Growth (OOM Crash).** Storing event IDs in an unbounded in-memory dictionary without a TTL or eviction strategy eventually leads to **process termination via memory exhaustion**.
+
+---
+
+### Corrected Implementation
+
+This production-ready implementation uses **raw byte capture**, **constant-time multi-key verification**, and **atomic Redis-based distributed idempotency locks**.
+
+```python
+import hashlib
+import hmac
+import json
+import logging
+from enum import StrEnum
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Header, HTTPException, Request, status
+from pydantic import BaseModel, ValidationError
+import redis.asyncio as aioredis
+
+logger = logging.getLogger("webhooks.payment")
+
+# -----------------------------------------------------------------------------
+# Configuration & Models
+# -----------------------------------------------------------------------------
+# Support current and previous secrets for zero-downtime rotation
+WEBHOOK_SECRETS: list[str] = [
+    "sec_live_current_9f83b2a1c4e7",
+    "sec_live_previous_4a2d8e6f1c9b",
+]
+IDEMPOTENCY_LOCK_TTL_SECONDS = 300       # 5 minutes in-flight lock
+IDEMPOTENCY_COMPLETED_TTL_SECONDS = 604800  # 7 days replay retention
+
+
+class EventStatus(StrEnum):
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class PaymentWebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    amount_cents: int
+    currency: str
+    customer_id: str
+    metadata: dict[str, Any] = {}
+
+
+router = APIRouter()
+
+
+# -----------------------------------------------------------------------------
+# Security Utilities
+# -----------------------------------------------------------------------------
+def verify_hmac_signature(raw_payload: bytes, signature_header: str | None, secrets: list[str]) -> bool:
+    """
+    Verifies the raw body against active secrets using constant-time comparison.
+    Never re-serializes parsed JSON.
+    """
+    if not signature_header or not secrets:
+        return False
+
+    # Assumes header format: 'sha256=<hex_digest>' or raw hex string
+    received_sig = signature_header.removeprefix("sha256=").strip()
+
+    for secret in secrets:
+        expected_sig = hmac.new(
+            key=secret.encode("utf-8"),
+            msg=raw_payload,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+        # Constant-time comparison prevents timing side-channel attacks
+        if hmac.compare_digest(expected_sig, received_sig):
+            return True
+
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Webhook Endpoint
+# -----------------------------------------------------------------------------
+@router.post("/webhooks/payment", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_signature: Annotated[str | None, Header()] = None,
+    redis: aioredis.Redis = None,  # Inject via Depends in production
+) -> dict[str, str]:
+    # 1. Capture exact raw bytes BEFORE any parsing
+    raw_body: bytes = await request.body()
+
+    # 2. Verify signature against raw bytes (reject invalid immediately)
+    if not verify_hmac_signature(raw_body, x_signature, WEBHOOK_SECRETS):
+        logger.warning("Rejected webhook: invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Signature verification failed.",
+        )
+
+    # 3. Parse and validate JSON schema only after successful signature check
+    try:
+        data = json.loads(raw_body)
+        event = PaymentWebhookPayload.model_validate(data)
+    except (json.JSONDecodeError, ValidationError):
+        logger.warning("Rejected webhook: malformed payload structure.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid payload format.",
+        )
+
+    ledger_key = f"webhook:event:{event.event_id}"
+
+    # 4. Atomic Concurrency & Replay Guard (Distributed Lock / State Machine)
+    # SET key "PROCESSING" NX EX -> True only if key did not previously exist
+    acquired = await redis.set(
+        ledger_key,
+        EventStatus.PROCESSING,
+        nx=True,
+        ex=IDEMPOTENCY_LOCK_TTL_SECONDS,
+    )
+
+    if not acquired:
+        current_state = await redis.get(ledger_key)
+        state_str = current_state.decode("utf-8") if current_state else ""
+
+        if state_str == EventStatus.COMPLETED:
+            # Already processed successfully: return 200 so processor stops retrying
+            return {"status": "already_processed"}
+
+        if state_str == EventStatus.PROCESSING:
+            # In-flight concurrent duplicate: reject with 409 or 429
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Event is currently being processed.",
+            )
+
+    # 5. Business Processing with Exception Containment
+    try:
+        await process_payment_event(event)
+
+        # Mark completed with multi-day TTL for replay defense
+        await redis.set(
+            ledger_key,
+            EventStatus.COMPLETED,
+            ex=IDEMPOTENCY_COMPLETED_TTL_SECONDS,
+        )
+        return {"status": "success"}
+
+    except Exception:
+        # Log internal stack trace privately; never leak to client
+        logger.exception("Internal error processing webhook event %s", event.event_id)
+
+        # Delete lock so the processor can safely retry on transient failure
+        await redis.delete(ledger_key)
+
+        # Return generic error to processor
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal processing error.",
+        )
+
+
+async def process_payment_event(event: PaymentWebhookPayload) -> None:
+    """Core domain logic (e.g., fulfill orders, update balances)."""
+    # ... execute domain logic inside database transaction ...
+    pass
+```
+
+---
+
+### Key Protections Applied
+
+**→ Pre-Parse Raw Byte HMAC.** Verifies signatures on unmodified network bytes (`request.body()`) before deserialization, avoiding parsing DoS attacks and canonicalization discrepancies.
+
+**→ Rotating Secret Toleration.** Compares signatures against a pool of active and previous secrets using **`hmac.compare_digest`** to prevent side-channel timing attacks.
+
+**→ Atomic Concurrency and Distributed Ledger.** Uses Redis `SET ... NX` across all worker processes to serialize concurrent duplicates, return early on completed events, and retain replay records for 7 days.
+
+**→ Exception Sanitization.** Logs the full error context internally while returning generic, unrevealing HTTP status codes to external callers.
+
+---[Response E]:
+**The primary vulnerabilities are non-atomic in-memory replay tracking and parsing JSON before raw-body HMAC verification, which allow duplicate payment execution and payload tampering.**
+
+---
+
+### Vulnerability Analysis (Ordered by Severity)
+
+**1 → In-memory replay tracking allows double-crediting across workers and restarts.** A standard Python `dict` is isolated per process and wipes on restart, failing across multi-worker deployments (e.g., Uvicorn with multiple workers). It also introduces a **race condition where concurrent duplicate requests** both pass the check before either writes to memory.
+
+**2 → HMAC verification on parsed JSON enables parser DoS and signature mismatches.** Re-serializing parsed JSON alters whitespace, number precision, and key ordering, breaking signatures. Parsing before verification also exposes the JSON parser to **unauthenticated denial-of-service payloads**.
+
+**3 → Single-secret validation breaks zero-downtime secret rotation.** Checking only one secret causes valid in-flight webhooks signed with an outgoing or incoming secret to fail during **key rotation transition windows**.
+
+**4 → Unhandled exceptions leak internal infrastructure and processor details.** Propagating unhandled exceptions back to the client exposes **stack traces, database schemas, and third-party error internals** in HTTP response bodies.
+
+---
+
+### Corrected Implementation
+
+```python
+import hmac
+import hashlib
+import json
+import logging
+from typing import List
+from fastapi import FastAPI, Request, Header, HTTPException, status
+from fastapi.responses import JSONResponse
+import redis.asyncio as redis
+
+logger = logging.getLogger("webhooks")
+app = FastAPI()
+
+# Shared distributed store for idempotency and replay prevention
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+# Support multiple secrets for zero-downtime rotation (newest first)
+WEBHOOK_SECRETS: List[str] = [
+    "sec_live_current_key_2026",
+    "sec_live_previous_key_2026",
+]
+
+# Keep replay ledger for 24 hours (86,400 seconds)
+EVENT_TTL_SECONDS = 86400
+
+
+def verify_hmac_signature(raw_body: bytes, signature_header: str | None, secrets: List[str]) -> bool:
+    """Verifies HMAC-SHA256 signature using constant-time comparison across active secrets."""
+    if not signature_header:
+        return False
+
+    # Extract signature if header format is 't=...,v1=hash' or raw hash
+    expected_hash = signature_header.split("v1=")[-1] if "v1=" in signature_header else signature_header
+
+    for secret in secrets:
+        computed_hash = hmac.new(
+            key=secret.encode("utf-8"),
+            msg=raw_body,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison prevents timing attacks
+        if hmac.compare_digest(computed_hash, expected_hash):
+            return True
+
+    return False
+
+
+@app.post("/webhooks/payments", status_code=status.HTTP_200_OK)
+async def handle_payment_webhook(
+    request: Request,
+    x_signature: str | None = Header(default=None, alias="X-Signature-SHA256")
+):
+    # 1. Read raw byte stream before JSON parsing
+    raw_body = await request.body()
+
+    # 2. Verify signature on unparsed bytes
+    if not verify_hmac_signature(raw_body, x_signature, WEBHOOK_SECRETS):
+        logger.warning("Webhook received with invalid HMAC signature")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid signature"
+        )
+
+    # 3. Parse JSON only after authenticity is guaranteed
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+        event_id = payload["id"]
+        event_type = payload["type"]
+        event_data = payload["data"]
+    except (ValueError, KeyError) as e:
+        logger.error("Malformed webhook payload received: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed payload structure"
+        )
+
+    # 4. Atomic Redis check-and-set locks the event and rejects replays
+    ledger_key = f"webhook:ledger:{event_id}"
+    acquired = await redis_client.set(ledger_key, "PROCESSING", nx=True, ex=EVENT_TTL_SECONDS)
+
+    if not acquired:
+        # Acknowledge duplicate cleanly without re-executing business logic
+        logger.info("Duplicate webhook rejected: event_id=%s", event_id)
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={"status": "duplicate_ignored", "event_id": event_id}
+        )
+
+    # 5. Process business logic inside a safe failure boundary
+    try:
+        await process_payment_event(event_type, event_data)
+        await redis_client.set(ledger_key, "PROCESSED", xx=True, ex=EVENT_TTL_SECONDS)
+        return {"status": "success", "event_id": event_id}
+
+    except Exception:
+        # Log complete stack trace internally for monitoring
+        logger.exception("Unexpected error processing event_id=%s", event_id)
+
+        # Release or set to FAILED to permit processor retries if intended
+        await redis_client.delete(ledger_key)
+
+        # Return generic error to avoid leaking internal processor/database states
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "Internal processing failure"}
+        )
+
+
+async def process_payment_event(event_type: str, data: dict):
+    """Core payment processing logic."""
+    if event_type == "payment.succeeded":
+        pass  # Fulfill order or credit account
+```
+
+---
+
+### Key Protections Enforced
+
+**→ Constant-time raw verification:** `hmac.compare_digest` against raw `request.body()` runs before deserialization, neutralizing timing attacks and JSON parser exploitation.
+
+**→ Distributed atomic ledger:** `redis.set(..., nx=True, ex=86400)` acts as an atomic lock and replay defense across all server nodes and workers.
+
+**→ Rollover key matching:** Iterating through candidate secrets allows zero-downtime key rotation.
+
+**→ Error masking:** Internal exceptions are logged to internal sinks while the client receives an opaque HTTP 500 response.
+
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

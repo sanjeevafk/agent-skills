@@ -1,0 +1,458 @@
+[exit=0 latency=32.86s]
+Updated 1.33.0 → 1.33.1
+This is a concrete memory-leak scenario I can diagnose directly without needing `dap`. Here's the full plan:
+
+---
+
+## 1. Capture & Diff Heap Snapshots in Production Safely
+
+**Do not use Chrome DevTools Protocol (`--inspect`) in production — it's a performance hit and an attack surface.** Instead:
+
+### A. Programmatic snapshot via Signal
+
+```js
+// In your startup code (only loaded when MEMORY_LEAK_DEBUG=1):
+if (process.env.MEMORY_LEAK_DEBUG === '1') {
+  process.on('SIGUSR2', async () => {
+    const inspector = await import('inspector');
+    // Wait for transport to be ready
+    await new Promise(r => setTimeout(r, 500));
+    const session = new inspector.Session();
+    session.connect();
+    const result = await new Promise((resolve, reject) => {
+      session.post('HeapProfiler.takeSnapshot', {}, (err, result) => {
+        err ? reject(err) : resolve(result);
+      });
+    });
+    session.disconnect();
+    
+    const buf = result.result.data; // JSHeapBinaryDump (base64 encoded string)
+    const fs = await import('fs');
+    const path = await import('path');
+    const dest = path.join('/tmp', `heap-${Date.now()}-${process.pid}.heapsnapshot`);
+    fs.writeFileSync(dest, JSON.stringify(buf));
+    console.error(`[memory] heap snapshot written to ${dest}`);
+  });
+}
+```
+
+Then from kubectl:
+```bash
+# Send signal to pod
+kubectl exec <pod> -- kill -USR2 $(cat /proc/self/status | grep Pid | awk '{print $2}')
+# Or target a specific PID inside the container
+kubectl exec <pod> -- sh -c 'kill -USR2 1'
+```
+
+### B. Safer approach: periodic snapshots with rotation
+
+```js
+// cron-style, only active during investigation window
+let snapshotCount = 0;
+const MAX_SNAPSHOTS = 10;
+
+async function takeSnapshot() {
+  if (snapshotCount >= MAX_SNAPSHOTS || !globalThis.__takeSnapshot) return;
+  snapshotCount++;
+  
+  const inspector = await import('inspector');
+  const session = new inspector.Session();
+  session.connect();
+  
+  const { result } = await new Promise((res, rej) =>
+    session.post('HeapProfiler.takeSnapshot', {}, (e, r) => e ? rej(e) : res({ result: r }))
+  );
+  session.disconnect();
+  
+  const fs = await import('fs');
+  const filePath = `/tmp/heap-snap-${Date.now()}.heapsnapshot`;
+  fs.writeFileSync(filePath, JSON.stringify(result.data));
+  
+  // Cleanup old snapshots
+  const dir = fs.readdirSync('/tmp').filter(f => f.startsWith('heap-snap-'));
+  dir.sort().slice(0, -MAX_SNAPSHOTS).forEach(f => 
+    fs.unlinkSync(`/tmp/${f}`)
+  );
+}
+
+// Take one every 30 minutes during your investigation window
+setInterval(takeSnapshot, 30 * 60 * 1000);
+```
+
+### C. Lightweight RSS monitoring (no snapshot cost)
+
+```js
+// Attach this to your healthcheck or metrics endpoint
+function rssMetrics() {
+  const mem = process.memoryUsage();
+  return {
+    rss_bytes: mem.rss,
+    heap_total: mem.heapTotal,
+    heap_used: mem.heapUsed,
+    external: mem.external,       // Buffers show up here
+    array_buffers: mem.arrayBuffers || 0,
+    timestamp: Date.now(),
+    uptime_seconds: process.uptime()
+  };
+}
+// Expose at /internal/metrics or push to Prometheus
+```
+
+### D. Diffing snapshots
+
+Download two snapshots (t0 and t0+6h), then:
+
+```bash
+# Install node-heapsnapshot-diff if needed
+npm i -g heapsnapshot-diff
+
+# Generate diff
+heapsnapshot-diff heap-t0.heapsnapshot heap-t0+6h.heapsnapshot > diff.json
+
+# Or use Chrome: open both in about:memory → "Compare" profile, or use
+# Chrome DevTools Memory panel → Snapshot comparison
+```
+
+Key things to look for in the diff:
+- **Allocation summaries**: "Bytes in objects created by native code" vs JS
+- **Detached heap buffers**: non-zero means you're leaking ArrayBuffer views (Buffers wrapping detached ArrayBuffers)
+- **Shallow sizes vs Retained sizes**: Shallow = object itself. Retained = what dies if you remove this object. Large retained size = strong retainer chain
+
+---
+
+## 2. Identify the Retainer Chain for Closures and Buffers
+
+### In Chrome DevTools (open each `.heapsnapshot` file):
+
+#### For closures retained by EventEmitter registry:
+
+1. Open the snapshot → switch to **"Summary"** view → filter type: `closure` or `code`
+2. Look for types like `lambda`, `anonymous`, or names matching route handlers/middleware
+3. Right-click any suspicious closure → **"Move selected to comparison"** (compare with earlier snapshot)
+4. Switch to **"Comparison"** view → sort by **"Retained Size"** descending
+5. Click the top entries → **"Retainers"** tab. You'll see something like:
+   ```
+   closure @ 0x... ← [EventEmitter] listeners ← Map ← EventEmitterRegistry
+                     ← [Map] _events ← EventEmitter ← Router ← App
+   ```
+6. The key finding: if the retainer chain goes through `EventEmitter._events` or a `_listeners` Map, you have a listener leak.
+
+#### For Buffer objects:
+
+1. Summary view → filter type: `Buffer` or `JSArrayBuffer`
+2. Check the **"External"** bytes field in `process.memoryUsage()` — this tracks C++ side buffer allocations (Node.js `Buffer` wrapper around `TypedArray` backing store)
+3. In the heap snapshot, Buffers with large shallow sizes are data blobs. Follow their retainers:
+   ```
+   Buffer @ 0x... ← String ← logEntry ← LogArray ← ResponseLogger
+                                   ← middleware closure ← Route handler
+   ```
+4. If you see strings/buffers being collected into arrays that never get pruned, that's your logging middleware leak.
+
+#### At the CLI (for headless environments):
+
+```js
+// script: find-retainers.mjs
+import { readFileSync } from 'fs';
+
+const snap = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+
+// Build adjacency list
+const nodes = snap.nodes;
+const edges = snap.edges; // [from, to] pairs
+
+// Find all closure nodes
+const closureNodes = [];
+nodes.name.forEach((n, i) => {
+  if (n.includes('closure') || n.includes('code')) closureNodes.push(i);
+});
+
+// Simple traversal to find top retained sizes
+console.log(`Found ${closureNodes.length} closure/code nodes`);
+console.log('Top 20 by shallow size:', 
+  closureNodes.slice(0, 20)
+    .map(i => ({ index: i, name: nodes.name[i], shallow: nodes.shallowSizes[i] }))
+    .sort((a, b) => b.shallow - a.shallow)
+);
+```
+
+---
+
+## 3. Confirm Whether the EventEmitter Registry Leaks Listeners
+
+### Evidence of a listener leak:
+
+The pattern in Node.js EventEmitter stores listeners in `emitter._events` (a plain `Object`) or `emitter.listeners(...)` returns a copy. If listeners are added via `on()`/`addListener()` but never removed with `off()`/`removeListener()`, they accumulate forever.
+
+### Code-level confirmation:
+
+```js
+// Reproduce the suspected pattern under the debugger
+const EventEmitter = require('events');
+
+class LeakyService {
+  constructor() {
+    this.emitter = new EventEmitter();
+  }
+  
+  // BUG:每 request creates a new listener that is never removed
+  handleRequest(req, res) {
+    this.emitter.on('response', (data) => {
+      // closure captures req, res, and possibly large request body
+      this.logResponse(data, req.id);
+    });
+    // ... handler executes ...
+    this.emitter.emit('response', { status: 200 });
+    // Missing: this.emitter.off('response', callback)
+  }
+  
+  logResponse(data, id) { /* ... */ }
+}
+
+// Verification: count listeners over time
+setInterval(() => {
+  const counts = {};
+  for (const evt of Object.keys(emitter.listenerCount)) {
+    counts[evt] = emitter.listenerCount(evt);
+  }
+  console.error('[leak check]', counts);
+}, 60000);
+```
+
+A real diagnostic script you can drop into production (guarded behind a flag):
+
+```js
+// leak-detector.mjs — require only during investigation
+import { EventEmitter } from 'events';
+
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+const listenerRegistry = new WeakMap();
+
+EventEmitter.prototype.on = EventEmitter.prototype.addListener = function(event, listener) {
+  const key = `${this.constructor.name}@${this.id ?? crypto.randomUUID()}:${event}`;
+  if (!listenerRegistry.has(this)) {
+    listenerRegistry.set(this, new Map());
+  }
+  const map = listenerRegistry.get(this);
+  const count = map.get(key) || 0;
+  map.set(key, count + 1);
+  
+  if (count > 100) {
+    console.error(`[LEAK WARNING] Event "${event}" has ${count} listeners on ${this.constructor.name}`);
+  }
+  return origAddListener.call(this, event, listener);
+};
+
+// Export a diagnostics endpoint
+import http from 'http';
+const server = http.createServer((req, res) => {
+  if (req.url === '/internal/listener-stats') {
+    const stats = {};
+    for (const [emitter, map] of listenerRegistry) {
+      stats[emitter.constructor.name] = Object.fromEntries(map);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats, null, 2));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+server.listen(0);
+console.error(`[leak-detector] listening on port ${server.address().port}`);
+```
+
+---
+
+## 4. Likely Code-Level Root Causes & Fixes
+
+Based on the symptoms described (RSS 300MB→4GB, closures in emitter registry, Buffers in response-logging middleware), here are the three most probable root causes ranked by likelihood:
+
+### Cause #1: Per-request EventEmitter listeners (most likely)
+
+```
+// BAD — this accumulates listeners indefinitely
+app.on('request-complete', (metadata) => {
+  metadata.body = rawRequestBody; // huge closure capturing request body
+  logger.store(metadata);         // logger holds all metadata in memory
+});
+
+router.get('/api/data', async (req, res) => {
+  app.on('request-complete', ({ body }) => {
+    // closure captures req, res, body — never GC'd because listener reference exists
+    auditLog.save(body);
+  });
+  const body = await readFullBody(req);  // Buffer, potentially MBs
+  res.send(process(body));
+  app.emit('request-complete', { body });
+});
+```
+
+**Fix:** Use `once()` instead of `on()`:
+
+```js
+// GOOD — fires once and removes itself
+router.get('/api/data', async (req, res) => {
+  const body = await readFullBody(req);
+  
+  app.once('request-complete', ({ requestId, status }) => {
+    // Only pass lightweight metadata, not the full body
+    auditLog.save({ requestId, status, timestamp: Date.now() });
+  });
+  
+  res.send(process(body));
+  app.emit('request-complete', { requestId: req.id, status: res.statusCode });
+});
+```
+
+Or better yet — don't use a global EventEmitter for this. Pass data directly:
+
+```js
+// BEST — no shared mutable state
+router.get('/api/data', async (req, res) => {
+  const body = await readFullBody(req);
+  try {
+    res.send(process(body));
+  } finally {
+    auditLog.save({ requestId: req.id, status: res.statusCode });
+    // Clean up body reference explicitly
+    body = null;
+  }
+});
+```
+
+### Cause #2: Response-logging middleware collecting Buffers/String bodies into an unbounded array
+
+```
+// BAD — every response body stored forever for "logging"
+const responseLog = []; // grows without bound
+
+function responseLogger(req, res, next) {
+  const originalEnd = res.end;
+  res.end = function(...args) {
+    // Capture the response body BEFORE it's sent
+    if (args[0]) {
+      responseLog.push({
+        url: req.url,
+        method: req.method,
+        status: res.statusCode,
+        body: args[0],           // ← Buffer or large string, never removed
+        timestamp: Date.now()
+      });
+    }
+    originalEnd.apply(this, args);
+  };
+  next();
+}
+
+// After 48 hours at moderate traffic, responseLog contains millions of entries
+```
+
+**Fix:** Implement a ring buffer or bounded queue:
+
+```js
+// GOOD — bounded circular buffer
+class BoundedLog {
+  constructor(maxSize = 10_000) {
+    this.buffer = new Array(maxSize);
+    this.head = 0;
+    this.full = false;
+  }
+  
+  push(entry) {
+    this.buffer[this.head] = entry;
+    this.head = (this.head + 1) % this.buffer.length;
+    if (this.head === 0) this.full = true;
+  }
+  
+  // optionally: export for /internal/logs endpoint
+  toArray() {
+    return this.full
+      ? [...this.buffer.slice(this.head), ...this.buffer.slice(0, this.head)]
+      : this.buffer.slice(0, this.head);
+  }
+}
+
+// And critically: do NOT serialize full response bodies. Store metadata only.
+const responseLog = new BoundedLog(10000);
+
+function responseLogger(req, res, next) {
+  const start = process.hrtime.bigint();
+  const originalEnd = res.end;
+  
+  res.end = function(...args) {
+    const duration = Number(process.hrtime.bigint() - start) / 1e6;
+    responseLog.push({
+      url: req.url,
+      method: req.method,
+      status: res.statusCode,
+      durationMs: Math.round(duration * 100) / 100,
+      contentLength: typeof args[0] === 'string' ? args[0].length : 0
+      // NO body, NO response data
+    });
+    originalEnd.apply(this, args);
+  };
+  next();
+}
+```
+
+### Cause #3: Detached ArrayBuffers from Buffer slicing/copying patterns
+
+```
+// BAD — creating buffers from slices of larger buffers keeps the entire
+// original allocation alive via the backing store
+function extractField(buffer, offset, length) {
+  return buffer.slice(offset, offset + length);  // shares backing store in some Node versions
+}
+
+// In a loop processing many responses:
+for (const response of responses) {
+  const headers = extractField(response.rawBuffer, 0, 64);
+  const body = extractField(response.rawBuffer, 64, response.contentLength);
+  // header and body Buffers share the SAME massive backing ArrayBuffer
+  // as long as ANY slice references it, the whole thing stays allocated
+}
+```
+
+**Fix:** Copy out of the backing store so the parent can be GC'd:
+
+```js
+// GOOD — copies data, breaks the backing-store connection
+function extractField(buffer, offset, length) {
+  const slice = buffer.slice(offset, offset + length);
+  return Buffer.from(slice); // allocates NEW backing store, parent is freeable
+}
+
+// Or use the explicit copy method:
+function extractFieldCopy(buffer, offset, length) {
+  const copy = Buffer.allocUnsafe(length);
+  buffer.copy(copy, 0, offset, offset + length);
+  return copy;
+}
+```
+
+Also check for `.subarray()` vs `.slice()` — TypedArray `.subarray()` always returns a view sharing the same underlying ArrayBuffer. Node.js `Buffer.subarray()` does NOT share, but if your code uses `Uint8Array` or similar, it does.
+
+---
+
+## Prioritized Action Plan
+
+| Priority | Action | Expected Impact |
+|----------|--------|-----------------|
+| **P0** | Deploy `/internal/listener-stats` + `/internal/metrics` endpoints | Immediate visibility into leak rate |
+| **P0** | Fix response-logging middleware to use bounded buffer + strip bodies | Likely eliminates 60-80% of RSS growth |
+| **P1** | Replace `emitter.on()` with `emitter.once()` in request handlers | Eliminates closure accumulation |
+| **P1** | Add `external` byte monitoring to your OOM alerting | Better early warning than RSS alone |
+| **P2** | Audit all `.pipe()`, `.concat()`, Buffer slicing across the codebase | Prevents secondary leaks |
+| **P2** | Set kubernetes `limitMemory` slightly above baseline (not 4GB) | Forces faster restarts while investigating |
+
+**Immediate kubectl safety net** — until fixed, reduce the grace period so OOM-killed pods restart faster:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "sleep 2"]  # shorter than default 30s
+```
+
+And consider setting `spec.containers.resources.limits.memory` to ~1GB instead of letting it grow unbounded. A 4GB limit with slow restart masks the severity of the leak.

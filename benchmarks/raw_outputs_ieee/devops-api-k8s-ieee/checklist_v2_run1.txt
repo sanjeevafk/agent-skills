@@ -1,0 +1,545 @@
+[exit=0 latency=29.86s]
+I'll produce the complete production manifests with full explanation. Let me structure this by component.
+
+## State Design Summary
+
+| Component | Purpose | Key Numbers |
+|-----------|---------|-------------|
+| Startup probe | Survive 20s cold-cache warmup | 40 × 2s = 80s ceiling |
+| Liveness probe | Detect hung goroutines | 5 × 3 = 15s fail fast |
+| Readiness probe | Drain before kill | PreStop 15s + 5s grace buffer |
+| HPA | Scale 3→10 on CPU + queue depth | Target 65% CPU, 50 queue entries |
+| PDB | Survive node drains | minAvailable: 2 (guarantees ≥2 when 3 running) |
+| Resources | No p99 CPU throttling | request=250m, limit=1000m (4x headroom) |
+
+---
+
+## 1. Namespace (prerequisite)
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api-production
+  labels:
+    env: production
+```
+
+---
+
+## 2. Secret — file-mounted (not env)
+
+Assumes an external secret operator or sealed-secrets provisioner already manages this. The manifest here is what we ask for:
+
+```yaml
+# deploy/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+  namespace: api-production
+type: Opaque
+stringData:                       # <-- NOT base64 encoded; SOPS/Vault handles that
+  db-url: "postgres://app@db:5432/api"
+  jwt-public-key.pem: |
+    -----BEGIN PUBLIC KEY-----
+    ...
+    -----END PUBLIC KEY-----
+  tls-cert.pem: |
+    ...
+  tls-key.pem: |
+    ...
+```
+
+---
+
+## 3. ConfigMap
+
+```yaml
+# deploy/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: api-production
+data:
+  LOG_LEVEL: "info"
+  GO_GC_FLAGS: "-Gcflags=all=-l"   # disable inlining for slower but debuggable builds
+  PORT: "8080"
+```
+
+---
+
+## 4. Core Workload — Deployment
+
+```yaml
+# deploy/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: api-production
+  labels:
+    app: api
+    version: "2.1.0"
+spec:
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0          # never drop traffic during rollout
+      maxSurge: 1                # add exactly one extra pod, then remove old
+  # --- replica count left unset; HPA controls it ---
+
+  template:
+    metadata:
+      labels:
+        app: api
+        version: "2.1.0"
+    spec:
+      serviceAccountName: api-sa
+      automountServiceAccountToken: false
+
+      # Graceful shutdown budget — must exceed PreStop sleep
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: api
+          image: ghcr.io/org/api:2.1.0       # NEVER :latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ---- Environment from ConfigMap (non-secret only) ----
+          envFrom:
+            - configMapRef:
+                name: api-config
+
+          # ---- Resource sizing: no p99 CPU throttling ----
+          # Request = sustainable baseline; limit = burst ceiling
+          resources:
+            requests:
+              cpu: "250m"           # ~1/4 core guaranteed → p50 sustained load
+              memory: "256Mi"       # Go runtime is lean; this covers GC overhead
+            limits:
+              cpu: "1000m"          # 1 full core burst cap — prevents noisy neighbor
+              memory: "512Mi"       # 2× request for burst / GC pauses
+
+          # ---- Security Context ----
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534        # nobody
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          # ---- Probes ----
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 40     # critical: 40 * 2s = 80s total startup window
+            periodSeconds: 2         # polls every 2s during cold start
+            # After 80s without success → restart
+            # Covers: binary load + DB connect + 20s cache warmup + margin
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5   # don't probe until past startup phase
+            periodSeconds: 5
+            failureThreshold: 3      # 3 failures = 15s → kills & restarts
+            timeoutSeconds: 3        # per-request timeout (don't wait forever)
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1      # recover immediately when /ready returns 200
+            timeoutSeconds: 3
+
+          # ---- Secret volume mounts (file-based, not env vars) ----
+          volumeMounts:
+            - name: secrets
+              mountPath: /etc/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: secrets
+          secret:
+            secretName: api-secrets
+        - name: tmp
+          emptyDir: {}               # scratch space for temp files
+
+      # ---- Anti-affinity: spread pods across nodes ----
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["api"]
+                topologyKey: kubernetes.io/hostname
+```
+
+### Probe Threshold Arithmetic Explained
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    STARTUP PROBES                           │
+│                                                             │
+│  failureThreshold = 40                                      │
+│  periodSeconds = 2                                          │
+│  ──────────────────────                                     │
+│  Total ceiling = 40 × 2s = 80 seconds                        │
+│                                                             │
+│  Timeline:                                                  │
+│  T+0s    Container starts                                   │
+│  T+2s    Probe 1 hits /health                               │
+│  T+4s    Probe 2                                           │
+│  ...                                                          │
+│  T+20s   Cache warmup completes                             │
+│  T+78s   Probe 39 — still ok                                │
+│  T+80s   Probe 40 fails → container restarted                │
+│                                                             │
+│  Why 2s period (not 5s)?                                    │
+│  - Faster detection means we can roll out earlier             │
+│  - 80s gives 60s margin over 20s warmup = safe              │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                   LIVENESS PROBES                           │
+│                                                             │
+│  failureThreshold = 3                                       │
+│  periodSeconds = 5                                          │
+│  ──────────────────────                                     │
+│  Detection time = 3 × 5s = 15 seconds                        │
+│                                                             │
+│  Catches: stuck goroutines, DB connection pool exhaustion,    │
+│           deadlocks where HTTP server doesn't respond.        │
+│                                                             │
+│  initialDelaySeconds = 5 — overlaps with early startup      │
+│  But: liveness resets on first successful startupProbe hit    │
+│  So: liveness effectively starts counting after warmup done   │
+│                                                             │
+│  Why not lower?                                               │
+│  - Under load, 5s period means a single slow GC could false-  │
+│    trigger at threshold=2. At 3 we tolerate one spike.       │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                 READINESS PROBES                            │
+│                                                             │
+│  path: /ready (different from /health!)                     │
+│  failureThreshold = 3                                       │
+│  periodSeconds = 5                                          │
+│  ──────────────────────                                     │
+│  Removal from endpoints = 15 seconds                         │
+│                                                             │
+│  /ready returns 503 during:                                 │
+│  - Cache warming (< 20s cold start)                         │
+│  - Dependency unavailability (downstream degraded)          │
+│  - During PreStop drain (see termination sequence)          │
+│                                                             │
+│  successThreshold = 1 — re-add to service immediately       │
+│  when /ready flips back to 200                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Service
+
+```yaml
+# deploy/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: api-production
+  labels:
+    app: api
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+```
+
+---
+
+## 6. Horizontal Pod Autoscaler — CPU + Custom Queue Depth
+
+```yaml
+# deploy/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: api-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    # Primary: CPU utilization across pods
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+
+    # Secondary: Custom metric from application — queue depth
+    # Requires Prometheus Adapter exposing the metric
+    # Metric name format: api_queue_depth_per_pod (histogram/gauge summed per-pod)
+    - type: Pods
+      pods:
+        metric:
+          name: api_queue_depth_per_pod
+        target:
+          type: AverageValue
+          averageValue: "50"
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0     # react immediately to load spikes
+      policies:
+        - type: Percent
+          value: 100                     # can add up to 100% of current replicas per period
+          periodSeconds: 60
+        - type: Pods
+          value: 4                       # OR add up to 4 pods per period
+          periodSeconds: 60
+      # Select the most aggressive policy
+      selectPolicy: Max
+
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 5-minute cooldown — prevents flapping
+      policies:
+        - type: Percent
+          value: 25                      # remove at most 25% of replicas per period
+          periodSeconds: 60
+        - type: Pods
+          value: 1                       # OR remove 1 pod per period
+          periodSeconds: 60
+      # Select the least aggressive to de-scale slowly
+      selectPolicy: Min
+```
+
+### HPA Behavior Notes
+
+- **scaleUp** has `stabilizationWindowSeconds: 0` so we react instantly to CPU or queue-depth spikes. The two policies cap how aggressive we are per minute.
+- **scaleDown** has a **300-second (5-minute) cooldown** because spinning down then back up ("flapping") wastes more resources and hurts latency than keeping a couple extra pods around.
+- Both CPU (65% utilization) and queue depth (avg 50 per pod) must be satisfied — HPA scales to whichever demand is higher.
+
+---
+
+## 7. PodDisruptionBudget
+
+```yaml
+# deploy/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+  namespace: api-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api
+```
+
+### PDB Rationale
+
+| Scenario | Replicas Available | Pods Drained | Min Available Protected |
+|----------|-------------------|--------------|------------------------|
+| 3 pods running | 2 stay up | 1 voluntarily disrupted | ✅ |
+| 4 pods running (HPA scaled up) | 2 stay up | 2 drained | ✅ |
+| Node upgrade evicts | scheduler respects PDB | gradual drain | ✅ |
+| minAvailable: 2 ensures at least 2 pods always serve traffic even during voluntary disruptions (drain, rolling updates with maxSurge limited by PDB) |
+
+If you want to guarantee 100% availability during PDB-controlled disruptions, use `maxUnavailable: 0` instead, but that blocks all voluntary disruptions including some node drains. The `minAvailable: 2` approach is the standard trade-off.
+
+---
+
+## 8. RBAC — Least Privilege
+
+```yaml
+# deploy/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-sa
+  namespace: api-production
+automountServiceAccountToken: false
+
+# App does NOT call the K8s API → no Role needed
+# This ServiceAccount alone enforces zero API access
+```
+
+Since the API is stateless and doesn't interact with the Kubernetes API server, we don't create any Roles or RoleBindings. The `automountServiceAccountToken: false` on both the SA and pod level ensures no token gets injected into the pod filesystem.
+
+---
+
+## Termination-Drain Sequence (Zero-Dropped Requests)
+
+```
+Time    Event                                    What Happens
+────    ────                                     ─────────────
+
+T+0     kubectl rollout restart deployment/api   Or Helm upgrade triggers new revision
+
+T+0+    New ReplicaSet created, old RS remains   RollingUpdate with maxUnavailable=0
+        minReadySeconds not needed (readiness    ensures ready before considering it up
+
+T+~5s   Readiness probe hits /ready on OLD pods  Old pods still serving
+
+T+~10s  New pods pass startupProbe → become      New capacity comes online FIRST
+        ready via /ready endpoint
+
+T+~10s  kube-proxy updates iptables: new pod      Traffic already split to new pods
+        IPs added to ClusterService endpoints
+
+T+~15s  PreStop hook executes on OLD pods        SIGTERM sent to container PID 1
+        ┌──────────────────────────────────────┐
+        │ sleep 15                               │ ← graceful drain window
+        │                                        │
+        │ During sleep:                          │
+        │  • Readiness probe /ready → 503        │ ← removed from endpoints
+        │  • Existing connections finish draining │
+        │  • New connections rejected by proxy    │
+        └──────────────────────────────────────┘
+
+T+~15s  (overlap with PreStop) Readiness probe   Pod removed from Service
+        returns 503, kube-proxy stops routing     endpoints within 15s (3 × 5s)
+        traffic to this pod
+
+T+~30s  PreStop sleep finishes, SIGCONT sent,     Application's signal handler catches
+        app receives SIGTERM                      SIGTERM and begins internal cleanup:
+                                                – Close listener sockets
+                                                – Wait for in-flight requests (≤15s)
+                                                – Flush buffered logs/metrics
+                                                – Shutdown DB connection pool gracefully
+
+T+~30s  Container exits within terminationGrace   Old pod terminates, replaced entirely
+        PeriodSeconds (30s) = 15s PreStop + 15s   No request dropped if handler waits
+        buffer for slowest inflight request        properly ≤15s
+
+T+30s+  Cleanup: stale pods gone, new ones fully  Rollout complete, all traffic on NEW pods
+        healthy
+```
+
+### Critical Go Code Requirements for This to Work
+
+Your Go HTTP server MUST handle SIGTERM properly. Here's the minimal correct pattern:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+)
+
+func main() {
+    srv := &http.Server{
+        Addr:         ":8080",
+        Handler:      router(), // your mux
+        ReadTimeout:  15 * time.Second,
+        WriteTimeout: 30 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+
+    // Start server in background
+    go func() {
+        log.Printf("listening on %s", srv.Addr)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("listen: %v", err)
+        }
+    }()
+
+    // Graceful shutdown on SIGTERM
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGTERM)
+    <-quit
+    log.Println("shutting down gracefully...")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Fatalf("server forced to shutdown: %v", err)
+    }
+    log.Println("server exited")
+}
+```
+
+Without this `srv.Shutdown()` pattern, the container will receive SIGKILL at `terminationGracePeriodSeconds=30` deadline, dropping whatever in-flight requests haven't completed.
+
+---
+
+## Full Manifest Apply Order
+
+```bash
+kubectl apply -f deploy/namespace.yaml
+kubectl apply -f deploy/secret.yaml
+kubectl apply -f deploy/configmap.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/deployment.yaml
+kubectl apply -f deploy/service.yaml
+kubectl apply -f deploy/hpa.yaml
+kubectl apply -f deploy/pdb.yaml
+```
+
+Verify everything came up clean:
+
+```bash
+# Confirm all components exist
+kubectl get deployments,hpa,pdb,service -n api-production
+
+# Watch rollout progress
+kubectl rollout status deployment/api -n api-production --timeout=120s
+
+# Verify HPA is tracking metrics
+kubectl get hpa api-hpa -n api-production -w
+
+# Confirm PDB is enforcing
+kubectl get pdb api-pdb -n api-production -o yaml
+
+# Check probe responses on a running pod
+POD=$(kubectl get pods -n api-production -l app=api -o jsonpath='{.items[0].metadata.name}')
+kubectl exec "$POD" -n api-production -- wget -qO- http://localhost:8080/health
+kubectl exec "$POD" -n api-production -- wget -qO- http://localhost:8080/ready
+```

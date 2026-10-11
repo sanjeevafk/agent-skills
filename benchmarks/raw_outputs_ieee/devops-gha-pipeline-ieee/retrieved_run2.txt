@@ -1,0 +1,1179 @@
+[exit=0 latency=60.61s]
+I'll design the full GitHub Actions pipeline for this monorepo. Given the scope, I'll organize this into separate workflow files.
+
+## Architecture Overview
+
+The pipeline is organized as three workflows plus one reusable workflow pattern:
+
+- **`ci.yml`** — CI pipeline (lint, build, test, preview envs)
+- **`deploy-production.yml`** — Deploy gated on environment approval via OIDC
+- **`release.yml`** — Release with SBOM generation + SLSA provenance attestation
+- **Required status checks** documented below for branch/merge-queue protection
+
+---
+
+## Cache-Key Design
+
+The cache strategy uses a layered approach:
+
+1. **Dependency cache** — Keyed on `<os>-pnpm-lock.json-<hash-of-lockfile>`. This invalidates whenever `pnpm-lock.yaml` changes, ensuring we never use stale resolution. On cache miss we run `pnpm install --frozen-lockfile`; on hit we skip download entirely.
+
+2. **Build cache** — Per-package keys built from `<os>-build-<package-name>-<lockfile-hash>`. The build output hash (`sha256(pnpm-lock.yaml)`) ensures cross-package consistency. Since pnpm's store is shared across the workspace, we also save the `.pnpm-store` directory keyed by lockfile hash. Build jobs do an incremental compile (not full rebuild) because tsc with `--incremental` writes `.tsbuildinfo` files.
+
+3. **Node modules cache** — We leverage pnpm's content-addressable store and the action's built-in `cache-dependency-path` parameter, which hashes the lockfile automatically. The key format is:
+   ```
+   <os>-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+   ```
+
+This means:
+- `pnpm-lock.yaml` unchanged → cache hit → near-zero install time
+- Any dep added/removed/touched → cache miss → fresh install → new cache saved
+- Build outputs are partitioned by package name so one app rebuild doesn't bust another
+
+---
+
+## Complete Workflow Files
+
+### `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main, 'release/**']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  merge_group:
+    # Run CI checks for merge queue gating
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '22'
+  PNPM_VERSION: '9.x'
+
+jobs:
+  # ── Determine changed packages ──────────────────────────────
+  changed-packages:
+    name: changed packages
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.set-outputs.outputs.apps }}
+      libs: ${{ steps.set-outputs.outputs.libs }}
+      has_changes: ${{ steps.changed.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed packages
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            # Full build on push — list everything
+            jq -n \
+              --argjson apps '["web","admin","api"]' \
+              --argjson libs '["core-utils","core-types","auth-lib","db-common","logging","config","http-client","ui-kit"]' \
+              '{apps: $apps, libs: $libs}' > /tmp/all.json
+          else
+            git fetch origin main:main 2>/dev/null || true
+            DIFF_BASE="origin/main"
+            # Find changed apps (compare app dirs)
+            APP_CHANGED=()
+            for app_dir in apps/*; do
+              [ -d "$app_dir" ] || continue
+              if git diff --quiet "${DIFF_BASE}..HEAD" -- "$app_dir"; then
+                continue
+              fi
+              APP_CHANGED+=("$app_dir")
+            done
+
+            # Find changed libs
+            LIB_CHANGED=()
+            for lib_dir in libs/*; do
+              [ -d "$lib_dir" ] || continue
+              if git diff --quiet "${DIFF_BASE}..HEAD" -- "$lib_dir"; then
+                continue
+              fi
+              # Also flag all libs if lockfile changed (deps may cascade)
+              if git diff --quiet "${DIFF_BASE}..HEAD" -- pnpm-lock.yaml; then
+                for l in libs/*/package.json; do dirname="$l"; done
+                # We'll resolve names at runtime
+              fi
+              LIB_CHANGED+=("$lib_dir")
+            done
+
+            echo "any=${#APP_CHANGED[@]}+${#LIB_CHANGED[@]}" >> "$GITHUB_OUTPUT"
+
+            # Build JSON arrays of affected package names
+            APPS_JSON="[]"
+            for d in "${APP_CHANGED[@]}"; do
+              NAME=$(basename "$d")
+              APPS_JSON=$(echo "$APPS_JSON" | jq --arg n "$NAME" '. + [$n]')
+            done
+
+            LIBS_JSON="[]"
+            for d in "${LIB_CHANGED[@]}"; do
+              NAME=$(basename "$d")
+              LIBS_JSON=$(echo "$LIBS_JSON" | jq --arg n "$NAME" '. + [$n]')
+            done
+
+            echo "apps=$APPS_JSON" >> "$GITHUB_OUTPUT"
+            echo "libs=$LIBS_JSON" >> "$GITHUB_OUTPUT"
+
+            # If lockfile changed, all libs are affected
+            if ! git diff --quiet "${DIFF_BASE}..HEAD" -- pnpm-lock.yaml; then
+              ALL_LIBS_JSON=$(jq -c '[.dirs[]]' .pnpm-workspace.yaml 2>/dev/null || echo "[]")
+              # Fallback: detect lib directories
+              for d in libs/*/; do
+                [ -d "$d" ] || continue
+                NAME=$(basename "$d")
+                LIBS_JSON=$(echo "$LIBS_JSON" | jq --arg n "$NAME" '. + [$n]')
+              done
+              echo "libs=$LIBS_JSON" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Set outputs
+        id: set-outputs
+        run: |
+          echo "apps=${{ steps.changed.outputs.apps }}" >> "$GITHUB_OUTPUT"
+          echo "libs=${{ steps.changed.outputs.libs }}" >> "$GITHUB_OUTPUT"
+
+  # ── Shared setup (runs once per workflow) ───────────────────
+  setup-environment:
+    name: setup environment
+    runs-on: ubuntu-latest
+    needs: [changed-packages]
+    if: ${{ needs.changed-packages.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      cache_key_prefix: ${{ steps.cache-info.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Extract cache key prefix
+        id: cache-info
+        run: |
+          HASH=$(pnpm hash pnpm-lock.yaml 2>/dev/null || sha256sum pnpm-lock.yaml | cut -c1-16)
+          echo "key=ci-deps-ubuntu-pnpm-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Upload base pnpm store
+        uses: actions/cache/save@v4
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ steps.cache-info.outputs.key }}
+
+      - name: Upload build cache for root
+        uses: actions/cache/save@v4
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          path: .
+          key: ci-build-root-${{ steps.cache-info.outputs.key }}
+
+  # ── Lint ────────────────────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    needs: [setup-environment]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run lint
+        run: pnpm lint
+
+  # ── Build per-app ───────────────────────────────────────────
+  build-apps:
+    name: build ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    needs: [changed-packages, setup-environment]
+    if: always() && fromJson(needs.changed-packages.outputs.apps) != []
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.changed-packages.outputs.apps) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore build cache for ${{ matrix.app }}
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dist/
+            *.tsbuildinfo
+          key: ci-build-${{ matrix.app }}-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          restore-keys: |
+            ci-build-${{ matrix.app }}-
+
+      - name: Build ${{ matrix.app }}
+        run: pnpm --filter @acme/${{ matrix.app }}... build
+
+      - name: Save build cache for ${{ matrix.app }}
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            dist/
+            *.tsbuildinfo
+          key: ${{ steps.restore.outputs.cache-primary-key }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+          retention-days: 7
+
+  # ── Build libs ──────────────────────────────────────────────
+  build-libs:
+    name: build ${{ matrix.lib }}
+    runs-on: ubuntu-latest
+    needs: [changed-packages, setup-environment]
+    if: always() && fromJson(needs.changed-packages.outputs.libs) != []
+    strategy:
+      matrix:
+        lib: ${{ fromJson(needs.changed-packages.outputs.libs) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore build cache for ${{ matrix.lib }}
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dist/
+            *.tsbuildinfo
+          key: ci-build-${{ matrix.lib }}-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          restore-keys: |
+            ci-build-${{ matrix.lib }}-
+
+      - name: Build ${{ matrix.lib }}
+        run: pnpm --filter @acme/${{ matrix.lib }}... build
+
+      - name: Save build cache for ${{ matrix.lib }}
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            dist/
+            *.tsbuildinfo
+          key: ${{ steps.restore.outputs.cache-primary-key }}
+
+  # ── Test matrix (Node 20/22 x shards) ───────────────────────
+  test:
+    name: test ${{ matrix.node }} (${{ matrix.shard }}/${{ matrix.total-shards }}) ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    needs: [changed-packages, setup-environment, build-apps, build-libs]
+    if: always()
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        node: [20, 22]
+        shard: [1, 2, 3, 4]
+        total-shards: [4]
+        package: ${{ fromJSON(format('[{0},{1}]', toJson(needs.changed-packages.outputs.apps), toJson(needs.changed-packages.outputs.libs))) }}
+      fail-fast: false
+      max-parallel: 32
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dist/
+            *.tsbuildinfo
+          key: ci-build-${{ matrix.package }}-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Build transitive deps
+        run: pnpm --filter @acme/${{ matrix.package }}... build
+
+      - name: Run tests
+        run: pnpm --filter @acme/${{ matrix.package }} test -- --shard=${{ matrix.shard }}/${{ matrix.total-shards }}
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-node${{ matrix.node }}-shard${{ matrix.shard }}-${{ matrix.package }}
+          path: |
+            apps/${{ matrix.package }}/coverage/
+            libs/${{ matrix.package }}/coverage/
+          retention-days: 14
+
+  # ── Type-check all ──────────────────────────────────────────
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    needs: [setup-environment]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check all packages
+        run: pnpm run --parallel typecheck
+
+  # ── Ephemeral preview environments per PR ───────────────────
+  preview:
+    name: preview ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    needs: [changed-packages, test, typecheck, build-apps]
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(fromJSON(needs.changed-packages.outputs.apps), matrix.app)
+    concurrency:
+      group: preview-${{ matrix.app }}-${{ github.head_ref }}
+      cancel-in-progress: true
+    timeout-minutes: 30
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_${{ matrix.app }}_PROJECT_ID }}
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.changed-packages.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Restore pnpm store
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ci-store-${{ needs.setup-environment.outputs.cache_key_prefix }}
+          fail-on-cache-miss: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+
+      - name: Deploy to Vercel Preview
+        uses: amondnet/vercel-action@v25
+        id: deploy
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          working-directory: ./apps/${{ matrix.app }}
+          vercel-org-id: ${{ env.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ env.VERCEL_PROJECT_ID }}
+          vercel-args: '--scope=acme-preview'
+
+      - name: Comment PR with preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = '${{ steps.deploy.outputs.preview-url }}';
+            const issueNumber = context.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `🚀 Preview of \`@acme/${{ matrix.app }}\` is live:\n\n${url}`
+            });
+
+  # ── Summary gate ────────────────────────────────────────────
+  pr-gate:
+    name: PR gate
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [lint, build-apps, build-libs, test, typecheck, preview]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any required job failed
+        run: |
+          for job in "${{ join(needs.*.result, ' ') }}"; do
+            if [ "$job" = "failure" ]; then
+              echo "::error::Pipeline failed"
+              exit 1
+            fi
+          done
+
+```
+
+---
+
+### `.github/workflows/deploy-production.yml`
+
+```yaml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      target_apps:
+        description: 'Comma-separated app names (empty = all)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+permissions:
+  id-token: write   # Critical: OIDC token for cloud federation (no static credentials)
+  contents: read
+
+jobs:
+  # ── Validate & prepare ────────────────────────────────────
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.set-outputs.outputs.apps }}
+      environment: ${{ steps.set-env.outputs.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine deploy targets
+        id: set-outputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.target_apps }}" ]; then
+            IFS=',' read -ra APPLIST <<< "${{ github.event.inputs.target_apps }}"
+            JSON=$(printf '%s\n' "${APPLIST[@]}" | jq -R . | jq -sc .)
+          else
+            JSON='["web","admin","api"]'
+          fi
+          echo "apps=$JSON" >> "$GITHUB_OUTPUT"
+
+      - name: Set environment variable
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "env=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "env=production" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Build for production ──────────────────────────────────
+  build-production:
+    name: build production
+    runs-on: ubuntu-latest
+    needs: [validate]
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.validate.outputs.apps) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: '9.x' }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build ${{ matrix.app }}
+        run: pnpm --filter @acme/${{ matrix.app }}... build
+
+      - name: Run production validation
+        run: pnpm --filter @acme/${{ matrix.app }} start --dry-run || true
+
+      - name: Upload production bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+          retention-days: 5
+
+  # ── Staging deploy (auto) ─────────────────────────────────
+  deploy-staging:
+    name: deploy to staging
+    runs-on: ubuntu-latest
+    needs: [validate, build-production]
+    if: needs.validate.outputs.environment == 'staging' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: staging
+      url: https://staging.acme.com
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.validate.outputs.apps) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: '9.x' }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download production bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: prod-dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+
+      # OIDC-based auth — no long-lived keys stored
+      - name: Authenticate to cloud (OIDC)
+        id: auth
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # No 'access-token' provided — OIDC token auto-generated
+          audience: 'https://management.azure.com/.default'
+
+      - name: Deploy ${{ matrix.app }} to staging
+        run: |
+          az webapp deploy \
+            --resource-group acme-staging \
+            --name "${{ matrix.app }}-staging" \
+            --src-path apps/${{ matrix.app }}/dist/ \
+            --type staticsites
+
+      - name: Smoke test staging
+        run: |
+          curl -sf https://${{ matrix.app }}-staging.acme.com/health || exit 1
+
+  # ── Production deploy (manual gate) ───────────────────────
+  deploy-production:
+    name: deploy to production
+    runs-on: ubuntu-latest
+    needs: [validate, build-production, deploy-staging]
+    # Explicit manual gate — requires GitHub environment approval
+    if: >-
+      (needs.validate.outputs.environment == 'production' &&
+       contains(github.ref, 'main')) ||
+      github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      # Gated on required reviewer(s) configured in repo settings
+      url: https://acme.com
+    # Grant OIDC token for cloud auth during deployment
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.validate.outputs.apps) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: '9.x' }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download production bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: prod-dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+
+      # ── OIDC Federation ─────────────────────────────────────
+      # Azure AAD application trusts this GitHub Actions OIDC provider.
+      # Configuration is done in Azure portal (see explanation below).
+      #
+      # Trust policy grants:
+      #   - Repository: acme/monorepo
+      #   - Condition: refs/heads/main AND environment:production
+      #
+      # At runtime, `azure/login` requests an OIDC token from
+      # `ghactions.io` and exchanges it for an Azure AD access
+      # token. No client secret or service principal key is
+      # stored anywhere. Rotation is automatic.
+      #
+      # ── Alternate Cloud Providers ───────────────────────────
+      # AWS equivalent:
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/deploy-role
+      #     aws-region: us-east-1
+      # (OIDC trust policy configured in AWS IAM)
+      #
+      # GCP equivalent:
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: projects/123/locations/global/workloadIdentityPools/github/providers/gh-actions
+      #     service_account: deploy-sa@project.iam.gserviceaccount.com
+
+      - name: Authenticate to cloud (OIDC)
+        id: auth
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          audience: 'https://management.azure.com/.default'
+
+      - name: Deploy ${{ matrix.app }} to production
+        run: |
+          az webapp deploy \
+            --resource-group acme-production \
+            --name "${{ matrix.app }}-prod" \
+            --src-path apps/${{ matrix.app }}/dist/ \
+            --type staticsites
+
+      - name: Health check production
+        run: |
+          echo "Verifying production health..."
+          MAX_RETRIES=10
+          RETRY=0
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            if curl -sf https://${{ matrix.app }}.acme.com/health > /dev/null 2>&1; then
+              echo "Health check passed"
+              exit 0
+            fi
+            RETRY=$((RETRY + 1))
+            sleep 10
+          done
+          echo "Health check failed after retries"
+          exit 1
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "::notice::Production deployment of ${{ matrix.app }} successful"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "::warning::Deployment failed, initiating rollback for ${{ matrix.app }}"
+          az webapp deploy \
+            --resource-group acme-production \
+            --name "${{ matrix.app }}-prod" \
+            --backup-name "$(az webapp deployment list-backups --resource-group acme-production --name ${{ matrix.app }}-prod --query '[0].id' -o tsv)" \
+            --target-commit-id "" \
+            --type staticsites
+```
+
+---
+
+### `.github/workflows/release.yml`
+
+```yaml
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write        # Create releases + upload assets
+  id-token: write        # OIDC for cosign attestation signing
+  packages: write        # Publish to GH Packages (optional)
+
+jobs:
+  # ── Assemble release artifacts ────────────────────────────
+  assemble:
+    name: assemble release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with: { version: '9.x' }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version: $TAG"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm --recursive --filter '@acme/*' build
+
+      - name: Package release tarball
+        run: |
+          mkdir -p dist/packages
+          for app in apps/* libs/*; do
+            [ -d "$app" ] || continue
+            NAME=$(basename "$app")
+            if [[ "$app" == apps/* ]]; then
+              cp -r "$app/dist" dist/packages/${NAME}-dist/ || true
+            fi
+          done
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ steps.version.outputs.tag }}
+          path: dist/
+          retention-days: 90
+
+  # ── Generate SBOM (Software Bill of Materials) ────────────
+  sbom:
+    name: generate SBOM
+    runs-on: ubuntu-latest
+    needs: [assemble]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: '9.x' }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Generate CycloneDX SBOM using `npm audit` + custom script
+      - name: Generate CycloneDX SBOM
+        uses: CycloneDX/gh-gomod-generate-sbom@v1  # Or npm-equivalent
+        with:
+          version: 1.4
+          output: sbom-cyclonedx-${{ needs.assemble.outputs.version }}.json
+
+      # Alternative: use syft directly
+      - name: Generate Syft SBOM (SPDX format)
+        uses: anchore/syft-action@v1
+        with:
+          path: .
+          output: sbom-spdx-${{ needs.assemble.outputs.version }}.spdx.json
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms-${{ needs.assemble.outputs.version }}
+          path: |
+            sbom-cyclonedx-${{ needs.assemble.outputs.version }}.json
+            sbom-spdx-${{ needs.assemble.outputs.version }}.spdx.json
+          retention-days: 90
+
+  # ── Artifact attestation (SLSA provenance) ────────────────
+  attest:
+    name: sign artifacts
+    runs-on: ubuntu-latest
+    needs: [assemble, sbom]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.assemble.outputs.version }}
+          path: dist/
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms-${{ needs.assemble.outputs.version }}
+          path: sboms/
+
+      # Provenance generation (in-toto / SLSA)
+      - name: Generate SLSA provenance
+        uses: slsa-framework/slsa-github-generator/.github/workns/generator_container@v1
+        with:
+          base64-subject: "<base64-encoded-digest>"
+          predicate-type: slsa.provenance
+
+      # Sign with cosign using GitHub OIDC (no stored keypair)
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Authenticate to Google Workload Identity (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GKE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GKE_SIGNER_SERVICE_ACCOUNT }}
+
+      - name: Sign artifacts with cosign
+        run: |
+          for artifact in dist/**; do
+            [ -f "$artifact" ] || continue
+            DIGEST=$(sha256sum "$artifact" | awk '{print $1}')
+            cosign sign \
+              --yes \
+              --identity-token="" \
+              "artifact:${artifact}@sha256:${DIGEST}"
+          done
+
+      # Attestation metadata
+      - name: Upload provenance attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-${{ needs.assemble.outputs.version }}
+          path: |
+            sboms/
+            *.sig
+            *.pem
+          retention-days: 90
+
+  # ── Create GitHub Release ─────────────────────────────────
+  create-release:
+    name: create release
+    runs-on: ubuntu-latest
+    needs: [assemble, attest]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate changelog
+        run: |
+          git log $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo HEAD)..HEAD --pretty=format:"* %s (%h)" > CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.assemble.outputs.version }}
+          name: Release ${{ needs.assemble.outputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: ${{ contains(needs.assemble.outputs.version, '-') }}
+          generate_release_notes: true
+```
+
+---
+
+## Required Status Checks & Merge Queue Wiring
+
+### Branch Protection Rules (via Admin UI or CLI)
+
+```bash
+# Via GitHub CLI — apply to `main` branch:
+gh api repos/{owner}/{repo}/branch-protection/branches/main \
+  --method PUT \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $GH_TOKEN" \
+  -f required_status_checks='
+  {
+    "strict": true,
+    "contexts": [
+      "lint",
+      "typecheck",
+      "pr-gate"
+    ]
+  }' \
+  -f required_pull_request_reviews='
+  {
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": true,
+    "required_approving_review_count": 1
+  }' \
+  -f enforce_admins=true \
+  -f restrictions=null \
+  -f required_linear_history=true \
+  -f allow_force_pushes=false \
+  -f allow_deletions=false \
+  -f required_conversation_resolution=true
+```
+
+### Merge Queue Configuration
+
+The `ci.yml` workflow already includes `merge_group` as a trigger event. Here's how it integrates:
+
+```yaml
+# In ci.yml — already included above:
+on:
+  ...
+  merge_group:
+    # Triggers when a commit enters the merge queue
+```
+
+**How merge queue gating works:**
+
+1. When a PR is merged, its commit enters the merge queue
+2. GitHub fires `merge_group` events running `ci.yml` against the queued commit
+3. All required status checks (`lint`, `typecheck`, `pr-gate`) must pass
+4. If they pass, the commit moves to the next position in the queue
+5. If any check fails, the commit is ejected from the queue
+
+**Key settings for merge queue:**
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `strict` (status checks) | `true` | Re-bases on latest `main` before queue entry |
+| Required checks | `lint`, `typecheck`, `pr-gate` | Minimum viable gate; omit verbose test matrix from queue to reduce wait time |
+| Max queue size | 3-5 commits | Balances throughput with queue staleness |
+| Check timeout | 15 min per job | Prevents zombie entries |
+
+**Performance note:** The merge queue skips the full test matrix (which would be too slow). It runs only lightweight checks (`lint`, `typecheck`, `pr-gate`). The full test suite runs on the PR itself. Once the PR passes all checks and gets reviewed, its commit enters the queue — at which point only fast checks re-run to confirm nothing broke during queuing.
+
+---
+
+## OIDC Trust Configuration
+
+### Azure Example
+
+```bash
+# 1. Create a federated credential on an Azure AD App Registration
+az ad app federation Credential create \
+  --id "${AZURE_APP_REGISTRATION_ID}" \
+  --parameters <<EOF
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:acme/monorepo:ref:refs/heads/main",
+  "name": "gh-actions-production",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+EOF
+
+# 2. For production environment, restrict further:
+az ad app federation Credential create \
+  --id "${AZURE_APP_REGISTRATION_ID}" \
+  --parameters <<EOF
+{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:acme/monorepo:environment:production",
+  "name": "gh-actions-production-gated",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+EOF
+```
+
+**Trust chain:**
+
+```
+GitHub Actions runner
+    │
+    ▼  Requests OIDC token from token.actions.githubusercontent.com
+GitHub OIDC Provider (token.actions.githubusercontent.com)
+    │  signs with rotating RSA key
+    ▼  JWT with claims: sub, aud, repository, ref, environment, job_sha256
+Azure AD Trust Policy (federated credential)
+    │  verifies issuer + subject match
+    ▼
+    Exchange succeeds → receives Azure AD Access Token
+    │  scopes: https://management.azure.com/.default
+    ▼
+az cli authenticated to Azure resources
+(no client secret ever stored)
+```
+
+**Critical claims in the JWT:**
+
+| Claim | Value | Purpose |
+|-------|-------|---------|
+| `iss` | `https://token.actions.githubusercontent.com` | Verifies GitHub as issuer |
+| `sub` | `repo:acme/monorepo:ref:refs/heads/main` | Restricts to specific repo + branch |
+| `sub` (gated) | `repo:acme/monorepo:environment:production` | Requires production environment approval |
+| `aud` | `api://AzureADTokenExchange` | Target audience for Azure AD |
+
+### AWS Equivalent
+
+```bash
+# OpenID Connect Provider in IAM
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea11c592d1043e8a6ec92ba68bd
+
+# Trust policy for deployment role
+cat > assume-role-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:sub": "repo:acme/monorepo:environment:production",
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:ref": "refs/heads/main"
+      }
+    }
+  }]
+}
+EOF
+
+aws iam update-role-trust-policy \
+  --role-name deploy-role \
+  --policy-document file://assume-role-policy.json
+```
+
+---
+
+## File Tree Summary
+
+```
+.github/
+├── workflows/
+│   ├── ci.yml              # Lint, build, test matrix, previews, merge queue gate
+│   ├── deploy-production.yml  # Staging (auto) + production (gated) via OIDC
+│   └── release.yml         # Tag-based release with SBOM + SLSA attestation
+```
+
+All three workflows are self-contained, share no state between runs beyond GitHub-hosted caches/artifacts, and follow the principle that every deployment step requires explicit environment context. The CI workflow filters per-package to minimize wasted compute, the test matrix covers both supported LTS Node versions with sharded execution, and the production deploy requires an environment approval gate combined with short-lived OIDC credentials.

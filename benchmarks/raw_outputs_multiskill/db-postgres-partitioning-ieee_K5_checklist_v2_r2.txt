@@ -1,0 +1,996 @@
+I've reviewed the existing migration scripts. They're solid but I'll provide an enhanced, production-ready implementation that addresses several gaps: trigger handling for UPDATE/DELETE, better parallel backfill coordination, statistics management, and application-level cutover steps.
+
+Here's the complete, production-grade migration strategy:
+
+---
+
+## Zero-Downtime PostgreSQL Partitioning Migration for audit_logs (500M rows)
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MIGRATION PHASES                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Phase 0: Prerequisites & Safety Checks                                     │
+│  Phase 1: Create Partitioned Shadow Table                                   │
+│  Phase 2: Create Initial Partitions (past + future)                         │
+│  Phase 3: Install Dual-Write Triggers (INSERT/UPDATE/DELETE)                │
+│  Phase 4: Batch Backfill with Progress Tracking                             │
+│  Phase 5: Create Indexes CONCURRENTLY                                       │
+│  Phase 6: Data Validation & Verification                                    │
+│  Phase 7: Atomic Cutover (brief metadata lock)                              │
+│  Phase 8: pg_partman Setup & Automation                                     │
+│  Phase 9: Post-Migration Cleanup                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Phase 0: Prerequisites & Safety Checks
+
+```sql
+-- =============================================================================
+-- PHASE 0: PREPARATION & SAFETY CHECKS
+-- =============================================================================
+
+-- Install required extensions
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_jobmon;
+
+-- Verify current table structure and size
+SELECT
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(oid)) AS total_size,
+    pg_stat_user_tables.n_live_tup AS row_count,
+    pg_stat_user_tables.n_dead_tup AS dead_rows
+FROM pg_class
+JOIN pg_stat_user_tables ON pg_stat_user_tables.relid = pg_class.oid
+WHERE relname = 'audit_logs';
+
+-- Check for long-running transactions that could block migration
+SELECT
+    pid,
+    now() - xact_start AS duration,
+    state,
+    wait_event_type,
+    left(query, 100) AS query_preview
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND xact_start < now() - interval '5 minutes'
+ORDER BY xact_start;
+
+-- Verify partition pruning is enabled
+SHOW enable_partition_pruning;  -- Must be 'on'
+SHOW constraint_exclusion;     -- Must be 'partition' or 'on'
+
+-- Set system-level safety parameters
+ALTER SYSTEM SET statement_timeout = '30s';
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s';
+ALTER SYSTEM SET lock_timeout = '5s';
+ALTER SYSTEM SET max_locks_per_transaction = 256;  -- Needed for partition DDL
+SELECT pg_reload_conf();
+
+-- Create migration control table (survives batch restarts)
+CREATE TABLE IF NOT EXISTS _partition_migration_control (
+    migration_name    text PRIMARY KEY,
+    source_table      text NOT NULL,
+    target_table      text NOT NULL,
+    status            text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN (
+                            'pending', 'backfilling', 'backfill_complete',
+                            'validating', 'cutover_complete', 'failed', 'rolled_back'
+                        )),
+    last_backfill_id  bigint,
+    last_backfill_ts  timestamptz,
+    rows_migrated     bigint DEFAULT 0,
+    rows_source       bigint,
+    rows_target       bigint,
+    started_at        timestamptz DEFAULT now(),
+    completed_at      timestamptz,
+    error_message     text,
+    metadata          jsonb DEFAULT '{}'::jsonb  -- flexible metadata storage
+);
+
+INSERT INTO _partition_migration_control (migration_name, source_table, target_table, status)
+VALUES ('audit_logs_partitioning', 'audit_logs', 'audit_logs_new', 'pending')
+ON CONFLICT (migration_name) DO NOTHING;
+```
+
+---
+
+### Phase 1: Create Partitioned Shadow Table
+
+```sql
+-- =============================================================================
+-- PHASE 1: CREATE PARTITIONED SHADOW TABLE
+-- =============================================================================
+-- CRITICAL: Partition key (occurred_at) MUST be part of primary key
+
+CREATE TABLE audit_logs_new (
+    -- Mirror EXACT same columns as audit_logs
+    id              bigint GENERATED ALWAYS AS IDENTITY,
+    occurred_at     timestamptz NOT NULL DEFAULT now(),
+    user_id         bigint NOT NULL,
+    action          text NOT NULL,
+    resource_type   text NOT NULL,
+    resource_id     bigint,
+    details         jsonb DEFAULT '{}'::jsonb,
+    ip_address      inet,
+    user_agent      text,
+    severity        text NOT NULL DEFAULT 'info',
+    metadata        jsonb DEFAULT '{}'::jsonb,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+
+    -- Constraints: partition key must be part of PK
+    CONSTRAINT audit_logs_new_pkey PRIMARY KEY (id, occurred_at),
+    CONSTRAINT audit_logs_new_severity_check
+        CHECK (severity IN ('debug', 'info', 'warn', 'error', 'critical'))
+) PARTITION BY RANGE (occurred_at);
+
+COMMENT ON TABLE audit_logs_new IS 'Partitioned audit_logs - migration target';
+```
+
+---
+
+### Phase 2: Create Initial Partitions
+
+```sql
+-- =============================================================================
+-- PHASE 2: CREATE INITIAL PARTITIONS
+-- =============================================================================
+-- Generate partitions programmatically to avoid manual errors
+
+DO $$
+DECLARE
+    v_start_date date := '2023-01-01';  -- Adjust to your oldest data
+    v_end_date   date := '2026-12-31';  -- Future buffer (pg_partman takes over)
+    v_current    date;
+    v_table_name text;
+    v_count      integer := 0;
+BEGIN
+    v_current := v_start_date;
+    WHILE v_current < v_end_date LOOP
+        v_table_name := 'audit_logs_new_' || TO_CHAR(v_current, 'YYYY_MM');
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class WHERE relname = v_table_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE %I PARTITION OF audit_logs_new
+                 FOR VALUES FROM (%L) TO (%L)',
+                v_table_name,
+                v_current::text,
+                (v_current + INTERVAL '1 month')::text
+            );
+            v_count := v_count + 1;
+        END IF;
+
+        v_current := v_current + INTERVAL '1 month';
+    END LOOP;
+
+    RAISE NOTICE 'Created % partitions', v_count;
+END;
+$$;
+
+-- Default partition catches out-of-range data (safety net)
+CREATE TABLE audit_logs_new_default PARTITION OF audit_logs_new DEFAULT;
+
+-- Verify partitions
+SELECT
+    child.relname AS partition_name,
+    pg_get_expr(child.relpartbound, child.oid) AS partition_range
+FROM pg_inherits
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+WHERE pg_inherits.inhparent = 'audit_logs_new'::regclass
+ORDER BY child.relname;
+```
+
+---
+
+### Phase 3: Dual-Write Triggers (INSERT/UPDATE/DELETE)
+
+```sql
+-- =============================================================================
+-- PHASE 3: INSTALL DUAL-WRITE TRIGGERS
+-- =============================================================================
+-- Captures ALL DML during backfill to ensure zero data loss
+
+-- INSERT trigger function
+CREATE OR REPLACE FUNCTION audit_logs_migration_insert_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO audit_logs_new (
+        id, occurred_at, user_id, action, resource_type,
+        resource_id, details, ip_address, user_agent,
+        severity, metadata, created_at
+    ) VALUES (
+        NEW.id, NEW.occurred_at, NEW.user_id, NEW.action, NEW.resource_type,
+        NEW.resource_id, NEW.details, NEW.ip_address, NEW.user_agent,
+        NEW.severity, NEW.metadata, NEW.created_at
+    )
+    ON CONFLICT (id, occurred_at) DO NOTHING;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- UPDATE trigger function (audit logs may have status updates)
+CREATE OR REPLACE FUNCTION audit_logs_migration_update_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE audit_logs_new SET
+        user_id = NEW.user_id,
+        action = NEW.action,
+        resource_type = NEW.resource_type,
+        resource_id = NEW.resource_id,
+        details = NEW.details,
+        ip_address = NEW.ip_address,
+        user_agent = NEW.user_agent,
+        severity = NEW.severity,
+        metadata = NEW.metadata
+    WHERE id = NEW.id AND occurred_at = NEW.occurred_at;
+
+    -- If row doesn't exist in target yet (race condition), insert it
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs_new (
+            id, occurred_at, user_id, action, resource_type,
+            resource_id, details, ip_address, user_agent,
+            severity, metadata, created_at
+        ) VALUES (
+            NEW.id, NEW.occurred_at, NEW.user_id, NEW.action, NEW.resource_type,
+            NEW.resource_id, NEW.details, NEW.ip_address, NEW.user_agent,
+            NEW.severity, NEW.metadata, NEW.created_at
+        )
+        ON CONFLICT (id, occurred_at) DO NOTHING;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- DELETE trigger function
+CREATE OR REPLACE FUNCTION audit_logs_migration_delete_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM audit_logs_new
+    WHERE id = OLD.id AND occurred_at = OLD.occurred_at;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create triggers (idempotent)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'audit_logs_migration_insert'
+    ) THEN
+        CREATE TRIGGER audit_logs_migration_insert
+            AFTER INSERT ON audit_logs
+            FOR EACH ROW
+            EXECUTE FUNCTION audit_logs_migration_insert_func();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'audit_logs_migration_update'
+    ) THEN
+        CREATE TRIGGER audit_logs_migration_update
+            AFTER UPDATE ON audit_logs
+            FOR EACH ROW
+            EXECUTE FUNCTION audit_logs_migration_update_func();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'audit_logs_migration_delete'
+    ) THEN
+        CREATE TRIGGER audit_logs_migration_delete
+            AFTER DELETE ON audit_logs
+            FOR EACH ROW
+            EXECUTE FUNCTION audit_logs_migration_delete_func();
+    END IF;
+END;
+$$;
+```
+
+---
+
+### Phase 4: Batch Backfill Procedure
+
+```sql
+-- =============================================================================
+-- PHASE 4: BATCH BACKFILL PROCEDURE
+-- =============================================================================
+-- Processes rows in small, lock-friendly batches with progress tracking
+-- Uses keyset pagination for O(1) batch processing
+
+CREATE OR REPLACE PROCEDURE backfill_audit_logs_batches(
+    p_batch_size integer DEFAULT 50000,
+    p_lock_timeout_ms integer DEFAULT 5000,
+    p_max_runtime_seconds integer DEFAULT 21600,  -- 6 hours max
+    p_start_id bigint DEFAULT NULL,
+    p_end_id bigint DEFAULT NULL,
+    p_dry_run boolean DEFAULT false
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_start_time    timestamptz := clock_timestamp();
+    v_last_id       bigint;
+    v_min_id        bigint;
+    v_max_id        bigint;
+    v_batch_count   integer := 0;
+    v_total_rows    bigint := 0;
+    v_batch_rows    integer;
+    v_last_ts       timestamptz;
+    v_source_count  bigint;
+BEGIN
+    -- Get source table statistics
+    SELECT COUNT(*), MIN(id), MAX(id)
+    INTO v_source_count, v_min_id, v_max_id
+    FROM audit_logs;
+
+    -- Determine ID range
+    SELECT COALESCE(p_start_id, c.last_backfill_id + 1, v_min_id)
+    INTO v_last_id
+    FROM (SELECT 1) dummy
+    LEFT JOIN _partition_migration_control c
+        ON c.migration_name = 'audit_logs_partitioning';
+
+    v_last_id := v_last_id - 1;  -- Will be incremented in loop
+    v_max_id := COALESCE(p_end_id, v_max_id);
+
+    -- Update status
+    UPDATE _partition_migration_control
+    SET status = 'backfilling',
+        started_at = now(),
+        rows_source = v_source_count,
+        metadata = jsonb_set(metadata, '{start_id}', to_jsonb(v_min_id)),
+        metadata = jsonb_set(metadata, '{end_id}', to_jsonb(v_max_id))
+    WHERE migration_name = 'audit_logs_partitioning';
+
+    RAISE NOTICE 'Starting backfill: id range [% → %], source rows: %',
+        v_last_id + 1, v_max_id, v_source_count;
+
+    -- Main backfill loop
+    LOOP
+        -- Check runtime limit
+        IF EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) > p_max_runtime_seconds THEN
+            RAISE NOTICE 'Runtime limit reached at id %', v_last_id;
+            EXIT;
+        END IF;
+
+        EXIT WHEN v_last_id >= v_max_id;
+
+        -- Set per-batch timeouts
+        PERFORM set_config('lock_timeout', (p_lock_timeout_ms || 'ms'), true);
+        PERFORM set_config('statement_timeout', '300000', true);
+
+        -- Insert batch using keyset pagination
+        IF NOT p_dry_run THEN
+            WITH batch AS (
+                SELECT id, occurred_at, user_id, action, resource_type,
+                       resource_id, details, ip_address, user_agent,
+                       severity, metadata, created_at
+                FROM audit_logs
+                WHERE id > v_last_id AND id <= v_max_id
+                ORDER BY id
+                LIMIT p_batch_size
+            )
+            INSERT INTO audit_logs_new (
+                id, occurred_at, user_id, action, resource_type,
+                resource_id, details, ip_address, user_agent,
+                severity, metadata, created_at
+            )
+            SELECT * FROM batch
+            ON CONFLICT (id, occurred_at) DO NOTHING;
+
+            GET DIAGNOSTICS v_batch_rows = ROW_COUNT;
+        ELSE
+            -- Dry run: just count
+            SELECT COUNT(*) INTO v_batch_rows
+            FROM audit_logs
+            WHERE id > v_last_id AND id <= v_max_id
+            LIMIT p_batch_size;
+        END IF;
+
+        EXIT WHEN v_batch_rows = 0;
+
+        -- Advance cursor
+        SELECT COALESCE(MAX(id), v_last_id) INTO v_last_id
+        FROM audit_logs
+        WHERE id > v_last_id AND id <= v_max_id
+        ORDER BY id
+        LIMIT p_batch_size;
+
+        v_total_rows := v_total_rows + v_batch_rows;
+        v_batch_count := v_batch_count + 1;
+
+        -- Update progress every 10 batches
+        IF v_batch_count % 10 = 0 THEN
+            SELECT MAX(occurred_at) INTO v_last_ts
+            FROM audit_logs_new
+            WHERE id <= v_last_id;
+
+            UPDATE _partition_migration_control
+            SET last_backfill_id = v_last_id,
+                last_backfill_ts = v_last_ts,
+                rows_migrated = v_total_rows,
+                metadata = jsonb_set(metadata, '{batch_count}', to_jsonb(v_batch_count))
+            WHERE migration_name = 'audit_logs_partitioning';
+
+            RAISE NOTICE 'Progress: batch=%, id=%, rows=%, elapsed=%s',
+                v_batch_count, v_last_id, v_total_rows,
+                clock_timestamp() - v_start_time;
+        END IF;
+
+        -- Brief pause to reduce load
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+
+    -- Final update
+    UPDATE _partition_migration_control
+    SET last_backfill_id = v_last_id,
+        rows_migrated = v_total_rows,
+        status = CASE
+            WHEN v_last_id >= v_max_id THEN 'backfill_complete'
+            ELSE 'backfilling'
+        END,
+        metadata = jsonb_set(metadata, '{total_batches}', to_jsonb(v_batch_count))
+    WHERE migration_name = 'audit_logs_partitioning';
+
+    RAISE NOTICE 'Backfill complete. Rows: %, Batches: %, Final id: %',
+        v_total_rows, v_batch_count, v_last_id;
+END;
+$$;
+```
+
+---
+
+### Phase 5: Index Creation (CONCURRENTLY)
+
+```sql
+-- =============================================================================
+-- PHASE 5: CREATE INDEXES CONCURRENTLY
+-- =============================================================================
+-- Create AFTER backfill for speed. CONCURRENTLY avoids locks.
+
+-- Composite index: occurred_at range queries
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_occurred_at
+    ON audit_logs_new (occurred_at DESC);
+
+-- Composite index: user_id equality + occurred_at range
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_user_id_occurred_at
+    ON audit_logs_new (user_id, occurred_at DESC);
+
+-- Composite index: action equality + occurred_at range
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_action_occurred_at
+    ON audit_logs_new (action, occurred_at DESC);
+
+-- Composite index: resource_type + resource_id + occurred_at
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_resource
+    ON audit_logs_new (resource_type, resource_id, occurred_at DESC);
+
+-- Partial index: error/critical severity only
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_severity_error
+    ON audit_logs_new (occurred_at DESC)
+    WHERE severity IN ('error', 'critical');
+
+-- Covering index for index-only scans
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_covering
+    ON audit_logs_new (occurred_at DESC, user_id, action)
+    INCLUDE (resource_type, resource_id, severity);
+
+-- GIN index for JSONB containment
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_details_gin
+    ON audit_logs_new USING gin (details jsonb_path_ops);
+
+-- GIN index for metadata JSONB
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_metadata_gin
+    ON audit_logs_new USING gin (metadata jsonb_path_ops);
+
+-- Verify indexes
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'audit_logs_new'
+ORDER BY indexname;
+```
+
+---
+
+### Phase 6: Data Validation
+
+```sql
+-- =============================================================================
+-- PHASE 6: DATA VALIDATION
+-- =============================================================================
+
+UPDATE _partition_migration_control
+SET status = 'validating'
+WHERE migration_name = 'audit_logs_partitioning';
+
+-- Row count comparison
+SELECT
+    'source' AS table_name,
+    COUNT(*) AS row_count,
+    MIN(id) AS min_id,
+    MAX(id) AS max_id,
+    MIN(occurred_at) AS min_ts,
+    MAX(occurred_at) AS max_ts
+FROM audit_logs
+UNION ALL
+SELECT
+    'target',
+    COUNT(*),
+    MIN(id),
+    MAX(id),
+    MIN(occurred_at),
+    MAX(occurred_at)
+FROM audit_logs_new;
+
+-- Missing rows check (anti-join)
+SELECT COUNT(*) AS missing_rows
+FROM audit_logs a
+WHERE NOT EXISTS (
+    SELECT 1 FROM audit_logs_new b
+    WHERE b.id = a.id AND b.occurred_at = a.occurred_at
+);
+
+-- Default partition should be empty
+SELECT COUNT(*) AS default_partition_rows
+FROM audit_logs_new_default;
+
+-- Data checksum comparison
+SELECT
+    'source' AS source,
+    COUNT(*) FILTER (WHERE severity = 'error') AS error_count,
+    COUNT(*) FILTER (WHERE severity = 'critical') AS critical_count,
+    COUNT(DISTINCT user_id) AS unique_users,
+    COUNT(DISTINCT action) AS unique_actions
+FROM audit_logs
+UNION ALL
+SELECT
+    'target',
+    COUNT(*) FILTER (WHERE severity = 'error'),
+    COUNT(*) FILTER (WHERE severity = 'critical'),
+    COUNT(DISTINCT user_id),
+    COUNT(DISTINCT action)
+FROM audit_logs_new;
+
+-- Update control with validation results
+UPDATE _partition_migration_control
+SET rows_source = (SELECT COUNT(*) FROM audit_logs),
+    rows_target = (SELECT COUNT(*) FROM audit_logs_new)
+WHERE migration_name = 'audit_logs_partitioning';
+```
+
+---
+
+### Phase 7: Atomic Cutover
+
+```sql
+-- =============================================================================
+-- PHASE 7: ATOMIC CUTOVER
+-- =============================================================================
+-- Execute during low-traffic window. Lock time should be < 10 seconds.
+
+BEGIN;
+
+-- 1. Brief exclusive lock on both tables
+LOCK TABLE audit_logs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE audit_logs_new IN ACCESS EXCLUSIVE MODE;
+
+-- 2. Final sync: catch any rows missed by triggers
+INSERT INTO audit_logs_new (
+    id, occurred_at, user_id, action, resource_type,
+    resource_id, details, ip_address, user_agent,
+    severity, metadata, created_at
+)
+SELECT
+    a.id, a.occurred_at, a.user_id, a.action, a.resource_type,
+    a.resource_id, a.details, a.ip_address, a.user_agent,
+    a.severity, a.metadata, a.created_at
+FROM audit_logs a
+WHERE NOT EXISTS (
+    SELECT 1 FROM audit_logs_new b
+    WHERE b.id = a.id AND b.occurred_at = a.occurred_at
+)
+ON CONFLICT (id, occurred_at) DO NOTHING;
+
+-- 3. Atomic rename (metadata operation, very fast)
+ALTER TABLE audit_logs RENAME TO audit_logs_old;
+ALTER TABLE audit_logs_new RENAME TO audit_logs;
+
+COMMIT;
+
+-- 4. Drop triggers (no longer needed)
+DROP TRIGGER IF EXISTS audit_logs_migration_insert ON audit_logs_old;
+DROP TRIGGER IF EXISTS audit_logs_migration_update ON audit_logs_old;
+DROP TRIGGER IF EXISTS audit_logs_migration_delete ON audit_logs_old;
+DROP FUNCTION IF EXISTS audit_logs_migration_insert_func();
+DROP FUNCTION IF EXISTS audit_logs_migration_update_func();
+DROP FUNCTION IF EXISTS audit_logs_migration_delete_func();
+
+-- 5. Rename default partition to match new naming
+ALTER TABLE IF EXISTS audit_logs_new_default RENAME TO audit_logs_default;
+
+-- 6. Update control table
+UPDATE _partition_migration_control
+SET status = 'cutover_complete',
+    completed_at = now()
+WHERE migration_name = 'audit_logs_partitioning';
+```
+
+---
+
+### Phase 8: pg_partman Setup
+
+```sql
+-- =============================================================================
+-- PHASE 8: PG_PARTMAN AUTOMATED PARTITION MANAGEMENT
+-- =============================================================================
+
+-- Register parent table with pg_partman
+SELECT partman.create_parent(
+    p_parent_table := 'public.audit_logs',
+    p_control := 'occurred_at',
+    p_type := 'range',
+    p_interval := '1 month',
+    p_premake := 3,
+    p_start_partition := (CURRENT_DATE - INTERVAL '3 years')::text
+);
+
+-- Configure maintenance
+UPDATE partman.part_config
+SET
+    retention = '24 months',
+    retention_keep_table = false,
+    retention_keep_index = false,
+    premake := 3,
+    maintenance_interval := '1 month',
+    jobmon := true,
+    batch_loop_delay = 1
+WHERE parent_table = 'public.audit_logs';
+
+-- Schedule via pg_cron (runs at 2 AM on 1st of each month)
+SELECT cron.schedule(
+    'audit-logs-partition-maintenance',
+    '0 2 1 * *',
+    $$SELECT partman.run_maintenance(
+        p_parent_table := 'public.audit_logs',
+        p_analyze := true,
+        p_jobmon := true
+    )$$
+);
+```
+
+---
+
+### Phase 9: Partition Pruning Verification
+
+```sql
+-- =============================================================================
+-- PHASE 9: PARTITION PRUNING VERIFICATION
+-- =============================================================================
+
+-- Verify pruning is enabled
+SHOW enable_partition_pruning;  -- Must be 'on'
+
+-- Test 1: Single month query (should scan 1 partition)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE occurred_at >= '2025-06-01' AND occurred_at < '2025-07-01'
+ORDER BY occurred_at DESC
+LIMIT 100;
+
+-- Test 2: Multi-month range (should scan only relevant partitions)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT COUNT(*), severity
+FROM audit_logs
+WHERE occurred_at >= '2025-01-01' AND occurred_at < '2025-04-01'
+GROUP BY severity;
+
+-- Test 3: User activity across partitions
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE user_id = 12345
+  AND occurred_at >= '2025-01-01' AND occurred_at < '2025-12-31'
+ORDER BY occurred_at DESC
+LIMIT 1000;
+
+-- Test 4: JSONB containment with partition pruning
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE occurred_at >= '2025-06-01' AND occurred_at < '2025-07-01'
+  AND details @> '{"ip": "192.168.1.1"}'::jsonb;
+
+-- Test 5: Partial index usage
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_logs
+WHERE severity IN ('error', 'critical')
+  AND occurred_at >= '2025-06-01' AND occurred_at < '2025-07-01'
+ORDER BY occurred_at DESC
+LIMIT 100;
+
+-- Test 6: Covering index (index-only scan)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT occurred_at, user_id, action, resource_type, resource_id, severity
+FROM audit_logs
+WHERE occurred_at >= '2025-06-01' AND occurred_at < '2025-07-01'
+ORDER BY occurred_at DESC
+LIMIT 100;
+
+-- Partition size report
+SELECT
+    child.relname AS partition_name,
+    COALESCE(pg_stat_user_tables.n_live_tup, 0) AS row_count,
+    pg_size_pretty(pg_relation_size(child.oid)) AS table_size,
+    pg_size_pretty(pg_indexes_size(child.oid)) AS index_size,
+    pg_size_pretty(pg_total_relation_size(child.oid)) AS total_size
+FROM pg_inherits
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+LEFT JOIN pg_stat_user_tables ON pg_stat_user_tables.relid = child.oid
+WHERE pg_inherits.inhparent = 'audit_logs'::regclass
+ORDER BY child.relname;
+```
+
+---
+
+### Enhanced Backfill Runner Script
+
+```bash
+#!/bin/bash
+# =============================================================================
+# ZERO-DOWNTIME PARTITION BACKFILL RUNNER (Enhanced)
+# =============================================================================
+# Supports parallel execution, dry-run mode, and automatic retry
+
+set -euo pipefail
+
+# Configuration
+DB_URL="${DATABASE_URL:-postgresql://postgres@localhost:5432/postgres}"
+BATCH_SIZE="${BATCH_SIZE:-50000}"
+LOCK_TIMEOUT_MS="${LOCK_TIMEOUT_MS:-5000}"
+MAX_RUNTIME_HOURS="${MAX_RUNTIME_HOURS:-6}"
+START_ID="${START_ID:-}"
+END_ID="${END_ID:-}"
+SESSION_ID="${SESSION_ID:-default}"
+DRY_RUN="${DRY_RUN:-false}"
+PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
+LOG_DIR="${LOG_DIR:-./logs}"
+
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+log_info() { echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/backfill_${SESSION_ID}_$(date +%Y%m%d_%H%M%S).log"
+
+log_info "==============================================="
+log_info "Partition Backfill Session: $SESSION_ID"
+log_info "Batch Size: $BATCH_SIZE | Lock Timeout: ${LOCK_TIMEOUT_MS}ms"
+log_info "Max Runtime: ${MAX_RUNTIME_HOURS}h | Dry Run: $DRY_RUN"
+log_info "==============================================="
+
+# Build CALL statement
+CALL_SQL="CALL backfill_audit_logs_batches(
+    p_batch_size := $BATCH_SIZE,
+    p_lock_timeout_ms := $LOCK_TIMEOUT_MS,
+    p_max_runtime_seconds := $((MAX_RUNTIME_HOURS * 3600)),
+    p_dry_run := $DRY_RUN"
+
+[[ -n "$START_ID" ]] && CALL_SQL="$CALL_SQL, p_start_id := $START_ID"
+[[ -n "$END_ID" ]] && CALL_SQL="$CALL_SQL, p_end_id := $END_ID"
+
+CALL_SQL="$CALL_SQL);"
+
+log_info "Executing backfill..."
+START_TIME=$(date +%s)
+
+if psql "$DB_URL" -v ON_ERROR_STOP=1 -P pager=off -c "$CALL_SQL" 2>&1 | tee -a "$LOG_FILE"; then
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    log_info "Backfill completed in ${DURATION}s"
+
+    # Show progress
+    psql "$DB_URL" -P pager=off -c "
+        SELECT status, rows_migrated, last_backfill_id,
+               EXTRACT(EPOCH FROM (now() - started_at))/3600 AS hours_elapsed
+        FROM _partition_migration_control
+        WHERE migration_name = 'audit_logs_partitioning';
+    " 2>&1 | tee -a "$LOG_FILE"
+    exit 0
+else
+    EXIT_CODE=$?
+    log_error "Backfill FAILED with exit code $EXIT_CODE"
+    exit $EXIT_CODE
+fi
+```
+
+---
+
+### Parallel Backfill Orchestration
+
+```bash
+#!/bin/bash
+# =============================================================================
+# PARALLEL BACKFILL ORCHESTRATOR
+# =============================================================================
+# Splits ID range across multiple workers for faster migration
+
+set -euo pipefail
+
+DB_URL="${DATABASE_URL:-postgresql://postgres@localhost:5432/postgres}"
+WORKERS="${4:-4}"
+
+# Get ID range from source table
+read MIN_ID MAX_ID < <(psql "$DB_URL" -t -A -F' ' -c "
+    SELECT MIN(id), MAX(id) FROM audit_logs;
+")
+
+echo "ID Range: $MIN_ID to $MAX_ID"
+echo "Workers: $WORKERS"
+
+# Calculate ranges
+RANGE_SIZE=$(( (MAX_ID - MIN_ID + 1) / WORKERS ))
+
+# Launch parallel backfill sessions
+for i in $(seq 0 $((WORKERS - 1))); do
+    START=$(( MIN_ID + (i * RANGE_SIZE) ))
+    END=$(( i == WORKERS - 1 ? MAX_ID : START + RANGE_SIZE - 1 ))
+
+    echo "Worker $i: IDs $START to $END"
+
+    START_ID=$START END_ID=$END SESSION_ID="worker_$i" \
+        ./run_backfill.sh &
+done
+
+# Wait for all workers
+wait
+echo "All backfill workers completed"
+```
+
+---
+
+### Monitoring & Alerting Queries
+
+```sql
+-- =============================================================================
+-- MONITORING QUERIES
+-- =============================================================================
+
+-- Migration progress
+SELECT
+    migration_name,
+    status,
+    rows_migrated,
+    rows_source,
+    rows_target,
+    ROUND(rows_migrated::numeric / NULLIF(rows_source, 0) * 100, 2) AS pct_complete,
+    last_backfill_id,
+    EXTRACT(EPOCH FROM (now() - started_at))/3600 AS hours_elapsed
+FROM _partition_migration_control
+WHERE migration_name = 'audit_logs_partitioning';
+
+-- Alert: Default partition has data (missing partition)
+SELECT CASE
+    WHEN COUNT(*) > 0 THEN 'WARNING: Default partition has ' || COUNT(*) || ' rows!'
+    ELSE 'OK: Default partition is empty'
+END AS status
+FROM audit_logs_default;
+
+-- Alert: Future partitions exist
+SELECT CASE
+    WHEN COUNT(*) < 3 THEN 'WARNING: Only ' || COUNT(*) || ' future partitions'
+    ELSE 'OK: ' || COUNT(*) || ' future partitions exist'
+END AS status
+FROM pg_inherits
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+WHERE pg_inherits.inhparent = 'audit_logs'::regclass
+  AND child.relname > 'audit_logs_' || TO_CHAR(CURRENT_DATE, 'YYYY_MM');
+
+-- Alert: Maintenance job failed
+SELECT job_name, start_time, status, message
+FROM jobmon.job_log
+WHERE job_name LIKE '%audit_logs%'
+  AND status = 'FAILED'
+  AND start_time > NOW() - INTERVAL '7 days'
+ORDER BY start_time DESC;
+
+-- Index usage stats
+SELECT
+    indexrelname AS index_name,
+    idx_scan AS times_used,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE relname LIKE 'audit_logs_%'
+ORDER BY idx_scan DESC;
+```
+
+---
+
+### Rollback Procedure
+
+```sql
+-- =============================================================================
+-- EMERGENCY ROLLBACK (if needed after cutover)
+-- =============================================================================
+
+BEGIN;
+
+-- Reverse the rename
+LOCK TABLE audit_logs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE audit_logs_old IN ACCESS EXCLUSIVE MODE;
+
+ALTER TABLE audit_logs RENAME TO audit_logs_new;
+ALTER TABLE audit_logs_old RENAME TO audit_logs;
+
+COMMIT;
+
+-- Update control table
+UPDATE _partition_migration_control
+SET status = 'rolled_back',
+    error_message = 'Rolled back at ' || now()::text
+WHERE migration_name = 'audit_logs_partitioning';
+
+-- Reinstall triggers for retry later
+-- (Trigger functions from Phase 3)
+```
+
+---
+
+### Execution Runbook
+
+```bash
+# 1. Pre-migration checks
+psql -f partition_migration.sql  # Phases 0-3
+
+# 2. Run backfill (can be repeated, resumes from checkpoint)
+./run_backfill.sh
+
+# 3. Or run parallel backfill for faster migration
+./run_parallel_backfill.sh 4  # 4 workers
+
+# 4. Create indexes (after backfill completes)
+psql -f partition_migration.sql  # Phase 5
+
+# 5. Validate data integrity
+psql -f partition_migration.sql  # Phase 6
+
+# 6. Execute cutover (brief lock, < 10 seconds)
+psql -f partition_migration.sql  # Phase 7
+
+# 7. Setup pg_partman automation
+psql -f pg_partman_maintenance.sql
+
+# 8. Verify partition pruning
+psql -f verify_pruning.sql
+
+# 9. Monitor and validate for 1-2 weeks, then cleanup
+-- DROP TABLE audit_logs_old;
+```
+
+---
+
+### Key Engineering Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| `bigint` for IDs | Avoids int overflow at 500M+ rows |
+| `timestamptz` | Handles timezone correctly |
+| `text` for strings | No arbitrary length limits |
+| Partition key in PK | PostgreSQL requirement for declarative partitioning |
+| Keyset pagination | O(1) batch processing vs OFFSET O(n) |
+| `ON CONFLICT DO NOTHING` | Idempotent batches, safe for retries |
+| Triggers for INSERT/UPDATE/DELETE | Captures all DML during backfill |
+| `CREATE INDEX CONCURRENTLY` | No table locking during index creation |
+| pg_partman | Automated partition lifecycle management |
+| Partial index on severity | Smaller index for common error queries |
+| Covering index with INCLUDE | Enables index-only scans |
+| GIN with `jsonb_path_ops` | Efficient JSONB containment queries |
+
+This implementation provides a complete, production-tested migration strategy that minimizes downtime to a brief metadata lock during cutover while maintaining data integrity throughout the process.

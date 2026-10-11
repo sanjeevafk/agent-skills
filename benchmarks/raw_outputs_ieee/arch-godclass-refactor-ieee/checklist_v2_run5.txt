@@ -1,0 +1,470 @@
+[exit=0 latency=39.84s]
+There's no OrderService in this repo — but you've described it precisely enough that I can deliver the full plan against those specs. Here's the complete campaign.
+
+---
+
+# OrderService Refactoring Campaign
+
+## Current State (As Described)
+
+| Dimension | Count | Concerns |
+|---|---|---|
+| Class size | ~1,400 lines | God object |
+| Fields | 34 | Tight coupling between domain state and infrastructure |
+| SQL calls | Scattered across methods | Hard-to-mock persistence layer |
+| Responsibilities | Validation → Pricing → Tax → Persistence → Email → Audit Logging | Violates SRP by ~6× |
+| Tests | Zero | No characterization baseline exists |
+
+---
+
+## Phase 0 — Characterization / Golden-Master Testing
+
+**Goal**: Achieve behavioral equivalence without modifying any production code. Every public method gets an encoded input/expected-output pair before any refactoring touches it.
+
+### Step 0a — Inventory every public method
+
+```python
+from api.code_transform import grep_public_methods
+methods = grep_public_methods('order_service.py')
+# Returns list of {(name, line, args_count), ...}
+```
+
+For each public method, the test harness captures **three dimensions of output**:
+
+1. **Return value** — serialized deterministically (sorted dicts/lists)
+2. **Database mutations** — snapshot after execution, before rollback
+3. **Side effects** — queued emails, audit log entries
+
+### Step 0b — Snapshot database mutations (golden DB snapshots)
+
+```python
+import json
+import hashlib
+from contextlib import contextmanager
+
+@contextmanager
+def snapshot_db(session_factory, operations):
+    """Run `operations` inside a transaction and return a diff-safe snapshot."""
+    conn = session_factory()
+    tx = conn.begin()
+    try:
+        # Capture pre-state for tables touched by the operation
+        yield conn
+        conn.commit()
+
+        # After commit, serialize the affected tables
+        rows = {}
+        for table_name in _tables_touched(operations):
+            query = f"SELECT * FROM {table_name} ORDER BY id"
+            rows[table_name] = [dict(r._mapping) for r in conn.execute(query)]
+
+        # Deterministic hash + JSON blob
+        payload = json.dumps(rows, sort_keys=True, default=str).encode()
+        snapshot = {"hash": hashlib.sha256(payload).hexdigest(), "payload": json.loads(json.dumps(rows, default=str))}
+    finally:
+        tx.rollback()
+    return snapshot
+```
+
+Each public method under test produces a `{method_name -> snapshot}` entry written to `tests/golden/order_snapshots_v1.json`. If behavior changes later, the diff triggers a CI failure.
+
+### Step 0c — Capture email side effects
+
+Don't send real mail during golden capture. Replace the SMTP transport with an in-memory collector behind the same interface:
+
+```python
+class InMemoryMailTransport:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send(self, to: str, subject: str, body: str):
+        self.sent.append({"to": to, "subject": subject, "body": body})
+
+    def clear(self):
+        self.sent.clear()
+```
+
+Every public method's test records `actual_sent[:]` and compares against expected via deep equality (order-sensitive — email ordering is part of behavior).
+
+### Step 0d — Capture audit-log side effects
+
+Audit logging is likely written to a table or message queue. Same pattern as email: use an in-memory auditor.
+
+```python
+class RecordingAuditor:
+    def __init__(self):
+        self.entries: list[dict] = []
+
+    def record(self, actor: str, action: str, entity: str, details: dict):
+        self.entries.append({"actor": actor, "action": action, "entity": entity, "details": details})
+
+    def clear(self):
+        self.entries.clear()
+```
+
+### Step 0e — Generate the golden-file generation script
+
+```python
+"""generate_golden_master.py — run once against staging data or fixtures.
+Reads the current OrderService from production build, executes every public
+method against deterministic fixtures, and writes the result to
+tests/golden/order_snapshots_v1.json.
+"""
+import asyncio, json, pathlib, sys
+sys.path.insert(0, '.')
+
+from src.order_service import OrderService
+from tests.fixtures import make_session, FakeSMTP, FakeAuditor
+
+
+async def main():
+    service = OrderService(
+        session_factory=make_session,
+        smtp=FakeSMTP(),
+        auditor=FakeAuditor(),
+    )
+    results = {}
+
+    # --- example fixture payloads ---
+    valid_payload = {"items": [{"sku": "WIDGET-A", "qty": 2}], "customer_id": "cust_12"}
+    result = await service.create_order(valid_payload)
+    results["create_order"] = {
+        "return_value": json.dumps(result, default=str),
+        "db_snapshot": snapshot_db(make_session, lambda s: s.execute(...)),
+        "emails_sent": service.smtp.sent,
+        "audit_entries": service.auditor.entries,
+    }
+
+    # Repeat for validate_order, cancel_order, apply_discount, etc.
+
+    out = pathlib.Path("tests/golden/order_snapshots_v1.json")
+    out.write_text(json.dumps(results, indent=2))
+    print(f"Wrote {out}: {len(results)} golden cases")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+After running this once, **every subsequent commit must pass the same assertions** — if the hash of any snapshot diverges, the assertion fails and the commit is blocked.
+
+---
+
+## Phase 1 — Seam Extraction (Interface-first)
+
+The extraction order is dictated by **dependency depth** — isolate the most-coupled collaborator first so later layers have clean interfaces to depend on.
+
+### Seam 1: Persistence Repository (highest dependency density)
+
+Direct SQL scattered throughout methods means every business method depends on `session.execute()`. This is the deepest seam.
+
+**Target**: Extract `OrderRepository` with exactly the CRUD & query signatures used.
+
+```python
+# Domain-side interface (no SQLAlchemy imports)
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class OrderRow:
+    id: str
+    customer_id: str
+    status: str
+    total_cents: int
+    created_at: str
+
+class OrderRepository(ABC):
+    @abstractmethod
+    async def save(self, row: OrderRow) -> None: ...
+    @abstractmethod
+    async def find_by_id(self, order_id: str) -> Optional[OrderRow]: ...
+    @abstractmethod
+    async def find_by_customer(self, customer_id: str) -> list[OrderRow]: ...
+    @abstractmethod
+    async def update_status(self, order_id: str, new_status: str) -> None: ...
+```
+
+**Refactor step**: Find every `self.session.execute(...)` call in OrderService. Each group of related statements becomes one repository method. Then replace the raw SQL with `await self._repo.save(...)`, etc. One commit per method replaced. After all replaces are done, the commit that removes `self.session` from OrderService is the seam completion.
+
+**Proof of preservation**: Run the golden-master test suite. Return values, DB snapshots, email queue, and audit log must match v1 exactly.
+
+### Seam 2: Pricing Strategy
+
+Once the repository is isolated, pricing logic (which currently likely reads item prices from SQL or external services inline) can be pulled into a `PricingEngine` interface.
+
+```python
+class PricingEngine(ABC):
+    @abstractmethod
+    async def compute_total(self, items: list[dict], coupon_code: Optional[str]) -> int:
+        """Returns total in cents."""
+        ...
+```
+
+Extract the inline math into `PricingStrategy` implementations (`FlatPricing`, `TieredPricing`, `CouponPricing`). Use composition over inheritance — inject the appropriate strategy at construction time.
+
+### Seam 3: Tax Calculator
+
+Similar pattern — pull tax computation out of OrderService into `TaxCalculator`.
+
+```python
+class TaxCalculator(ABC):
+    @abstractmethod
+    async def compute_tax(self, subtotal: int, region: str) -> int:
+        """Returns tax amount in cents."""
+        ...
+```
+
+### Seam 4: Email Notification Service
+
+```python
+class NotificationService(ABC):
+    @abstractmethod
+    async def notify_order_created(self, order_id: str, customer_email: str, items_summary: str):
+        ...
+    @abstractmethod
+    async def notify_order_cancelled(self, order_id: str, customer_email: str):
+        ...
+```
+
+Replace direct SMTP calls with `await self._notifier.notify_order_created(...)`.
+
+### Seam 5: Audit Logger
+
+```python
+class AuditLogger(ABC):
+    @abstractmethod
+    async def log(self, actor: str, action: str, entity_type: str, entity_id: str, metadata: dict):
+        ...
+```
+
+### Why This Order?
+
+```
+Persistence ──▶ Pricing ──▶ Tax ──▶ Email ──▶ Audit
+    │              │         │          │           │
+    ▼              ▼         ▼          ▼           ▼
+Deeply coupled   Business   Business   External     Cross-cutting
+throughout       logic      logic      dependency   concern
+all methods      (depends   (depends   (depends on  (depends on
+(raw SQL)        on repo)   on pric.)  pric+tax)    everything)
+```
+
+The deeper a collaborator's SQL coupling, the earlier it surfaces. Each extracted interface becomes a constructor parameter; its implementation lives in `src/adapters/`.
+
+---
+
+## Phase 2 — Module Boundaries (Target Architecture)
+
+```
+src/
+├── order/                          # Domain module (no infrastructure deps)
+│   ├── __init__.py
+│   ├── models.py                   # Value objects: OrderId, Money, LineItem, OrderStatus
+│   ├── aggregate.py                # Order aggregate root (invariants only)
+│   ├── validation.py               # Validation rules (pure functions)
+│   ├── pricing.py                  # PricingStrategy interface + strategies
+│   ├── tax.py                      # TaxCalculator interface + providers
+│   └── events.py                   # Domain events: OrderCreated, OrderCancelled
+│
+├── adapters/                       # Infrastructure adapters (depend on interfaces above)
+│   ├── __init__.py
+│   ├── repositories/
+│   │   └── order_sql_repository.py # SQLAlchemy-backed OrderRepository impl
+│   ├── email/
+│   │   └── smtp_notification.py    # SMTP-based NotificationService impl
+│   └── audit/
+│       └── db_audit_logger.py      # DB-backed AuditLogger impl
+│
+├── application/                    # Application orchestration layer
+│   ├── __init__.py
+│   ├── order_service.py            # Thin orchestrator — delegates to domain + adapters
+│   └── commands/
+│       ├── create_order.py
+│       ├── cancel_order.py
+│       └── apply_discount.py
+│
+└── interfaces/                     # Entry points (HTTP, CLI, API)
+    └── orders_api.py               # Request/response mapping
+```
+
+**Key constraints enforced by import direction**:
+- `order/*` has zero imports outside its package
+- `adapters/*` imports from `order/*` only
+- `application/order_service.py` imports from both
+- No circular dependencies
+
+---
+
+## Phase 3 — Incremental Strangler Steps
+
+Each step is independently shippable, operates behind the existing public API, and passes the golden-master suite before merge.
+
+### Strangler Step 1 — Inject the Repository (commits 1–N)
+
+| Commit | Action |
+|---|---|
+| 1 | Add `OrderRepository` interface + `tests/unit/test_order_repository_interface.py` |
+| 2 | Write `SQLOrderRepository` adapter (under tests directory first — TDD-style) |
+| 3..K | Replace one `self.session.execute()` call per commit with `_repo.*()` |
+| K+1 | Remove `self.session` field from OrderService |
+| K+2 | **Golden-master gate** — entire suite passes, behavior hash matches v1 |
+
+**Public API unchanged.** The class still has the same methods, same signatures, same return types.
+
+### Strangler Step 2 — Extract Pricing (commits N+1..M)
+
+| Commit | Action |
+|---|---|
+| 1 | Add `PricingEngine` interface |
+| 2 | Move inline pricing formula into `DefaultPricing.compute_total()` |
+| 3 | Wire `PricingEngine` into OrderService constructor |
+| 4 | Inline pricing body replaced with `await self._pricing.compute_total(...)` |
+| 5 | **Golden-master gate** |
+
+### Strangler Step 3 — Extract Tax (same pattern as Step 2)
+
+### Strangler Step 4 — Extract Email (same pattern as Step 2)
+
+### Strangler Step 5 — Extract Audit Logging (same pattern)
+
+### Strangler Step 6 — Split the Aggregate
+
+Now that cross-cutting concerns are gone and OrderService is a thin orchestrator (~80 lines), move business invariants into `order/aggregate.py`:
+
+| Commit | Action |
+|---|---|
+| 1 | Create `OrderAggregate` with invariants: status transitions, non-negative totals |
+| 2 | Move validation rules into `order/validation.py` as pure functions |
+| 3 | Replace remaining procedural logic in OrderService with aggregate method calls |
+| 4 | Delete old validation block from OrderService |
+| 5 | **Golden-master gate** |
+
+### Strangler Step 7 — Introduce CQRS Commands
+
+Thin the orchestrator further by converting each public method into a command handler:
+
+| Commit | Action |
+|---|---|
+| 1 | Define `CreateOrderCommand(command: CreateOrderRequest)` |
+| 2 | Implement `CreateOrderHandler` that calls aggregate + repository + notification |
+| 3 | Update OrderService.public method to delegate to handler |
+| 4 | Repeat for cancel, discount, etc. |
+| 5 | **Golden-master gate** |
+
+At this point OrderService is ~40 lines of delegation glue. It can be deprecated and removed in a future PR with zero risk.
+
+---
+
+## Behavior Preservation — How You Prove It at Every Commit
+
+### 1. Golden-Master Assertions (mandatory pre-merge)
+
+```python
+"""tests/golden/test_behavior_preservation.py"""
+import json, pytest
+
+GOLDEN_FILE = "tests/golden/order_snapshots_v1.json"
+
+@pytest.mark.parametrize("method_name,expected", 
+    load_golden_cases(GOLDEN_FILE).items())
+def test_no_regression(method_name: str, expected: dict):
+    """Run method against fixtures and compare snapshots byte-for-byte."""
+    actual = execute_method_and_capture(method_name)
+    
+    assert actual["return_value"] == expected["return_value"], \
+        f"{method_name} return value changed"
+    assert actual["db_snapshot"]["hash"] == expected["db_snapshot"]["hash"], \
+        f"{method_name} DB state changed"
+    assert actual["emails_sent"] == expected["emails_sent"], \
+        f"{method_name} emails sent differ"
+    assert actual["audit_entries"] == expected["audit_entries"], \
+        f"{method_name} audit log differs"
+```
+
+This runs as a required CI check. Any change in behavior fails the build. To update the baseline (intentional behavior change), someone must update `tests/golden/order_snapshots_v1.json` explicitly and document what changed.
+
+### 2. Contract Tests on Public Signatures
+
+```python
+import inspect
+from src.order_service import OrderService
+
+PUBLIC_METHODS = {
+    "create_order": ("request_dict",),
+    "cancel_order": ("order_id", "actor"),
+    "apply_discount": ("order_id", "coupon_code"),
+    # ... every public method + its arg signature
+}
+
+def test_public_api_signature_unchanged():
+    """Regression guard: no one renames or reshapes public methods."""
+    svc = OrderService.__new__(OrderService)  # avoid instantiation issues
+    for method_name, expected_args in PUBLIC_METHODS.items():
+        assert hasattr(svc, method_name), f"Missing public method: {method_name}"
+        sig = inspect.signature(getattr(OrderService, method_name))
+        actual = tuple(p.name for p in sig.parameters.values() if p.default == inspect.Parameter.empty)
+        assert actual == expected_args, f"{method_name} signature changed from {expected_args} to {actual}"
+```
+
+### 3. Import Direction Enforcement
+
+Use `import-linter` in CI to enforce the dependency graph:
+
+```ini
+# .importlinter
+[importlinter]
+root_package = order
+
+[[importlinter.contract:1]]
+name = order-module-is-pure
+type = forbidden
+source_modules = order.adapters
+forbidden_modules = order
+; Actually reverse: adapters can import order, order cannot import adapters
+```
+
+This prevents accidental infrastructure leaks back into the domain layer.
+
+### 4. Performance Smoke Test
+
+Add a lightweight benchmark comparing total elapsed time for the full create→validate→tax→email flow against a tolerance threshold (+/-5%). Catch regressions where extracting seams adds unexpected overhead (e.g., N+1 queries surfacing from new abstraction boundaries).
+
+```python
+import timeit
+from tests.perf import run_order_flow
+
+def test_performance_stays_in_range():
+    t_before = run_order_flow()
+    assert t_before < 2.0, f"Order flow took {t_before}s, exceeds 2s budget"
+```
+
+---
+
+## Risk Mitigation
+
+| Risk | Mitigation |
+|---|---|
+| Golden snapshot mismatch after refactor | Run golden suite **before** and **after** each commit; fix before merging |
+| Interface evolution breaks consumers | All consumers are internal — single codebase. Change interface + usage atomically in one commit |
+| SQL dialect differences between environments | Adapter layer accepts raw SQL from repo impl — environment-specific dialects stay localized |
+| Email timing affects downstream systems | Captured in memory; comparison is content-only, not timestamp-dependent |
+| Audit log ordering matters | Recorded in insertion order; compared list-equality |
+
+---
+
+## Estimated Effort & Milestones
+
+| Phase | Commits | Shippable Outcome |
+|---|---|---|
+| 0 — Golden master | 2 (scripts + golden file) | Behavioral baseline locked in CI |
+| 1 — Repository | 8–12 | Pure SQL→interface boundary |
+| 2 — Pricing | 4–5 | Pricing strategy pluggable |
+| 3 — Tax | 3–4 | Tax calculator isolated |
+| 4 — Email | 2–3 | Notification decoupled |
+| 5 — Audit | 2 | Logger isolated |
+| 6 — Aggregate split | 5–7 | Domain model stands alone |
+| 7 — CQRS handlers | 6–8 | Orchestrator reduced to glue |
+| **Total** | **32–44 commits** | Zero-downtime migration, every commit shippable |
+
+Each commit is independently deployable because the public API surface never shrinks or reshapes until Phase 7, and even then the delegation layer preserves compatibility.
