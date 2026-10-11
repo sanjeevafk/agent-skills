@@ -184,25 +184,27 @@ class TestCompilerProvenance:
                 bad.append((entry["skill_id"], "edited"))
         assert not bad, f"compiled artefacts drifted from the manifest: {bad}"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "skills/tdd/SKILL.md was edited after the 2026-08-29 run (recorded sha "
-            "1d0a1439..., on disk 93ea419b...). The benchmark-time source predates "
-            "the repository's initial commit and only the compiled artefact survives; "
-            "skills/tdd/SKILL.benchmark-time.md reproduces that artefact byte-for-byte "
-            "but no file on disk matches the recorded *source* hash. See "
-            "skills/RECOVERY.md."
-        ),
-    )
     def test_source_hashes_still_match_disk(self):
+        """Every manifest source is present on disk, byte-for-byte.
+
+        Two skills (`tdd`, `debugging-code`) were legitimately edited after the
+        run. Their benchmark-time sources were recovered verbatim -- from the A0
+        ablation artifacts, which are raw passthroughs of the benchmark-time
+        input -- and sit beside the live file as `SKILL.benchmark-time.md`.
+
+        A candidate only counts when its SHA-256 equals the manifest's recorded
+        `source_sha256`, so a reconstruction that merely recompiles to the same
+        artefact cannot satisfy this. See skills/RECOVERY.md.
+        """
         data = _load("checklists_v2/manifest.json")
         drifted = []
         for entry in data["skills"].values():
-            src = REPO / entry["source_path"]
-            if not src.exists():
+            live = REPO / entry["source_path"]
+            candidates = [live, live.parent / "SKILL.benchmark-time.md"]
+            present = [c for c in candidates if c.exists()]
+            if not present:
                 drifted.append((entry["skill_id"], "missing"))
-            elif hashlib_sha(src) != entry["source_sha256"]:
+            elif not any(hashlib_sha(c) == entry["source_sha256"] for c in present):
                 drifted.append((entry["skill_id"], "edited"))
         assert not drifted, f"SKILL.md sources drifted after compilation: {drifted}"
 

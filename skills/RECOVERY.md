@@ -1,72 +1,69 @@
-# Recovered Sources (2026-10-10)
+# Recovered Sources
 
-`skills/tdd/` and `skills/debugging-code/` were edited or removed after the
-benchmark run, breaking the SHA-256 provenance chain in
-`benchmarks/checklists_v2/manifest.json`. Both have now been recovered from the
-**compiled v2 artifacts**, which survived the source deletion.
+`skills/tdd/` and `skills/debugging-code/` were edited after the benchmark run,
+breaking the SHA-256 provenance chain in
+`benchmarks/checklists_v2/manifest.json`. **Both benchmark-time sources are now
+recovered byte-for-byte.** The manifest's `source_sha256` for all 18 benchmark
+skills matches a file on disk, and all 18 compiled artifacts reproduce.
 
-## Why artifacts, not git
+## Where the sources came from
 
-Neither lost source existed in git history:
+Not git. Neither benchmark-time source was ever committed: local history begins
+2026-10-08, weeks after the 2026-08-24 run.
 
-- `skills/debugging-code/SKILL.md` was never committed in any revision.
-- `skills/tdd/SKILL.md` exists in history only at the *post-run* version
-  (`93ea419b…`), not the benchmark-time version the manifest recorded
-  (`1d0a1439…`). The pre-run file predates the repository's initial commit.
+| skill | recovered from | bytes | sha256 |
+|---|---|---:|---|
+| `tdd` | `benchmarks/ablations/tdd_a0_full.md` | 4211 | `1d0a1439…` |
+| `debugging-code` | `benchmarks/ablations/debugging-code_a0_full.md` | 11613 | `cb00d683…` |
 
-The compiled artifacts, however, are intact and verify against the manifest:
+The A0 ablation condition is a **raw passthrough** of the benchmark-time input,
+so those files *are* the sources the experiment consumed. Both match the v1
+manifest's `source_sha256` and `source_bytes` exactly.
 
-| skill | recorded compiled sha256 | on-disk | match |
-|---|---|---|---|
-| `tdd` | `146d271310d209eca2b4…` | same | yes |
-| `debugging-code` | `4638490357409f21d056…` | same | yes |
+An earlier attempt reconstructed these sources by prepending frontmatter to the
+surviving v2 artifacts. That reconstruction is superseded — it was lossy (it
+could not recover the prose the compiler prunes, `keep_narrative = false`) and
+its hash never matched the manifest. The files now in place are the genuine
+sources, so the residual gap the reconstruction left is closed.
 
-## Reconstruction method and its limit
-
-Each lost source was rebuilt by prepending YAML frontmatter to the surviving v2
-artifact and committing that as the skill source. This is faithful **at the level
-the benchmark consumed**: recompiling each reconstructed file with
-`crates/skills-compiler` v0.2.0 reproduces the recorded artifact **byte-for-byte**
-(verified by SHA-256 for both skills).
-
-The one thing that is **not** recoverable is the narrative prose the compiler
-pruned (`keep_narrative = false`), roughly half of each original file. So:
-
-- The compiled-artifact reproduction is exact.
-- The *original token counts* quoted in the paper (e.g. `tdd` at 1,052 source
-  tokens, `debugging-code` at 2,903) come from the manifest, not from these
-  reconstructed files. Re-measuring the reconstructed source will show a lower
-  source-token figure because the prose is already gone.
+The other 16 skills needed nothing: their live `SKILL.md` still hashes exactly
+to what the manifest recorded.
 
 ## tdd: both versions kept
 
-Because the current `tdd/SKILL.md` (`93ea419b…`) is what the live canonical suite
-and downstream tooling use, it was **not** overwritten:
+The live `skills/tdd/SKILL.md` is a genuine post-run **rewrite**, not a
+condensation — it re-frames the skill around pre-agreed test seams and
+cross-references other skills. It is what the canonical suite and downstream
+tooling use, so it was not reverted.
 
-- `skills/tdd/SKILL.md` — current post-run version (kept as the active skill).
-- `skills/tdd/SKILL.benchmark-time.md` — reconstructed pre-run source that
-  reproduces the recorded `146d271310…` artifact.
-- `skills/tdd/SKILL.post-run.md` — byte-identical copy of the current file, kept
-  so the pair is self-documenting.
+- `skills/tdd/SKILL.md` — current post-run version (the active skill).
+- `skills/tdd/SKILL.benchmark-time.md` — the recovered benchmark-time source,
+  4211 bytes, SHA-256 `1d0a1439…`, matching the manifest.
+- `skills/tdd/SKILL.post-run.md` — byte-identical copy of the active file.
+
+`skills/debugging-code/SKILL.md` is likewise a post-run condensation; its
+recorded source sits beside it as `SKILL.benchmark-time.md`.
+
+## How the checks consume these
+
+Both `scripts/verify_compiled_artifacts.py` and
+`tests/test_paper_claims.py::TestCompilerProvenance::test_source_hashes_still_match_disk`
+resolve a skill's source by trying the live path first, then the sibling
+`SKILL.benchmark-time.md`.
+
+A candidate is accepted **only** when its SHA-256 equals the manifest's recorded
+`source_sha256`. This is deliberately stricter than "recompiles to the same
+artifact": a reconstruction that reproduced the artifact while carrying the
+wrong source bytes would be rejected. That distinction is what made the earlier
+reconstruction insufficient, and it is why this one is sufficient.
 
 ## Verification
 
-To confirm a reconstructed source still reproduces its artifact:
-
 ```bash
-cargo build --release --manifest-path crates/skills-compiler/Cargo.toml
-./crates/skills-compiler/target/release/skills-compiler compile \
-    --input skills/tdd/SKILL.benchmark-time.md --output /tmp/tdd.txt
-sha256sum /tmp/tdd.txt   # expect 146d271310d209eca2b4…
+uv run python scripts/verify_compiled_artifacts.py
+# 18/18 artifacts reproduce byte-for-byte; 0 documented exceptions remain.
 ```
 
-## Effect on the artifact checks
-
-`scripts/verify_compiled_artifacts.py` previously listed `tdd` and
-`debugging-code` as declared exceptions. With the reconstructed sources restored
-(and, for `tdd`, the benchmark-time file present), that script and
-`tests/test_paper_claims.py::TestCompilerManifest::test_source_hashes_still_match_disk`
-can now pass for `debugging-code`. The `tdd` source-hash assertion still expects
-the original `1d0a1439…` file, which no longer exists; the test keeps that
-expectation so the residual gap stays visible rather than being quietly satisfied
-by the reconstruction.
+`KNOWN_EXCEPTIONS` in the verifier is now empty. It is retained as a structure
+so that any future drift must be declared explicitly rather than silently
+skipped, and the script still fails if a declared exception starts reproducing.
