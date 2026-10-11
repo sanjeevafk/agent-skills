@@ -1,137 +1,46 @@
 # Agent Skills Warehouse
 
-A curated cold-storage warehouse and offline catalog of specialized agent skill
-suites across **Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi**.
+A curated cold-storage warehouse and offline catalog of 2,700+ specialized agent skill suites across **Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi**, designed to prevent prompt bloat and context collapse in daily agent sessions.
 
 ---
 
-## 1. System Architecture: Two-Tier Model
+## 1. What This Repository Is
 
-To prevent context collapse and 20,000+ token prompt bloat while retaining deep
-domain knowledge, the environment uses a strict two-tier architecture:
+To preserve frontier LLM attention and eliminate 20,000+ token per-turn overhead, the environment uses a strict two-tier architecture:
 
-```
-+--------------------------------------------------------------------------+
-|                       ACTIVE RUNTIME (~/.agents/skills)                  |
-|          75 Canonical Skills -- Linked across all 5 Agent Harnesses      |
-|           Zero Context Bloat -- 100% Frontier LLM Attention Recall       |
-+--------------------------------------------------------------------------+
-                                      ^
-                                      |  Promoted on demand
-                                      v
-+--------------------------------------------------------------------------+
-|                     COLD STORAGE WAREHOUSE (agent-skills)                |
-|           531 Skills & Domain Collections Offline                        |
-+--------------------------------------------------------------------------+
-```
-
-1. **Active Runtime (`~/.agents/skills/`, mirrored in `canonical/`):** Exactly 75
-   hardened, non-redundant production skills wired into daily coding agents.
-   Consumes $<2,500$ prompt tokens per message turn.
-2. **Cold Storage Warehouse (`agent-skills/`):** Comprehensive offline archive
-   preserving specialized industry, scientific, security, and enterprise
-   playbooks.
+1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** A minimal, hardened suite of ~75 production skills wired into active coding agents (<2,500 prompt tokens per turn).
+2. **Cold-Storage Warehouse (`skills/` & `collections/`):** An offline repository housing **556 modular skills** across 9 core engineering domains and **2,200+ specialized domain playbooks** (cybersecurity MITRE/NIST, Hugging Face, bioinformatics, financial modeling, and reference architectures), bridged dynamically on-demand via `skill-router`.
 
 ---
 
-## 2. Suites & Collection Inventory
+## 2. Accompanying Research Paper
 
-| Suite / Collection | Location | Size | Primary Attributes & Scope |
-|---|---|---|---|
-| **Canonical Active Suite** | `canonical/` | **75 skills** | Curated production skills for full-stack engineering, testing (`tdd`, `veriharness`, `playwright`), security (`security-audit`), design (`impeccable`, `frontend-design`, `oil-motion`, `remotion`), research (`last30days`, `orx`), architecture (`archify`, `nextjs-15-expert`), and dynamic routing (`skill-router`). |
-| **Core Modular Catalog** | `skills/` | **531 skills** | Flat skill manuals indexed across 9 semantic namespaces (`web`, `workflow`, `lang`, `ai-ml`, `security`, `debug`, `devops`, `style`, `data`). |
-| **Cybersecurity Suite** | `collections/cybersecurity-skills/` | **818 skills** | Threat emulation, defensive posture, and compliance playbooks mapped to MITRE ATT&CK, NIST CSF 2.0, MITRE ATLAS, and D3FEND. |
-| **Upstream ECC Suite** | `collections/ecc-upstream/` | **1027 skills** | Complete upstream Everything Claude Code (ECC) ecosystem: subagents, slash commands, workflow hooks, system rules, and framework patterns. |
-| **Scientific & Life Sciences** | `collections/scientific-skills/` | **119 skills** | Bioinformatics, genomics (`scanpy`, `biopython`), computational chemistry (`rdkit`, `diffdock`), and quantum computing (`qiskit`, `cirq`). |
-| **Financial Services** | `collections/financial-services/` | **112 skills** | Anthropic's official financial agents and vertical plugins: private equity, investment banking, equity research, valuation, and fund administration. |
-| **Enterprise Ops** | `collections/enterprise-ops/` | **42 skills** | Brand discovery, executive positioning, enterprise onboarding, and organizational workflow templates. |
-| **Reference Architectures** | `collections/reference-architectures/` | **28 systems** | Production RAG (Docling, LightRAG, Mem0, Graphiti, n8n) and web scraping pipelines (Crawl4AI v2, Ottomarkdown, PydanticAI) with distilled skill playbooks. |
-| **Hugging Face Suite** | `collections/huggingface-skills/` | **26 skills** | Official Hugging Face Hub workflows, CLI/MCP tooling, datasets, spaces, evaluation, and model training (TRL, Sentence Transformers, SageMaker). |
-| **Agentic Design Patterns** | `collections/agentic-design-patterns/` | **21 systems** | Production agent architectures from Antonio Gulli's textbook: prompt chaining, dynamic routing, parallelization, reflection, tool use, memory tiers, MCP, guardrails, and discovery loops. |
-| **Media Production** | `collections/media-production/` | **8 skills** | Algorithmic video generation (Remotion, fframes, Manim), screen capture, and media asset pipelines. |
-| **Claude Agent Architectures** | `collections/claude-agent-architectures/` | **8 systems** | Distilled blueprints from `claude-cookbooks`: Chief of Staff, SRE incident responder, vulnerability detector, agent observability, specialist coordinator, production guardrails, outcome grading, and issue-to-PR pipeline. |
-| **Academic Research Suite** | `collections/academic-research-skills/` | **5 modules** | End-to-end academic paper authoring pipeline, citation anti-hallucination verification, LaTeX/APA formatting, and simulated peer-review. |
-| **Impeccable Design Suite** | `collections/impeccable/` | **6 skills** | Comprehensive anti-slop frontend design system, deterministic detector rules, UX critique/audit, and live browser rendering loop. |
-| **Kaggle Suite** | `collections/kaggle-skills/` | **4 skills** | Official Kaggle hackathon judging workflows, standardized agent examinations, and benchmark authoring (`kbench`, `kaggle-benchmarks`). |
-| **Open Code Review Suite** | `collections/open-code-review/` | **4 skills** | Alibaba's enterprise AI code review engine (`ocr`), diff-level review, full repo audits (`ocr scan`), and host-agent delegation mode. |
+This repository also serves as the artifact and benchmark testbed for the empirical software engineering paper:
+
+> **Compress the Prose, Keep the Syntax: What Agent Skill Files Actually Do, and Why You Probably Don't Need a Router**
+
+### Core Empirical Findings
+
+The study evaluated 396 blind trials across an 18-task engineering benchmark (Qwen 3.7 Flash generating, DeepSeek V4 Pro judging a 35-point rubric) plus 87 ablation runs:
+
+- **Compressing Prose is Free; Deleting Syntax is Not:** Structure-preserving static compilation (`checklist_v2`) cuts **30.0% of prompt tokens** (saving 680 tokens per skill/turn) with no measurable quality penalty compared to uncompressed multi-thousand-token manuals (24.96/35 vs. 25.17/35, paired $p = 0.7672$).
+- **Syntax-Stripping Context Collapse:** Aggressively stripping narrative prose in policy-centric domains (Security, Databases) is completely safe. However, removing executable code fixtures in syntax-dense tasks (e.g., TDD RED/GREEN tracer patterns) causes immediate collapse ($\Delta = -8.50$ points; 0 of 6 runs passing).
+- **You Probably Don't Need a Router:** Testing selection across the 522-skill catalogue revealed that multi-stage neural routing (dense retrieval + cross-encoder reranker) is a net loss (5/17 Top-1) compared to a tuned lexical TF-IDF baseline (8/17 Top-1). Passing the entire 522-skill catalogue in context in a single prompt achieved **14/17 Top-1**, matching the union oracle ceiling. At this catalogue scale, an in-context pass outperforms neural retrieval pipelines.
 
 ---
 
-## 3. Skill Selection at Scale: Measured, Not Assumed
-
-An earlier revision of this README advertised a planned `Julia-1` hierarchical
-router at <70 ms end-to-end on commodity CPU. **That approach was built and
-benchmarked, and it does not pay for itself** at this catalogue size.
-
-Over 17 held-out queries against a 522-routable-skill catalogue:
-
-| Approach | Top-1 | Top-5 | p50 |
-|---|---:|---:|---:|
-| Dense retriever | 7/17 | 11/17 | — |
-| Dense + Julia-1 rerank | **5/17** | 11/17 | 401 ms |
-| Lexical TF-IDF | **8/17** | 11/17 | 1.75 ms |
-| Union of both shortlists | — | **14/17** | — |
-| **No retrieval — whole catalogue in context** | **14/17** | — | ~18k tokens |
-
-Shortlist recall is identical across all three retrieval methods, so coverage is
-not the limit — the reranker is. It measurably *reduced* Top-1 accuracy over
-dense shortlisting alone (41.2% → 29.4%), overriding a correct shortlist hit in
-6 of 11 cases. Because removing retrieval entirely matches the union oracle
-ceiling, **at this catalogue scale shortlisting buys nothing a single in-context
-pass does not already deliver.**
-
-Practical guidance: treat both retrieval and reranking as **optional layers to
-be measured against an oracle ceiling**, not defaults to be added. The numbers
-above are reproducible from `benchmarks/` via `scripts/benchmark_router.py`.
-
----
-
-## 4. Quick Commands
+## 3. Quick Commands
 
 ```bash
-# Rebuild the catalog index (skills.json)
+# Search skills by keyword
+uv run python scripts/search_skills.py <keyword>
+
+# Rebuild catalog index (skills.json)
 uv run python scripts/build_index.py
 
-# Validate that every SKILL.md frontmatter block parses
+# Validate SKILL.md frontmatter blocks
 uv run python scripts/check_frontmatter.py
 
-# Compile every skill with frontmatter preserved (dry run)
-uv run python scripts/compile_and_deploy.py --dry-run
-
-# Check status of canonical skills
-ls -la canonical/
+# Run compiler verification on benchmarks
+uv run python scripts/verify_compiled_artifacts.py
 ```
-
-Compile a single skill programmatically:
-
-```python
-import sys; sys.path.insert(0, "scripts")
-import skills_compiler as sc
-
-text, metrics = sc.compile_skill(
-    open("skills/tdd/SKILL.md").read(),
-    sc.checklist_v2("testing"),          # domain-aware code-block budget
-)
-print(metrics["token_reduction_percentage"])
-```
-
----
-
-## 5. Licensing
-
-See **[`LICENSE`](LICENSE)** for the full terms — it is not a standard license,
-because this repository holds authored work and vendored third-party content
-under different terms.
-
-| Content | Terms |
-|---|---|
-| `scripts/`, `tests/`, `benchmarks/`, `canonical/`, `skills/`, and the first-party collections | the grant in **Part 1** |
-| `collections/` (vendored: cybersecurity, ECC upstream, Hugging Face, Kaggle, Anthropic financial-services, impeccable, open-code-review, academic-research, scientific, media-production) | **their upstream licenses** — see the Part 2 table |
-| `skills/attention-span/` | **AGPL-3.0** (copyleft), governed by its own file |
-
-Two things worth knowing before you copy anything out of `collections/`:
-
-- `academic-research-skills/` is **CC BY-NC 4.0** — non-commercial, and
-  incompatible with any permissive grant.
-- Dependencies are **not vendored**: node packages install from each project's
-  `package-lock.json` via `npm ci`, and `node_modules/` is git-ignored.
