@@ -7,7 +7,9 @@ published conclusion.
 
 Usage:  uv run python scripts/analyze_position_bias.py [--json]
 
-Findings (paper §7.2, §8.1; reported in benchmarks/POSITION_BIAS_AUDIT.md):
+Findings (reported in paper §9, "Judge Position Bias and Statistical Power").
+Reproduce with this script; every figure below is recomputed from
+benchmarks/delivery_results_ieee.json:
 
   * Position effects are large and highly significant:
         A +2.08   B +0.70   C -0.79   D -1.58   E -0.37

@@ -9,8 +9,10 @@ The compiler is a byte-for-byte Python port of the former Rust crate
 (crates/skills-compiler v0.2.0). That port was cross-validated against the Rust
 binary on identical input for all six compilation modes across the benchmark
 corpus (120/120 byte-identical) before the crate was removed, so switching
-implementations did not change any recorded artifact. See
-benchmarks/COMPILER_PROVENANCE.md.
+implementations did not change any recorded artifact. See skills/RECOVERY.md.
+
+The `checklist` arm, which shipped from benchmarks/checklists_ieee/ rather than
+from this compiler, is verified separately by verify_ieee_v1_artifacts.py.
 
 Known exceptions are declared explicitly below rather than silently skipped, so
 that fixing them flips this check from "known-degraded" to fully clean.
@@ -43,11 +45,11 @@ TASKS = REPO / "benchmarks" / "tasks_ieee.json"
 MANIFEST = REPO / "benchmarks" / "checklists_v2" / "manifest.json"
 
 # Skills whose recorded artifacts are known not to reproduce today. Each entry
-# states why, so the exception is auditable rather than a blanket waiver.
-# No skills are exempt today. The last one (`tdd`) was cleared when its
-# benchmark-time source was recovered verbatim from the A0 ablation artifact --
-# see skills/RECOVERY.md. The table is kept because a future drift should be
-# declared explicitly rather than silently skipped.
+# states why, so an exception is auditable rather than a blanket waiver.
+# Empty today: the last one (`tdd`) was cleared when its benchmark-time source
+# was recovered verbatim from the A0 ablation artifact (see skills/RECOVERY.md).
+# The table is kept so that a future drift must be declared explicitly rather
+# than silently skipped.
 KNOWN_EXCEPTIONS: dict[str, str] = {}
 
 
