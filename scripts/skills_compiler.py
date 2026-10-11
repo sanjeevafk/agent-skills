@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -566,6 +567,8 @@ def ablate(input_path: Path, out_dir: Path, domain: str = "general") -> list[Pat
         target = out_dir / f"{name}_{suffix}.md"
         if opts is None:
             text = content
+        elif suffix == "a5_v1_bullets":
+            text = generate("a5_v1_bullets", content)
         else:
             text, _ = compile_skill(content, opts)
         target.write_text(text, encoding="utf-8")
@@ -722,12 +725,72 @@ def ieee_v1_from_manifest(manifest_path: Path, out_dir: Path,
             print(f"  ⚠️  {skill}: no source on disk matching {recorded[:12]}",
                   file=sys.stderr)
             continue
-        text = compile_ieee_v1(source.read_text(encoding="utf-8"))
+        text = generate("checklist", source.read_text(encoding="utf-8"))
         (out_dir / f"{skill}.txt").write_text(text, encoding="utf-8")
         produced[skill] = hashlib.sha256(text.encode("utf-8")).hexdigest()
         print(f"  {skill:<32} {len(text.encode('utf-8')):>6}B  "
               f"{produced[skill][:16]}")
     return produced
+
+
+# ---------------------------------------------------------------------------
+# Canonical arm -> generator registry
+#
+# Two unrelated generators produce output whose names both contain "v1", and
+# getting them backwards is silent: each produces valid-looking text, just not
+# the bytes the recorded artifact holds. So the mapping lives here, in one
+# place, and every caller -- the CLI, the verifiers, the tests, `ablate()` --
+# resolves through `generate()` instead of calling a similarly named function
+# directly.
+#
+#   "checklist"      -> the `checklist` delivery arm,
+#                       benchmarks/checklists_ieee/*.txt (80 scored evaluations).
+#   "a5_v1_bullets"  -> the A5 ablation variant,
+#                       benchmarks/ablations/*_a5_v1_bullets.md.
+#
+# `checklist_v1()` is the A5 one. The name predates the IEEE extractor and is
+# kept so the parity tests stay valid, but it is NOT the `checklist` arm. Do not
+# add call sites to it; add a label to ARM_GENERATORS instead.
+# ---------------------------------------------------------------------------
+def _generate_a5_v1_bullets(skill_md: str) -> str:
+    return compile_skill(skill_md, checklist_v1())[0]
+
+
+ARM_GENERATORS: dict[str, "Callable[[str], str]"] = {
+    "checklist": compile_ieee_v1,
+    "a5_v1_bullets": _generate_a5_v1_bullets,
+}
+
+
+def generate(arm: str, skill_md: str) -> str:
+    """Produce the recorded artifact for `arm` from a SKILL.md source."""
+    try:
+        gen = ARM_GENERATORS[arm]
+    except KeyError:
+        raise KeyError(
+            f"unknown arm {arm!r}; known arms: {sorted(ARM_GENERATORS)}"
+        ) from None
+    return gen(skill_md)
+
+
+# Directories holding recorded evidence. Writing into either from a routine
+# invocation would destroy the very artifacts CI verifies, so the CLI refuses
+# without an explicit opt-in.
+TRACKED_EVIDENCE_DIRS = (
+    REPO / "benchmarks" / "checklists_ieee",
+    REPO / "benchmarks" / "checklists_v2",
+    REPO / "benchmarks" / "ablations",
+)
+
+
+def _is_tracked_evidence_dir(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved == d.resolve() or d.resolve() in resolved.parents
+               for d in TRACKED_EVIDENCE_DIRS)
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="skills-compiler", description=__doc__)
@@ -754,13 +817,22 @@ def main(argv: list[str] | None = None) -> int:
     v1.add_argument(
         "-m", "--manifest", type=Path,
         default=REPO / "benchmarks" / "checklists_ieee" / "manifest.json")
-    v1.add_argument("-o", "--out-dir", type=Path,
-                    default=REPO / "benchmarks" / "checklists_ieee")
+    # Required, and defaulted to nothing: writing into benchmarks/checklists_ieee
+    # would overwrite the exact artifacts CI verifies. Previously this defaulted
+    # to the tracked directory, so a bare `ieee-v1` destroyed the evidence it
+    # was supposed to reproduce.
+    v1.add_argument("-o", "--out-dir", type=Path, required=True,
+                    help="output directory (must not be a tracked evidence dir "
+                         "unless --overwrite-tracked is given)")
+    v1.add_argument("--overwrite-tracked", action="store_true",
+                    help="permit writing into benchmarks/ evidence directories")
 
     a = sub.add_parser("ablate", help="Generate the A0-A5 ablation series")
     a.add_argument("-i", "--input", required=True, type=Path)
     a.add_argument("-o", "--out-dir", required=True, type=Path)
     a.add_argument("-d", "--domain", default="general")
+    a.add_argument("--overwrite-tracked", action="store_true",
+                   help="permit writing into benchmarks/ evidence directories")
 
     args = p.parse_args(argv)
 
@@ -794,11 +866,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "ieee-v1":
+        if _is_tracked_evidence_dir(args.out_dir) and not args.overwrite_tracked:
+            print(
+                f"refusing to write into tracked evidence: {args.out_dir}\n"
+                f"These are the artefacts CI verifies. Pass --overwrite-tracked "
+                f"only if you intend to replace them.",
+                file=sys.stderr,
+            )
+            return 2
         produced = ieee_v1_from_manifest(args.manifest, args.out_dir)
-        print(f"\nRegenerated {len(produced)} checklist_v1 artefacts into {args.out_dir}")
+        print(f"\nRegenerated {len(produced)} `checklist` artefacts into {args.out_dir}")
         return 0
 
     if args.command == "ablate":
+        if _is_tracked_evidence_dir(args.out_dir) and not args.overwrite_tracked:
+            print(
+                f"refusing to write into tracked evidence: {args.out_dir}\n"
+                f"Pass --overwrite-tracked to replace them deliberately.",
+                file=sys.stderr,
+            )
+            return 2
         ablate(args.input, args.out_dir, args.domain)
         return 0
 

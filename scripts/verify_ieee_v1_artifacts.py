@@ -12,6 +12,14 @@ the recovered rules). This script is what keeps that claim honest: it
 regenerates every artefact from its recorded source and compares SHA-256
 against both the file on disk and the digest the manifest recorded at run time.
 
+It drives the shipped `skills_compiler.py ieee-v1` **command line** into a
+temporary directory rather than importing the extractor directly. That is
+deliberate. During the recovery the rules were fitted in a scratch script which
+scored 18/18; copying them into the real module dropped the score to 10/18,
+because the table flattener joined every column instead of dropping the head.
+Only rerunning the full matrix caught it. Verifying through the same entry
+point a user would invoke is what keeps that class of porting error visible.
+
 Usage:
     uv run python scripts/verify_ieee_v1_artifacts.py
 
@@ -27,12 +35,12 @@ import hashlib
 import json
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "scripts"))
-from skills_compiler import ieee_v1_from_manifest  # noqa: E402
+COMPILER = REPO / "scripts" / "skills_compiler.py"
 
 MANIFEST = REPO / "benchmarks" / "checklists_ieee" / "manifest.json"
 ARTIFACTS = REPO / "benchmarks" / "checklists_ieee"
@@ -51,28 +59,41 @@ def main() -> int:
 
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="verify-ieee-v1-"))
     try:
-        produced = ieee_v1_from_manifest(MANIFEST, tmp)
+        # Go through the shipped CLI, exactly as a user would.
+        proc = subprocess.run(
+            [sys.executable, str(COMPILER), "ieee-v1",
+             "--manifest", str(MANIFEST), "--out-dir", str(tmp)],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            print(f"compiler CLI failed:\n{proc.stdout}\n{proc.stderr}",
+                  file=sys.stderr)
+            return 1
+        produced = {
+            path.stem: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(tmp.glob("*.txt"))
+        }
+
+        matched, drifted, missing_source, absent = [], [], [], []
+        for skill, entry in sorted(recorded.items()):
+            if skill not in produced:
+                missing_source.append(skill)
+                continue
+            committed = ARTIFACTS / f"{skill}.txt"
+            if not committed.exists():
+                absent.append(skill)
+                continue
+            # Both comparisons matter: the file on disk must be unmodified, and
+            # it must match what the manifest recorded at experiment time.
+            if (produced[skill] == sha256_file(committed)
+                    == entry["artifact_sha256"]):
+                matched.append(skill)
+            else:
+                drifted.append(skill)
     finally:
-        pass
+        shutil.rmtree(tmp, ignore_errors=True)
 
-    matched, drifted, missing_source, absent = [], [], [], []
-    for skill, entry in sorted(recorded.items()):
-        if skill not in produced:
-            missing_source.append(skill)
-            continue
-        committed = ARTIFACTS / f"{skill}.txt"
-        if not committed.exists():
-            absent.append(skill)
-            continue
-        # Both comparisons matter: the file on disk must be unmodified, and
-        # it must match what the manifest recorded at experiment time.
-        if (produced[skill] == sha256_file(committed)
-                == entry["artifact_sha256"]):
-            matched.append(skill)
-        else:
-            drifted.append(skill)
-    shutil.rmtree(tmp, ignore_errors=True)
-
+    print(f"compiler: {COMPILER.relative_to(REPO)} ieee-v1")
     print(f"manifest: {MANIFEST.relative_to(REPO)} "
           f"(extractor v{json.loads(MANIFEST.read_text(encoding='utf-8'))['extractor_version']})")
     print()

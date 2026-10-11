@@ -1,23 +1,26 @@
-"""The checklist_v1 artifacts are irreplaceable and must not drift.
+"""The checklist arm's artifacts must not drift, and must stay reproducible.
 
 `benchmarks/checklists_ieee/` backs the `checklist` delivery arm -- 80 of the
 396 scored evaluations (20%) and 7 of the 10 pairwise comparisons, including
 `checklist_vs_checklist_v2`, the balanced-vs-aggressive contrast that the
 headline delivery result rests on.
 
-The byte pins below guard the *committed originals*. Regenerating them is a
-separate check, in `test_checklist_v1_artefacts_regenerate_from_source`.
+Two independent checks guard this arm:
 
-Unlike `checklists_v2/`, **no generator in this repository reproduces these
-files**. They were produced by a tool that predates the repository's initial
-commit. The compiler's `checklist_v1()` path emits a `[CHECKLIST GUIDELINES]`
-header these files do not have, so recompiling produces *different* bytes and
-would silently invalidate the archived evaluations. See
-`benchmarks/COMPILER_PROVENANCE.md` section 4.
+* the byte pins below guard the *committed originals*;
+* `test_checklist_v1_artefacts_regenerate_from_source` rebuilds all 18 from
+  their recorded sources through the shipped `skills_compiler.py ieee-v1`
+  command.
 
-So these files cannot be regenerated -- they can only be lost. This module is
-the only guard against that, and against an edit that would leave the archived
-`checklist` scores unreproducible without anyone noticing.
+Both matter. The originals were originally unreproducible -- the extractor
+predated the repository's initial commit -- so for a time these files could only
+be lost, not rebuilt. That extractor has since been recovered
+(`skills_compiler.compile_ieee_v1`, documented there) and regenerates all 18
+byte-for-byte, so a rebuild that *matches* is only meaningful if nobody has
+quietly edited the originals to match. Hence the pins as well.
+
+Note the generator is NOT `checklist_v1()`, which produces the unrelated A5
+ablation artefacts; see `tests/test_generator_registry.py`.
 """
 
 from __future__ import annotations
@@ -65,8 +68,8 @@ def test_checklist_v1_artifacts_are_intact() -> None:
     missing = sorted(n for n in EXPECTED_SHA256 if not (V1_DIR / n).exists())
     assert not missing, (
         f"missing: {missing}. These back the `checklist` delivery arm (80 of 396 "
-        f"evaluations) and no tool in this repository regenerates them. Restore "
-        f"from git history -- do not recompile."
+        f"evaluations). Restore from git history; `skills_compiler.py ieee-v1` "
+        f"can rebuild them from source, but not a missing file in place."
     )
     drifted = [
         f"{n} ({expected[:12]} -> {hashlib.sha256((V1_DIR / n).read_bytes()).hexdigest()[:12]})"
@@ -74,8 +77,8 @@ def test_checklist_v1_artifacts_are_intact() -> None:
         if hashlib.sha256((V1_DIR / n).read_bytes()).hexdigest() != expected
     ]
     assert not drifted, (
-        f"modified: {drifted}. These artifacts have no reproducing generator, so "
-        f"an edit silently invalidates the archived `checklist` scores. If the "
+        f"modified: {drifted}. These bytes are what the archived `checklist` "
+        f"scores were scored against, so an edit invalidates them. If the "
         f"change is intended, the affected evaluations must be re-run and the "
         f"arm restated."
     )
