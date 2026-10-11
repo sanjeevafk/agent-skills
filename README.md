@@ -119,26 +119,19 @@ print(metrics["token_reduction_percentage"])
 
 ## 5. Licensing
 
-See **[`LICENSE`](LICENSE)** for the full terms. It is not a standard license
-such as MIT or Apache-2.0, because this repository holds two different kinds of
-material under different terms, and a blanket license would misrepresent one of
-them.
-
-In short:
+See **[`LICENSE`](LICENSE)** for the full terms — it is not a standard license,
+because this repository holds authored work and vendored third-party content
+under different terms.
 
 | Content | Terms |
 |---|---|
-| `scripts/`, `canonical/`, `tests/`, `benchmarks/`, and skills authored here | the grant in **Part 1** of `LICENSE` |
-| `collections/` (15,070 files) | **their upstream licenses** — Apache-2.0, MIT, and CC BY-NC 4.0 are all present; see Part 2 for the per-collection table |
-| Any path shipping its own `LICENSE` (e.g. `skills/attention-span/`) | governed by that file |
+| `scripts/`, `tests/`, `benchmarks/`, `canonical/`, `skills/`, and the first-party collections | the grant in **Part 1** |
+| `collections/` (vendored: cybersecurity, ECC upstream, Hugging Face, Kaggle, Anthropic financial-services, impeccable, open-code-review, academic-research, scientific, media-production) | **their upstream licenses** — see the Part 2 table |
+| `skills/attention-span/` | **AGPL-3.0** (copyleft), governed by its own file |
 
-Three things worth knowing before you copy anything out of `collections/`:
+Two things worth knowing before you copy anything out of `collections/`:
 
 - `academic-research-skills/` is **CC BY-NC 4.0** — non-commercial, and
   incompatible with any permissive grant.
-- `skills/attention-span/` is **AGPL-3.0** — copyleft; it cannot be relicensed
-  permissively.
-- Four collections (`agentic-design-patterns/`, `claude-agent-architectures/`,
-  `enterprise-ops/`, `reference-architectures/`) ship **no license file at all**.
-  With no license, default copyright applies: treat them as all rights
-  reserved, and do not redistribute them until terms are established.
+- Dependencies are **not vendored**: node packages install from each project's
+  `package-lock.json` via `npm ci`, and `node_modules/` is git-ignored.
