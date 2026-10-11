@@ -574,6 +574,161 @@ def ablate(input_path: Path, out_dir: Path, domain: str = "general") -> list[Pat
     return written
 
 
+
+# ---------------------------------------------------------------------------
+# checklist_ieee generator (the `checklist` delivery arm)
+#
+# This is NOT checklist_v1() above. That CompilationOptions variant produces
+# the A5 ablation artefacts (`benchmarks/ablations/*_a5_v1_bullets.md`) and is
+# covered by the parity tests. The `checklist` arm shipped from
+# `benchmarks/checklists_ieee/` was produced by a different, simpler extractor
+# that no longer existed in the repository. The rules below were recovered by
+# fitting them against the 18 committed artefacts until all 18 reproduced
+# byte-for-byte; see scripts/verify_ieee_v1_artifacts.py.
+#
+# Recovered rule set:
+#   * drop YAML frontmatter and the level-1 title
+#   * headings h2..hN are demoted one level and emitted only when a retained
+#     line actually follows them
+#   * fenced code blocks are dropped entirely
+#   * list items and numbered items become "- <content>"
+#   * `**Label:** rest` becomes `- **Label:** rest`; a bare `**Label**`
+#     becomes `- **Label**` (label colon trimmed)
+#   * a markdown table row flattens to `head: rest | rest` (`**` stripped from
+#     cells, divider rows dropped)
+#   * a retained line must be >= 6 bytes and open with bold, an uppercase
+#     letter, or a backtick -- which is what discards `- [ ]` checkboxes and
+#     `- [link](url)` entries
+#   * no blank lines are emitted
+# ---------------------------------------------------------------------------
+V1_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
+V1_BULLET_RE = re.compile(r"^\s*[-*•]\s+(.*)$")
+V1_NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
+V1_BOLD_RE = re.compile(r"^\s*\*\*([^*]+):?\*\*:?\s*(.*)$")
+V1_TABLE_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+V1_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+V1_KEEP_RE = re.compile(r"^\*\*|^[A-Z`]")
+V1_MIN_BYTES = 6
+
+
+def _strip_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return text
+    rest = text[3:]
+    nl = rest.find("\n")
+    if nl == -1 or rest[:nl].strip():
+        return text
+    off, pos = 3 + nl + 1, 0
+    for line in rest[nl + 1:]:
+        end = off + pos + len(line)
+        if line.rstrip("\r\n") in ("---", "..."):
+            return text[end:].lstrip("\r\n")
+        pos += len(line)
+    return text
+
+
+def _flatten_table_row(row: str) -> str | None:
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    cells = [c for c in cells if c != ""]
+    if not cells:
+        return None
+    if all(set(c) <= set("-: ") for c in cells):   # |---| divider
+        return None
+    cells = [c.replace("**", "").strip() for c in cells]
+    head, rest = cells[0], cells[1:]
+    if ":" in head:
+        return " | ".join(cells)
+    return head + ": " + " | ".join(rest)
+
+
+def compile_ieee_v1(skill_md: str) -> str:
+    """Regenerate a `checklists_ieee/*.txt` artifact. See the note above."""
+    body = _strip_frontmatter(skill_md)
+    out: list[str] = []
+    pending: tuple[int, str] | None = None
+    seen: set[str] = set()
+    in_fence = False
+
+    def flush() -> None:
+        nonlocal pending
+        if pending is not None:
+            level, title = pending
+            if level >= 2:
+                out.append("#" * (level - 1) + " " + title)
+            pending = None
+
+    for line in body.split("\n"):
+        if V1_FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+
+        m = V1_HEADING_RE.match(line)
+        if m:
+            pending = (len(m.group(1)), m.group(2).strip())
+            continue
+
+        content: str | None = None
+        m = V1_NUMBERED_RE.match(line)
+        if m:
+            content = m.group(2).strip()
+        else:
+            m = V1_BULLET_RE.match(line)
+            if m:
+                raw = m.group(1).strip()
+                if blen(raw) >= V1_MIN_BYTES and V1_KEEP_RE.match(raw):
+                    content = raw
+            else:
+                m = V1_BOLD_RE.match(line)
+                if m:
+                    label = m.group(1).strip().rstrip(":")
+                    rest = m.group(2).strip()
+                    content = f"**{label}**" if not rest else f"**{label}:** {rest}"
+                else:
+                    m = V1_TABLE_RE.match(line)
+                    if m:
+                        flat = _flatten_table_row(m.group(1))
+                        if flat and V1_KEEP_RE.match(flat):
+                            content = flat
+
+        if not content:
+            continue
+        key = content.lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        flush()
+        out.append("- " + content)
+
+    # No trailing flush: a heading is emitted only if a retained line follows.
+    return "\n".join(out) + "\n"
+
+
+def ieee_v1_from_manifest(manifest_path: Path, out_dir: Path,
+                          skills_root: Path | None = None) -> dict:
+    """Regenerate every `checklists_ieee` artefact the manifest records."""
+    skills_root = skills_root or (REPO / "skills")
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    produced: dict[str, str] = {}
+    for skill, entry in sorted(data["checklists"].items()):
+        recorded = entry["source_sha256"]
+        candidates = [REPO / entry["source"],
+                      (REPO / entry["source"]).parent / "SKILL.benchmark-time.md"]
+        source = next((c for c in candidates
+                       if c.exists() and hashlib.sha256(c.read_bytes()).hexdigest() == recorded), None)
+        if source is None:
+            print(f"  ⚠️  {skill}: no source on disk matching {recorded[:12]}",
+                  file=sys.stderr)
+            continue
+        text = compile_ieee_v1(source.read_text(encoding="utf-8"))
+        (out_dir / f"{skill}.txt").write_text(text, encoding="utf-8")
+        produced[skill] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        print(f"  {skill:<32} {len(text.encode('utf-8')):>6}B  "
+              f"{produced[skill][:16]}")
+    return produced
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="skills-compiler", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -591,6 +746,16 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("from-tasks", help="Batch compile from a tasks JSON")
     f.add_argument("-t", "--tasks", type=Path, default=REPO / "benchmarks/tasks_ieee.json")
     f.add_argument("-o", "--out-dir", type=Path, default=REPO / "benchmarks/checklists_v2")
+
+    v1 = sub.add_parser(
+        "ieee-v1",
+        help="Regenerate the checklists_ieee (checklist arm) artefacts",
+    )
+    v1.add_argument(
+        "-m", "--manifest", type=Path,
+        default=REPO / "benchmarks" / "checklists_ieee" / "manifest.json")
+    v1.add_argument("-o", "--out-dir", type=Path,
+                    default=REPO / "benchmarks" / "checklists_ieee")
 
     a = sub.add_parser("ablate", help="Generate the A0-A5 ablation series")
     a.add_argument("-i", "--input", required=True, type=Path)
@@ -626,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "from-tasks":
         from_tasks(args.tasks, args.out_dir)
+        return 0
+
+    if args.command == "ieee-v1":
+        produced = ieee_v1_from_manifest(args.manifest, args.out_dir)
+        print(f"\nRegenerated {len(produced)} checklist_v1 artefacts into {args.out_dir}")
         return 0
 
     if args.command == "ablate":

@@ -5,6 +5,9 @@
 `checklist_vs_checklist_v2`, the balanced-vs-aggressive contrast that the
 headline delivery result rests on.
 
+The byte pins below guard the *committed originals*. Regenerating them is a
+separate check, in `test_checklist_v1_artefacts_regenerate_from_source`.
+
 Unlike `checklists_v2/`, **no generator in this repository reproduces these
 files**. They were produced by a tool that predates the repository's initial
 commit. The compiler's `checklist_v1()` path emits a `[CHECKLIST GUIDELINES]`
@@ -23,7 +26,8 @@ import hashlib
 import json
 from pathlib import Path
 
-V1_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "checklists_ieee"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+V1_DIR = REPO_ROOT / "benchmarks" / "checklists_ieee"
 RESULTS = V1_DIR.parent / "delivery_results_ieee.json"
 
 EXPECTED_SHA256 = {
@@ -78,7 +82,10 @@ def test_checklist_v1_artifacts_are_intact() -> None:
 
 
 def test_no_extra_files_in_checklist_v1_directory() -> None:
-    """An added artifact was never the input to any scored run."""
+    """An added artifact was never the input to any scored run.
+
+    `manifest.json` is part of the recorded set; it is read, never regenerated.
+    """
     found = {p.name for p in V1_DIR.iterdir()} - set(EXPECTED_SHA256)
     assert not found, f"unexpected files in checklists_ieee/: {sorted(found)}"
 
@@ -88,3 +95,21 @@ def test_checklist_arm_is_still_part_of_the_archived_results() -> None:
     results = json.loads(RESULTS.read_text(encoding="utf-8"))
     assert "checklist" in results["strategies"]
     assert results["raw_score_counts"]["checklist"] == 80
+
+def test_checklist_v1_artefacts_regenerate_from_source() -> None:
+    """The arm is reproducible, not merely archived.
+
+    Guards the claim that the recovered extractor still produces these exact
+    bytes. If this fails, either the extractor drifted or a source changed --
+    both invalidate the 80 archived `checklist` evaluations.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "verify_ieee_v1_artifacts.py")],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, (
+        f"checklist_v1 no longer regenerates from source:\n{proc.stdout}\n{proc.stderr}"
+    )
