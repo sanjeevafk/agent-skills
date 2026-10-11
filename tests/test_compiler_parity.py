@@ -1,6 +1,6 @@
 """Compiler parity tests -- direct port of the 24 unit tests that guarded
-`crates/skills-compiler` before the Python port (Phase 1.6 of
-PYTHON_PORT_PLAN.md).
+`crates/skills-compiler` before the Python port, plus three regression guards
+for bugs the port itself introduced.
 
 These are NOT generic unit tests. Each one pins a byte-level behaviour that
 the recorded artifacts in `benchmarks/checklists_v2/` and
@@ -118,7 +118,8 @@ def test_a4_never_touches_switch_case_labels():
 # changing the recorded A4 ablation artifacts. Their practical impact is
 # bounded: across the 18 evaluated skills the realised A4 magnitude is 0.9%
 # (security-review) and 0.0% elsewhere, so they do not materially affect
-# §8.4. See benchmarks/COMPILER_PROVENANCE.md ("Known limitations").
+# §8.4. See skills/RECOVERY.md and the module docstring in
+# scripts/skills_compiler.py.
 
 def test_a4_known_gap_optional_param_annotation_survives():
     md = (
