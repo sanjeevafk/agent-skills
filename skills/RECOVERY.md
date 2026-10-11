@@ -25,6 +25,8 @@ surviving v2 artifacts. That reconstruction is superseded — it was lossy (it
 could not recover the prose the compiler prunes, `keep_narrative = false`) and
 its hash never matched the manifest. The files now in place are the genuine
 sources, so the residual gap the reconstruction left is closed.
+`skills/debugging-code/RECONSTRUCTED.md` records the same supersession for that
+skill and is now a pointer here rather than a stale claim.
 
 The other 16 skills needed nothing: their live `SKILL.md` still hashes exactly
 to what the manifest recorded.
@@ -39,7 +41,10 @@ tooling use, so it was not reverted.
 - `skills/tdd/SKILL.md` — current post-run version (the active skill).
 - `skills/tdd/SKILL.benchmark-time.md` — the recovered benchmark-time source,
   4211 bytes, SHA-256 `1d0a1439…`, matching the manifest.
-- `skills/tdd/SKILL.post-run.md` — byte-identical copy of the active file.
+
+An earlier `SKILL.post-run.md` byte-identical copy of the active file was
+removed; `SKILL.md` already is that version, so the duplicate carried no
+information.
 
 `skills/debugging-code/SKILL.md` is likewise a post-run condensation; its
 recorded source sits beside it as `SKILL.benchmark-time.md`.

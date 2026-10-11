@@ -146,7 +146,7 @@ def load_reference(task: dict) -> tuple[str, str]:
     if source != "artifact_v2":
         raise SystemExit(
             f"no committed v2 artifact for '{skill_name}' (got {source!r}); "
-            "run the Rust compiler first"
+            "regenerate the arm first: uv run python scripts/skills_compiler.py from-tasks"
         )
     return skill_md, compiled
 
