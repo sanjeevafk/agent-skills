@@ -34,6 +34,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from skills_compiler import TASK_DOMAIN_TO_DOMAIN  # noqa: E402
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 COMPILER = REPO / "scripts" / "skills_compiler.py"
 TASKS = REPO / "benchmarks" / "tasks_ieee.json"
@@ -41,21 +44,51 @@ MANIFEST = REPO / "benchmarks" / "checklists_v2" / "manifest.json"
 
 # Skills whose recorded artifacts are known not to reproduce today. Each entry
 # states why, so the exception is auditable rather than a blanket waiver.
-KNOWN_EXCEPTIONS: dict[str, str] = {
-    "tdd": (
-        "The benchmark-time source of skills/tdd/SKILL.md predates the repository's "
-        "initial commit and is not recoverable; only its compiled artifact survives. "
-        "The reconstructed benchmark-time source is kept at "
-        "skills/tdd/SKILL.benchmark-time.md and reproduces the recorded artifact "
-        "byte-for-byte, but the recorded source hash (1d0a1439...) no longer matches "
-        "any file on disk. The live skills/tdd/SKILL.md is the post-run version "
-        "(93ea419b...) that current tooling uses. See skills/RECOVERY.md."
-    ),
-}
+# No skills are exempt today. The last one (`tdd`) was cleared when its
+# benchmark-time source was recovered verbatim from the A0 ablation artifact --
+# see skills/RECOVERY.md. The table is kept because a future drift should be
+# declared explicitly rather than silently skipped.
+KNOWN_EXCEPTIONS: dict[str, str] = {}
 
 
 def sha256_file(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _domain_for(skill_id: str) -> str:
+    """The Domain enum name the manifest recorded this skill under."""
+    tasks = json.loads(TASKS.read_text(encoding="utf-8"))
+    for t in tasks:
+        if t.get("skill") == skill_id:
+            return TASK_DOMAIN_TO_DOMAIN.get((t.get("domain") or "").lower(), "general")
+    return "general"
+
+
+def resolve_source(entry: dict) -> tuple[pathlib.Path | None, str]:
+    """Return the on-disk file whose bytes are the recorded source, and how.
+
+    The live `SKILL.md` is the first candidate. If it was legitimately edited
+    after the run, a sibling `SKILL.benchmark-time.md` may hold the recorded
+    source verbatim -- recovered from the A0 ablation artifact, which is a raw
+    passthrough of the benchmark-time input. Candidates are accepted only when
+    their SHA-256 equals the manifest's `source_sha256`, so this can never be
+    satisfied by a reconstruction that merely happens to recompile to the same
+    artefact.
+
+    Falls back to the live path so genuine drift is still reported rather than
+    silently hidden.
+    """
+    live = REPO / entry["source_path"]
+    recorded = entry["source_sha256"]
+    candidates = [live, live.parent / "SKILL.benchmark-time.md"]
+    fallback = None
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if sha256_file(candidate) == recorded:
+            return candidate, ("live" if candidate == live else "recovered")
+        fallback = fallback or candidate
+    return fallback, "unmatched"
 
 
 def main() -> int:
@@ -86,18 +119,45 @@ def main() -> int:
         rebuilt = json.loads(rebuilt_manifest.read_text(encoding="utf-8"))["skills"]
 
         matched: list[str] = []
+        recovered: list[str] = []
         drifted: list[str] = []
         absent: list[str] = []
 
         for skill_id, entry in sorted(recorded.items()):
             want = entry["compiled_sha256"]
             artifact = tmp / f"{skill_id}.txt"
-            if skill_id not in rebuilt or not artifact.exists():
+            source, provenance = resolve_source(entry)
+
+            # The bulk `from-tasks` run compiles live sources. When a skill's
+            # recorded source is only available as the recovered copy, compile
+            # that file directly so the artefact check stays honest.
+            if source is None:
                 absent.append(skill_id)
                 continue
+            if provenance != "live":
+                proc2 = subprocess.run(
+                    [sys.executable, str(COMPILER), "compile",
+                     "--input", str(source),
+                     "--domain", _domain_for(skill_id),
+                     "--output", str(artifact)],
+                    cwd=REPO, capture_output=True, text=True,
+                )
+                if proc2.returncode != 0:
+                    drifted.append(skill_id)
+                    continue
+
+            if skill_id not in rebuilt and provenance == "live":
+                absent.append(skill_id)
+                continue
+            if not artifact.exists():
+                absent.append(skill_id)
+                continue
+
             # Hash the artefact on disk rather than trusting the rebuild manifest.
             if sha256_file(artifact) == want:
                 matched.append(skill_id)
+                if provenance != "live":
+                    recovered.append(skill_id)
             else:
                 drifted.append(skill_id)
     finally:
@@ -108,6 +168,9 @@ def main() -> int:
           f"(recorded with compiler v{manifest_data['compiler_version']})")
     print()
     print(f"  reproducible (byte-identical): {len(matched)}/{len(recorded)}")
+    print(f"    from the live SKILL.md:      {len(matched) - len(recovered)}")
+    print(f"    from a recovered source:     {len(recovered)}"
+          + (f"  ({', '.join(sorted(recovered))})" if recovered else ""))
     print(f"  drifted:                       {len(drifted)}")
     print(f"  not recompiled (source absent): {len(absent)}")
 
