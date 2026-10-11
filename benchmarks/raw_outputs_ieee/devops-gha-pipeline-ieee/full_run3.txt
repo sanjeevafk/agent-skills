@@ -1,0 +1,835 @@
+[exit=0 latency=69.86s]
+Here's the complete pipeline design for a TypeScript monorepo with pnpm, 3 apps (`web`, `api`, `dashboard`), and 8 libs (`config/*`, `ui/*`, `db/*`, `auth`, `utils`).
+
+---
+
+## Architecture Overview
+
+```
+.github/workflows/
+├── ci.yml                 # Path-filtered CI (lint → test → build per app)
+├── deploy.yml             # Deploy to staging/prod (OIDC federated)
+├── release-attestation.yml # Release + SBOM + sigstore attestation
+└── pr-cleanup.yml         # Cleanup ephemeral preview environments
+```
+
+---
+
+## Cache Key Design
+
+The cache strategy uses two independent layers keyed differently:
+
+```yaml
+# Deps cache — invalidated ONLY when lockfile or root package.json changes
+- uses: actions/cache@v4
+  with:
+    path: ~/.pnpm-store
+    key: pnpm-deps-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+    restore-keys: |
+      pnpm-deps-${{ runner.os }}-
+
+# Build cache — invalidated when lockfile + root package.json + specific workspace content changes
+- uses: actions/cache@v4
+  with:
+    path: |
+      ./**/dist/
+      ./**/node_modules/.cache/
+      apps/web/.next/
+      apps/api/.output/
+    key: build-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}-${{ hashFiles('apps/web/package.json', 'apps/web/**/*.{ts,tsx}', 'packages/**/*.{ts,tsx}') }}
+    restore-keys: |
+      build-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}-
+```
+
+**Rationale:**
+
+- **Deps cache** is keyed on the lockfile because that's what determines installed package versions. The root `package.json` is added because pnpm overrides and resolution hints live there. Without it, updating pnpm-config in `package.json` wouldn't bust the cache.
+
+- **Build cache** adds workspace-specific content hashes. If only `packages/shared-ui` changes, only the `web` app (which depends on it) gets a fresh build — `api` and `dashboard` reuse their cached builds. The fallback restore key ensures partial cache hits when content changes but the lockfile hasn't.
+
+- **`~/.pnpm-store`** is pnpm's global content-addressable store (equivalent to `node_modules/.pnpm`). Caching it avoids redownloading transitive deps. The `node_modules` in each workspace are symlinks into this store — fast to recreate.
+
+- **`restore-keys`** enable partial cache hits: if an exact match isn't found, the closest prior cache is restored and incremental updates happen. This keeps rebuilds fast even when caches expire.
+
+---
+
+## OIDC Trust Configuration
+
+### AWS Setup
+
+```bash
+# 1. Create OIDC identity provider in AWS
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+
+# 2. Create IAM role with trust policy
+cat > trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_AWS_ACCOUNT:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo/YOUR_ORG/YOUR_REPO:environment:production"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name gh-actions-deploy \
+  --assume-role-policy-document file://trust-policy.json \
+  --description "Used by GitHub Actions for production deployments"
+
+# 3. Attach least-privilege permissions (adjust to your services)
+aws iam attach-role-policy \
+  --role-name gh-actions-deploy \
+  --policy-arn arn:aws:iam::policy/ECS-ReadOnly-Policy
+
+# 4. In GitHub repo: Settings > Environments > production
+#    Add "Required reviewers" and "Deployment branches: main"
+```
+
+### Workflow Integration
+
+```yaml
+- name: Configure AWS Credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::YOUR_AWS_ACCOUNT:role/gh-actions-deploy
+    aws-region: us-east-1
+    role-session-name: github-actions-${{ github.run_id }}-${{ github.run_number }}
+```
+
+Key security properties:
+- **No long-lived keys stored** — GitHub exchanges its JWT for temporary AWS STS credentials
+- **Environment-gated** — the trust policy requires `github.ref == refs/heads/main` AND the `production` environment context, so PRs on `feature/*` branches cannot assume the role
+- **Session naming** — `github-actions-runID-number` ties each credential session to a specific workflow invocation for audit logging
+- **Per-PR isolation** — preview environments use a separate role (`gh-actions-preview`) with scoped permissions to the ephemeral namespace
+
+---
+
+## Complete Workflow Files
+
+### 1. `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PNPM_CACHE_DIR: ~/.pnpm-store
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Path Detection (runs once, outputs per-app flags)
+  # ──────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Apps
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      api: ${{ steps.filter.outputs.api }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      libs: ${{ steps.filter.outputs.libs }}
+      all_changed_files: ${{ steps.filter.outputs.all_changed_files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            web:
+              - 'apps/web/**'
+              - 'packages/ui/**'
+              - 'packages/config/**'
+              - 'packages/auth/**'
+              - 'packages/utils/**'
+            api:
+              - 'apps/api/**'
+              - 'packages/db/**'
+              - 'packages/auth/**'
+              - 'packages/config/**'
+              - 'packages/utils/**'
+            dashboard:
+              - 'apps/dashboard/**'
+              - 'packages/ui/**'
+              - 'packages/db/**'
+              - 'packages/config/**'
+              - 'packages/utils/**'
+            libs:
+              - 'packages/ui/**'
+              - 'packages/db/**'
+              - 'packages/config/**'
+              - 'packages/auth/**'
+              - 'packages/utils/**'
+
+  # ──────────────────────────────────────────────
+  # Shared Infrastructure
+  # ──────────────────────────────────────────────
+  setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key-prefix: ${{ steps.cache-key.outputs.prefix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Compute cache keys
+        id: cache-key
+        run: |
+          echo "prefix=pnpm-deps-${{ runner.os }}" >> $GITHUB_OUTPUT
+          echo "lock-hash=${{ hashFiles('pnpm-lock.yaml', 'package.json') }}" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────
+  # Dependency Installation (shared, cached)
+  # ──────────────────────────────────────────────
+  install:
+    name: Install Dependencies
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Restore deps cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ steps.setup.outputs.cache-key-prefix }}-${{ needs.setup.outputs.lock-hash }}
+          restore-keys: |
+            ${{ steps.setup.outputs.cache-key-prefix }}-
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+  # ──────────────────────────────────────────────
+  # Per-App Lint & Type Check (non-blocking CI signal for merge queue)
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint (${{ matrix.app }})
+    needs: [install, detect-changes]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >-
+      needs.detect-changes.outputs.web == 'true' && matrix.app == 'web' ||
+      needs.detect-changes.outputs.api == 'true' && matrix.app == 'api' ||
+      needs.detect-changes.outputs.dashboard == 'true' && matrix.app == 'dashboard' ||
+      (needs.detect-changes.outputs.libs == 'true' && matrix.app != 'skip')
+    strategy:
+      matrix:
+        app: [web, api, dashboard]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Restore deps cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ needs.setup.outputs.cache-key-prefix }}-${{ needs.setup.outputs.lock-hash }}
+          restore-keys: |
+            ${{ needs.setup.outputs.cache-key-prefix }}-
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Bootstrap packages
+        run: pnpm build --filter './packages/**'
+
+      - name: Lint
+        run: pnpm --filter "./apps/${{ matrix.app }}" lint
+
+      - name: Type check
+        run: pnpm --filter "./apps/${{ matrix.app }}" typecheck
+
+  # ──────────────────────────────────────────────
+  # Per-App Test Matrix (blocking CI signal for merge queue)
+  # ──────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.app }}, Node ${{ matrix.node }}, Shards ${{ matrix.shard_total }}/${{ matrix.shard_current }})
+    needs: [install, detect-changes]
+    runs-on: ubuntu-latest
+    if: >-
+      needs.detect-changes.outputs.web == 'true' && matrix.app == 'web' ||
+      needs.detect-changes.outputs.api == 'true' && matrix.app == 'api' ||
+      needs.detect-changes.outputs.dashboard == 'true' && matrix.app == 'dashboard' ||
+      (needs.detect-changes.outputs.libs == 'true' && matrix.app != 'skip')
+    strategy:
+      matrix:
+        app: [web, api, dashboard]
+        node: [20, 22]
+        shard_current: [1, 2, 3, 4]
+        shard_total: [4]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Restore deps cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ needs.setup.outputs.cache-key-prefix }}-${{ needs.setup.outputs.lock-hash }}
+          restore-keys: |
+            ${{ needs.setup.outputs.cache-key-prefix }}-
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Bootstrap packages
+        run: pnpm build --filter './packages/**'
+
+      - name: Run tests (shard ${{ matrix.shard_current }}/${{ matrix.shard_total }})
+        run: >-
+          pnpm --filter "./apps/${{ matrix.app }}" test
+          --shard ${{ matrix.shard_current }}/${{ matrix.shard_total }}
+        env:
+          NODE_VERSION: ${{ matrix.node }}
+          CI: true
+
+      - name: Upload coverage
+        if: matrix.shard_current == 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.app }}-node${{ matrix.node }}
+          path: |
+            apps/${{ matrix.app }}/coverage/
+            !**/lcov.info
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # Per-App Build (with caching, feeds deploy)
+  # ──────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.app }})
+    needs: [install, detect-changes, test]
+    runs-on: ubuntu-latest
+    if: >-
+      needs.detect-changes.outputs.web == 'true' && matrix.app == 'web' ||
+      needs.detect-changes.outputs.api == 'true' && matrix.app == 'api' ||
+      needs.detect-changes.outputs.dashboard == 'true' && matrix.app == 'dashboard' ||
+      (needs.detect-changes.outputs.libs == 'true' && matrix.app != 'skip')
+    strategy:
+      matrix:
+        app: [web, api, dashboard]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Restore deps cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ needs.setup.outputs.cache-key-prefix }}-${{ needs.setup.outputs.lock-hash }}
+          restore-keys: |
+            ${{ needs.setup.outputs.cache-key-prefix }}-
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Bootstrap packages
+        run: pnpm build --filter './packages/**'
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./**/dist/
+            ./**/node_modules/.cache/
+            apps/web/.next/
+            apps/api/.output/
+          key: build-${{ runner.os }}-${{ needs.setup.outputs.lock-hash }}-${{ matrix.app }}-${{ hashFiles('apps/' + matrix.app + '/package.json', 'apps/' + matrix.app + '/src/**/*.{ts,tsx}') }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ needs.setup.outputs.lock-hash }}-${{ matrix.app }}-
+
+      - name: Build
+        run: pnpm --filter "./apps/${{ matrix.app }}" build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+          retention-days: 14
+
+  # ──────────────────────────────────────────────
+  # Preview Deployment Trigger (fires after passing CI)
+  # ──────────────────────────────────────────────
+  trigger-preview:
+    name: Trigger Preview Deploy
+    needs: [build]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Dispatch preview workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref: 'main',
+              inputs: {
+                environment: 'preview',
+                app_names: '${{ join(github.event.pull_request.changed_apps || ['web', 'api'], ', ') }}',
+                pr_number: '${{ github.event.pull_request.number }}',
+                sha: '${{ github.event.pull_request.head.sha }}'
+              }
+            });
+
+  # ──────────────────────────────────────────────
+  # Prod Deploy Trigger (fires after merge to main)
+  # ──────────────────────────────────────────────
+  trigger-prod:
+    name: Trigger Prod Deploy
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Dispatch deploy workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const apps = ['web', 'api', 'dashboard'];
+            // Check which apps had changes
+            const { data: commitFiles } = await github.rest.repos.compareCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: context.payload.before,
+              head: context.payload.after
+            });
+            const changedApps = [];
+            const changedPaths = new Set(commitFiles.files.map(f => f.filename));
+            for (const app of apps) {
+              const appPrefix = 'apps/' + app + '/';
+              if (changedPaths.has(appPrefix) || [...changedPaths].some(p => p.startsWith(appPrefix))) {
+                changedApps.push(app);
+              }
+            }
+            if (changedApps.length === 0) changedApps.push('web'); // fallback
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref: 'main',
+              inputs: {
+                environment: 'production',
+                app_names: changedApps.join(','),
+                sha: '${{ github.sha }}'
+              }
+            });
+```
+
+---
+
+### 2. `.github/workflows/deploy.yml`
+
+```yaml
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - preview
+          - staging
+          - production
+      app_names:
+        description: 'Comma-separated app names (e.g., web,api)'
+        required: true
+        type: string
+      pr_number:
+        description: 'PR number (for preview deployments)'
+        required: false
+        type: string
+      sha:
+        description: 'Commit SHA to deploy'
+        required: true
+        type: string
+
+  # Allow dispatch from CI workflow
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      app_names:
+        required: true
+        type: string
+      pr_number:
+        required: false
+        type: string
+      sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC federation
+
+env:
+  APP_NAMES: ${{ inputs.app_names }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Preview / Staging: OIDC auth, lightweight deploy
+  # ──────────────────────────────────────────────
+  deploy-environment:
+    name: Deploy to ${{ inputs.environment }} (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment == 'production' && 'production' || format('{0}-{1}', inputs.environment, inputs.pr_number || github.run_number) }}
+      url: ${{ steps.deploy.outputs.url }}
+    strategy:
+      matrix:
+        app: ${{ fromJSON(format('["{0}"]', inputs.app_names)) }}
+      fail-fast: false
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.environment == 'production' && 'arn:aws:iam::YOUR_AWS_ACCOUNT:role/gh-actions-deploy' || 'arn:aws:iam::YOUR_AWS_ACCOUNT:role/gh-actions-preview' }}
+          aws-region: us-east-1
+          role-session-name: github-actions-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Deploy ${{ matrix.app }}
+        id: deploy
+        run: |
+          echo "Deploying ${{ matrix.app }} to ${{ inputs.environment }}..."
+
+          # Example: ECS Blue/Green or Fargate deploy
+          # Adjust to your deployment target
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            DEPLOY_CMD="ecs deploy-production"
+          else
+            DEPLOY_CMD="ecs deploy-staging"
+          fi
+
+          # Placeholder — replace with actual deployment
+          echo "Running: $DEPLOY_CMD --app ${{ matrix.app }} --sha ${{ inputs.sha }}"
+          # aws ecs update-service --cluster main --service ${{ matrix.app }} --force-new-deployment
+
+          # Output environment URL
+          if [[ "$ENVIRONMENT" == "preview" ]]; then
+            echo "url=https://${{ matrix.app }}-${{ inputs.pr_number }}.preview.example.com" >> $GITHUB_OUTPUT
+          elif [[ "$ENVIRONMENT" == "staging" ]]; then
+            echo "url=https://${{ matrix.app }}.staging.example.com" >> $GITHUB_OUTPUT
+          else
+            echo "url=https://${{ matrix.app }}.example.com" >> $GITHUB_OUTPUT
+          fi
+
+  # ──────────────────────────────────────────────
+  # Post-deploy verification
+  # ──────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test (${{ matrix.app }})
+    needs: deploy-environment
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: ${{ fromJSON(format('["{0}"]', inputs.app_names)) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Run smoke tests
+        run: pnpm --filter "./apps/${{ matrix.app }}" test:e2e
+        env:
+          TARGET_URL: ${{ needs.deploy-environment.outputs.url }}
+```
+
+---
+
+### 3. `.github/workflows/release-attestation.yml`
+
+```yaml
+name: Release + Attestation
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write       # For Sigstore OIDC (Fulcio/MerkleTree)
+  packages: write       # For pushing attested packages
+  actions: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Build all apps
+  # ──────────────────────────────────────────────
+  build-release:
+    name: Build Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [web, api, dashboard]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Bootstrap packages
+        run: pnpm build --filter './packages/**'
+
+      - name: Build ${{ matrix.app }}
+        run: pnpm --filter "./apps/${{ matrix.app }}" build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/dist/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Generate SBOM + Sign Provenance
+  # ──────────────────────────────────────────────
+  attestation:
+    name: SBOM + Attestation
+    needs: build-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [web, api, dashboard]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: dist/${{ matrix.app }}/
+
+      # ── SBOM Generation ──
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist/${{ matrix.app }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.app }}.spdx.json
+          artifact-name: sbom-${{ matrix.app }}
+
+      # ── Build provenance attestation via sigstore ──
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/${{ matrix.app }}
+          subject-name: ${{ matrix.app }}
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-name: ${{ matrix.app }}
+          subject-path: dist/${{ matrix.app }}
+          sbom-path: sbom-${{ matrix.app }}.spdx.json
+```
+
+---
+
+### 4. `.github/workflows/pr-cleanup.yml`
+
+```yaml
+name: PR Cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to cleanup'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  cleanup-environment:
+    name: Cleanup Preview Environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine PR number
+        id: pr-number
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete preview environment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr-number.outputs.number }}
+        run: |
+          # Delete the GitHub Environment for this PR
+          ENV_NAME="preview-$PR_NUMBER"
+          if gh api repos/${{ github.repository }}/environments/$ENV_NAME >/dev/null 2>&1; then
+            echo "Deleting environment: $ENV_NAME"
+            gh api --method DELETE repos/${{ github.repository }}/environments/$ENV_NAME
+          else
+            echo "Environment $ENV_NAME does not exist, skipping."
+          fi
+
+          # Clean up any associated resources (DNS records, cloud resources, etc.)
+          # Replace with your actual cleanup logic:
+          # aws route53 change-resource-record-sets ...
+          # gcloud compute addresses delete ...
+          echo "Cleaned up preview environment for PR #$PR_NUMBER"
+```
+
+---
+
+## Status Checks & Merge Queue Wiring
+
+All CI jobs that appear in the merge queue must produce **status checks**. Here's the mapping:
+
+| Status Check Name (as shown in UI) | Purpose | Blocking? |
+|---|---|---|
+| `CI (Lint (web))` | Web app linting & typecheck | Yes |
+| `CI (Lint (api))` | API app linting & typecheck | Yes |
+| `CI (Lint (dashboard))` | Dashboard app linting & typecheck | Yes |
+| `CI (Test (web, Node 20, Shards 4/4))` | Full web test suite, Node 20 | Yes |
+| `CI (Test (web, Node 22, Shards 4/4))` | Full web test suite, Node 22 | Yes |
+| `CI (Test (api, Node 20, Shards 4/4))` | Full API test suite, Node 20 | Yes |
+| `CI (Test (api, Node 22, Shards 4/4))` | Full API test suite, Node 22 | Yes |
+| `CI (Test (dashboard, Node 20, Shards 4/4))` | Full dashboard tests, Node 20 | Yes |
+| `CI (Test (dashboard, Node 22, Shards 4/4))` | Full dashboard tests, Node 22 | Yes |
+| `CI (Build (web))` | Web build passes | Yes |
+| `CI (Build (api))` | API build passes | Yes |
+| `CI (Build (dashboard))` | Dashboard build passes | Yes |
+| `CI (Deploy to Preview (web))` | Preview env deploy succeeded | No |
+| `CI (Deploy to Preview (api))` | Preview env deploy succeeded | No |
+| `CI (Deploy to Preview (dashboard))` | Preview env deploy succeeded | No |
+
+In **Settings > Branches > Branch protection rules**:
+- Require status checks: select all the **"Yes"** rows above
+- Check "Require status checks to pass before merging" ✓
+- Enable "Include administrators" ✓
+- Under "Merge queue": enable merge queue, set max queue depth (e.g., 5), consistency horizon (e.g., 2 min)
+
+GitHub merge queue validates that each queued PR passes all required checks on the `main` branch. Jobs with `continue-on-error: true` (like lint) post as "success" even on failure — they need `continue-on-error: false` for true merge-queue gating. I've left them as-is since lint failures often allow fixes in follow-up commits; adjust to `false` if you want hard gates.
+
+---
+
+## Summary of Security Properties
+
+| Concern | How It's Addressed |
+|---|---|
+| No long-lived cloud keys | OIDC federation — `id-token: write` exchanges GitHub JWT for temp STS credentials |
+| Environment separation | Separate IAM roles (`gh-actions-deploy` vs `gh-actions-preview`); trust policies scope to environment context |
+| Branch protection | Deploy workflow dispatches only on `push` to `main`; preview only on `pull_request` |
+| Audit trail | Session names include `run_id/run_number`; all AWS CloudTrail logs tie back to GitHub |
+| SBOM traceability | Syft-generated SPDX + Sigstore-signed provenance + SBOM attestation — all verifiable via `cosign` |
+| Pristine builds | `--frozen-lockfile` prevents dependency substitution; `hashFiles()` keying prevents stale cache reuse |

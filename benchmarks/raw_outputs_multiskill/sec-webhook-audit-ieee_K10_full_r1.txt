@@ -1,0 +1,199 @@
+I'll analyze the vulnerabilities in order of severity and provide a corrected implementation.
+
+## Vulnerability Analysis (by severity)
+
+**CRITICAL: Signature verified AFTER JSON parsing**
+- Attacker sends 100MB garbage → server allocates memory, parses JSON, *then* rejects
+- Enables DoS and timing-based oracle attacks
+- Fix: Verify signature on raw bytes first
+
+**CRITICAL: In-memory replay ledger**
+- Multi-worker deployments: each process has separate dict → replay succeeds on different worker
+- Process restart → ledger wiped → all historical event-ids accepted again
+- Race condition: concurrent duplicate requests both pass the "not in dict" check before either inserts
+- Fix: Use Redis SETNX or database unique constraint with proper locking
+
+**HIGH: No idempotency under concurrency**
+- Two simultaneous webhooks with same event-id both pass replay check → payment processed twice
+- Fix: Distributed lock (Redis/DB) around event-id processing
+
+**HIGH: Processor errors leaked to client**
+- Stack traces, DB errors, internal paths exposed → aids attacker reconnaissance
+- Fix: Catch all exceptions, return generic 200/500, log details internally
+
+**MEDIUM: No timestamp validation**
+- Old captured payloads replayable forever
+- Fix: Reject webhooks older than threshold (e.g., 5 minutes)
+
+**MEDIUM: No body size limit**
+- Even with signature-first, unbounded body is risk
+- Fix: Content-Length check before reading
+
+---
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import time
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+import redis.asyncio as redis
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# Redis for replay protection + distributed locking
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+MAX_BODY_SIZE = 1024 * 1024  # 1MB
+WEBHOOK_TTL = 300  # 5 minutes for replay window
+LOCK_TIMEOUT = 30  # seconds to process one event
+
+
+class WebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    data: dict
+
+
+def get_signing_secret() -> bytes:
+    """Fetch current secret from rotation store (e.g., Vault, AWS Secrets Manager)."""
+    # In production: implement actual secret rotation logic
+    return b"current-secret-from-vault"
+
+
+def verify_signature(payload: bytes, signature: str, secret: bytes) -> bool:
+    """Constant-time HMAC verification."""
+    expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def acquire_event_lock(event_id: str) -> Optional[str]:
+    """
+    Acquire distributed lock for event processing.
+    Returns lock token if acquired, None if already locked.
+    """
+    lock_key = f"lock:webhook:{event_id}"
+    lock_token = f"{time.time()}"
+    
+    # SET NX EX — atomic acquire with expiry
+    acquired = await redis_client.set(
+        lock_key, lock_token, nx=True, ex=LOCK_TIMEOUT
+    )
+    return lock_token if acquired else None
+
+
+async def release_event_lock(event_id: str, lock_token: str):
+    """Release lock only if we still own it (prevent releasing another worker's lock)."""
+    lock_key = f"lock:webhook:{event_id}"
+    
+    # Lua script for atomic check-and-delete
+    script = """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    else
+        return 0
+    end
+    """
+    await redis_client.eval(script, 1, lock_key, lock_token)
+
+
+async def is_replay(event_id: str) -> bool:
+    """Check if event was already processed. Returns True if replay."""
+    key = f"webhook:processed:{event_id}"
+    # SET NX with TTL — atomic check-and-set
+    result = await redis_client.set(key, "1", nx=True, ex=WEBHOOK_TTL * 24)  # Keep for 24x window
+    return result is None  # None means key already existed
+
+
+@app.post("/webhooks/payment")
+async def payment_webhook(request: Request):
+    # 1. Content-Length guard (before reading body)
+    content_length = request.headers.get("content-length")
+    if not content_length or int(content_length) > MAX_BODY_SIZE:
+        raise HTTPException(status_code=413, detail="Payload too large")
+    
+    # 2. Read raw bytes (NOT parsed JSON)
+    raw_body = await request.body()
+    
+    # 3. Extract and verify signature FIRST (on raw bytes)
+    signature = request.headers.get("X-Signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing signature")
+    
+    secret = get_signing_secret()
+    if not verify_signature(raw_body, signature, secret):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    # 4. NOW parse JSON (only after auth verified)
+    try:
+        payload = WebhookPayload.model_validate_json(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    
+    # 5. Timestamp validation (prevent indefinite replay)
+    timestamp = request.headers.get("X-Timestamp")
+    if timestamp:
+        try:
+            ts = int(timestamp)
+            if abs(time.time() - ts) > WEBHOOK_TTL:
+                raise HTTPException(status_code=400, detail="Request expired")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid timestamp")
+    
+    # 6. Acquire distributed lock (prevents concurrent duplicate processing)
+    lock_token = await acquire_event_lock(payload.event_id)
+    if not lock_token:
+        # Another worker is processing this event — return success (idempotent)
+        return JSONResponse({"status": "already_processing"}, status_code=200)
+    
+    try:
+        # 7. Replay check (atomic SET NX)
+        if await is_replay(payload.event_id):
+            logger.info(f"Replay detected: {payload.event_id}")
+            return JSONResponse({"status": "already_processed"}, status_code=200)
+        
+        # 8. Process the webhook (your business logic)
+        await process_payment_webhook(payload)
+        
+        return JSONResponse({"status": "ok"}, status_code=200)
+    
+    except Exception as e:
+        # 9. NEVER leak internal errors to client
+        logger.error(f"Webhook processing failed: {payload.event_id}", exc_info=e)
+        # Return 500 so processor retries (but no details)
+        raise HTTPException(status_code=500, detail="Internal error")
+    
+    finally:
+        # 10. Always release lock
+        await release_event_lock(payload.event_id, lock_token)
+
+
+async def process_payment_webhook(payload: WebhookPayload):
+    """Your actual business logic here."""
+    # Process payment, update database, etc.
+    pass
+```
+
+## Key Security Properties
+
+| Threat | Mitigation |
+|--------|-----------|
+| DoS via large payload | Content-Length check before `body()` |
+| Timing attacks | `hmac.compare_digest` (constant-time) |
+| Replay across workers | Redis `SET NX` (atomic, shared) |
+| Replay after restart | Redis persists across process restarts |
+| Concurrent duplicates | Distributed lock per event-id |
+| Lock ownership | Lua check-and-delete prevents releasing others' locks |
+| Error leakage | Generic 500, details only in server logs |
+| Indefinite replay | Timestamp validation with TTL window |
+| Secret rotation | `get_signing_secret()` abstraction for Vault/SM |
+
+The critical insight: **verify on raw bytes, lock before check, and never trust in-memory state in a distributed system.**

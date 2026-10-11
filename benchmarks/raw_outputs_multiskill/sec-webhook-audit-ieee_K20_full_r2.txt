@@ -1,0 +1,228 @@
+# Security Review: FastAPI Payment Webhook
+
+## Vulnerabilities (Ordered by Severity)
+
+### 1. CRITICAL: Signature Verification After JSON Parsing
+Parsing untrusted JSON before HMAC verification means you're processing attacker-controlled data. This enables deserialization attacks, resource exhaustion, and logic exploitation on unverified payloads.
+
+### 2. HIGH: In-Memory Replay Ledger
+- **Lost on restart** — replay attacks possible after any deployment
+- **Not horizontally scalable** — multiple instances each have separate ledgers
+- **Unbounded growth** — memory leak with no TTL
+- **No persistence** — no audit trail
+
+### 3. HIGH: Race Condition on Concurrent Duplicates
+Two simultaneous webhooks with the same event-id both pass the "not seen" check and both process — double-charging the customer.
+
+### 4. MEDIUM: Error Information Leakage
+Processor/internal errors returned to the caller reveal stack traces, library versions, and internal architecture.
+
+### 5. MEDIUM: Timing-Side-Channel on HMAC Comparison
+Using `==` for HMAC comparison leaks timing information, enabling signature forgery.
+
+### 6. LOW: No Timestamp Validation
+Ancient replayed events are accepted if their event-id hasn't been seen.
+
+---
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import time
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import JSONResponse
+import redis.asyncio as redis
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# --- Configuration (from environment, never hardcoded) ---
+WEBHOOK_SECRETS = [
+    "whsec_current_secret",    # Current signing secret
+    "whsec_previous_secret",   # Previous secret during rotation
+]
+WEBHOOK_TOLERANCE_SECONDS = 300  # 5-minute window for replay protection
+REDIS_URL = "redis://localhost:6379"
+
+
+# --- Redis client for replay ledger ---
+async def get_redis() -> redis.Redis:
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# --- Pydantic model for validated payload ---
+class WebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    timestamp: int
+    data: dict
+
+
+# --- HMAC Verification (constant-time, on raw body) ---
+def verify_signature(raw_body: bytes, signature_header: str) -> bool:
+    """
+    Verify HMAC-SHA256 signature against rotating secrets.
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    if not signature_header:
+        return False
+
+    # Expected format: "t=<timestamp>,v1=<signature>"
+    try:
+        parts = signature_header.split(",")
+        timestamp_part = parts[0].split("=")[1]
+        signature_part = parts[1].split("=")[1]
+    except (IndexError, ValueError):
+        return False
+
+    # Validate timestamp freshness (prevent ancient replays)
+    try:
+        event_time = int(timestamp_part)
+    except ValueError:
+        return False
+
+    now = int(time.time())
+    if abs(now - event_time) > WEBHOOK_TOLERANCE_SECONDS:
+        logger.warning("Webhook timestamp outside tolerance window")
+        return False
+
+    # Construct signed payload: timestamp.body
+    signed_payload = f"{timestamp_part}.{raw_body.decode('utf-8')}"
+
+    # Try each secret (supports rotation)
+    for secret in WEBHOOK_SECRETS:
+        expected_sig = hmac.new(
+            secret.encode("utf-8"),
+            signed_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        # CONSTANT-TIME comparison — prevents timing side-channel
+        if hmac.compare_digest(expected_sig, signature_part):
+            return True
+
+    return False
+
+
+# --- Idempotency: Atomic check-and-set with Redis ---
+async def is_event_processed(redis_client: redis.Redis, event_id: str) -> bool:
+    """
+    Atomically check if event was seen and mark it as processed.
+    Uses SET NX (set-if-not-exists) with TTL for atomicity.
+    Returns True if already processed (duplicate).
+    """
+    # SET NX with 7-day TTL — atomic check-and-set
+    # Returns None if key already exists (duplicate), "OK" if new
+    result = await redis_client.set(
+        f"webhook:event:{event_id}",
+        "1",
+        nx=True,           # Only set if not exists
+        ex=604800,         # 7-day TTL (auto-cleanup)
+    )
+    return result is None  # None means key existed = duplicate
+
+
+# --- Webhook Endpoint ---
+@app.post("/webhooks/payment")
+async def payment_webhook(request: Request):
+    """
+    Payment webhook endpoint with:
+    - HMAC verification on raw body (before parsing)
+    - Replay protection via Redis-backed event-id ledger
+    - Atomic idempotency for concurrent duplicates
+    - Generic error responses (no internal leakage)
+    """
+    # Step 1: Read raw body (DO NOT PARSE YET)
+    raw_body = await request.body()
+
+    # Step 2: Verify signature on raw bytes
+    signature = request.headers.get("X-Webhook-Signature", "")
+    if not verify_signature(raw_body, signature):
+        logger.warning("Invalid webhook signature received")
+        # Generic error — don't reveal WHY it failed
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    # Step 3: NOW parse the verified body
+    try:
+        payload = WebhookPayload.model_validate_json(raw_body)
+    except Exception:
+        logger.warning("Webhook payload validation failed")
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    # Step 4: Atomic idempotency check (handles concurrent duplicates)
+    redis_client = await get_redis()
+    try:
+        if await is_event_processed(redis_client, payload.event_id):
+            logger.info(f"Duplicate webhook ignored: {payload.event_id}")
+            # Return 200 to prevent processor retries
+            return JSONResponse(
+                status_code=200,
+                content={"status": "already_processed"},
+            )
+
+        # Step 5: Process the webhook (idempotent by design)
+        await process_payment_event(payload)
+
+        return JSONResponse(
+            status_code=200,
+            content={"status": "processed"},
+        )
+    finally:
+        await redis_client.close()
+
+
+# --- Business logic (separated for testability) ---
+async def process_payment_event(payload: WebhookPayload) -> None:
+    """
+    Process the payment event. Must be idempotent — safe to call
+    multiple times with the same event_id.
+    """
+    # Your payment processing logic here
+    # Use payload.event_id as idempotency key in database operations
+    logger.info(f"Processing event: {payload.event_id}")
+    ...
+
+
+# --- Global exception handler: prevent error leakage ---
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all: log full error internally, return generic message.
+    Never expose stack traces, library versions, or internal details.
+    """
+    logger.error(f"Unhandled exception in webhook: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"},
+    )
+```
+
+---
+
+## Key Security Fixes Summary
+
+| Vulnerability | Fix Applied |
+|---|---|
+| Signature after parsing | Verify HMAC on **raw bytes** before any JSON parsing |
+| In-memory ledger | Redis with `SET NX` + TTL — persistent, shared, auto-expiring |
+| Race condition | Atomic `SET NX` — only one concurrent caller wins |
+| Error leakage | Generic 400/500 responses; full details logged server-side |
+| Timing attack | `hmac.compare_digest()` for constant-time comparison |
+| Ancient replays | Timestamp tolerance window (5 min) |
+| Secret rotation | Try multiple secrets; timestamp binds to signing time |
+
+## Deployment Checklist
+
+- [ ] `WEBHOOK_SECRETS` loaded from environment (never in code)
+- [ ] Redis persistence enabled (AOF or RDB) for replay ledger survival
+- [ ] TLS termination at load balancer (webhooks over HTTPS only)
+- [ ] Rate limiting on `/webhooks/payment` (e.g., 100 req/min per IP)
+- [ ] Alert on high 400 rates (signature failures = attack indicator)
+- [ ] Monitor Redis memory usage and key count

@@ -1,0 +1,1574 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+Design a Playwright E2E suite for a 4-step checkout flow (cart, address, payment, confirmation) that currently has 15% flake. Requirements: page-object model with typed locators, auth state reused via storageState instead of per-test logins, payment and shipping APIs stubbed via route interception with deterministic fixtures, network-idle-free waiting strategies, trace + video artifacts only on retry, and safe parallel execution across 8 workers with per-worker data isolation. Specify the config, the fixture hierarchy, and the quarantine policy for flaky specs.
+
+---
+[Response A]:
+I'll design the full suite addressing every requirement. Let me walk through the architecture before showing the code.
+
+**Key decisions:**
+- **Per-worker isolation**: Each worker gets unique session/cookie keys so auth state from one test can't collide with another's. Workers get isolated cookie names via environment variables injected by Playwright's built-in concurrency model.
+- **StorageState auth**: One-time login → serialize context to a temp file → all other tests consume it. No per-test logins.
+- **No network-idle**: Replace all `waitForLoadState('networkidle')` with targeted `waitForResponse()` calls for known API endpoints plus locator auto-wait.
+- **Route interception**: A single fixture intercepts `/api/shipping/*` and `/api/payment/*` globally, returning deterministic fixtures. Tests can override per-scenario.
+- **Trace/video on retry only**: Config-level `trace: 'on-first-retry'`, `video: 'retain-on-failure'`.
+- **Quarantine**: Flaky specs get `test.fixme(true, 'Issue #NNN')` with mandatory issue tracking. Quarterly audit hook documented.
+
+Here's the complete implementation:
+
+---
+
+## Directory Structure
+
+```
+tests/e2e/checkout/
+├── playwright.config.ts
+├── fixtures/
+│   ├── global-fixtures.ts
+│   ├── auth.fixture.ts
+│   └── api-stubs.fixture.ts
+├── pages/
+│   ├── BasePage.ts
+│   ├── CartPage.ts
+│   ├── AddressPage.ts
+│   ├── PaymentPage.ts
+│   └── ConfirmationPage.ts
+├── fixtures/
+│   ├── checkout-data.json
+│   └── shipping-rates.json
+├── steps/
+│   └── checkout.steps.ts        # Shared helper for the 4-step flow
+├── cart.spec.ts
+├── address.spec.ts
+├── payment.spec.ts
+├── confirmation.spec.ts
+├── full-flow.spec.ts
+└── quarantine.md                 # Quarantine log
+quarantine.md                      # Full quarantine policy
+```
+
+---
+
+## Configuration (`playwright.config.ts`)
+
+```typescript
+import { defineConfig, devices } from '@playwright/test'
+
+export default defineConfig({
+  testDir: './tests/e2e/checkout',
+  testMatch: '**/*.spec.ts',
+
+  // Parallelism — safe for 8 workers
+  fullyParallel: true,
+  workers: process.env.CI ? 8 : undefined,
+
+  // CI discipline
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+
+  // Reporters
+  reporter: [
+    ['html', { outputFolder: 'playwright-report/open', open: 'never' }],
+    ['junit', { outputFile: 'playwright-results/junit.xml' }],
+    ['json', { outputFile: 'playwright-results/results.json' }],
+    ['list'],
+  ],
+
+  use: {
+    baseURL: process.env.BASE_URL || 'http://localhost:3000',
+
+    // Traces only on first retry (cost savings)
+    trace: 'on-first-retry',
+
+    // Videos only retained on failure (large artifacts)
+    video: 'retain-on-failure',
+    videosPath: 'artifacts/videos',
+
+    // Screenshot only on failure
+    screenshot: 'only-on-failure',
+    screenshotsPath: 'artifacts/screenshots',
+
+    // Reasonable defaults — no networkidle needed
+    actionTimeout: 10_000,
+    navigationTimeout: 30_000,
+    timeout: 60_000,
+    ignoreHTTPSErrors: true,
+  },
+
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+  ],
+
+  webServer: {
+    command: 'npm run dev',
+    url: process.env.BASE_URL || 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+  },
+
+  // Per-worker uniqueness for isolated cookies/sessions
+  globalSetup: require.resolve('./fixtures/global-setup.ts'),
+})
+```
+
+### Global Setup (`fixtures/global-setup.ts`)
+
+Generates per-run IDs to avoid cache/stale-state collisions between runs:
+
+```typescript
+import { FullConfig } from '@playwright/test'
+import fs from 'fs'
+import path from 'path'
+
+export default async function globalSetup(_config: FullConfig) {
+  const artifactsDir = path.join(process.cwd(), 'artifacts')
+  fs.mkdirSync(artifactsDir, { recursive: true })
+
+  // Write a run identifier that every test can read for isolation
+  const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  fs.writeFileSync(path.join(artifactsDir, '.run-id'), runId)
+
+  // Clean stale artifacts from previous runs (>24h)
+  const keepMs = 24 * 60 * 60 * 1000
+  const cutoff = Date.now() - keepMs
+  for (const dir of ['videos', 'screenshots']) {
+    const p = path.join(artifactsDir, dir)
+    if (!fs.existsSync(p)) continue
+    fs.readdirSync(p).forEach(f => {
+      const stat = fs.statSync(path.join(p, f))
+      if (stat.mtimeMs < cutoff) fs.unlinkSync(path.join(p, f))
+    })
+  }
+}
+```
+
+---
+
+## Fixture Hierarchy
+
+### Global Fixtures (`fixtures/global-fixtures.ts`)
+
+Root fixtures that chain together — this is where auth state, API stubs, and shared logic are provided:
+
+```typescript
+import { test as base } from '@playwright/test'
+import { extendAuthFixtures, authFixtures } from './auth.fixture'
+import { extendApiStubFixtures, apiStubFixtures } from './api-stubs.fixture'
+
+// Chain: base → auth → api-stubs
+export const test = extendApiStubFixtures(
+  extendAuthFixtures(base)
+)
+
+export { expect } from '@playwright/test'
+```
+
+### Auth Fixture (`fixtures/auth.fixture.ts`)
+
+Handles storageState reuse — logs in ONCE, serializes state, reuses across tests. Key mechanism: per-worker session isolation via random suffixes on cookie names.
+
+```typescript
+import {
+  BrowserContext,
+  Cookie,
+  ElectronApplication,
+  expect as baseExpect,
+  Locator,
+  Page,
+  TestInfo,
+} from '@playwright/test'
+import { test as baseTest } from '@playwright/test'
+
+/**
+ * Generates unique cookie/session identifiers so two parallel workers
+ * don't stomp on each other's auth state.
+ */
+function workerIsolatedCookieName(name: string): string {
+  // Worker index is available after test has started; we derive from the
+  // temporary directory which is worker-unique.
+  return name
+}
+
+interface AuthFixtures {
+  /** Pre-authenticated page ready to use */
+  authenticatedPage: Page
+  /** Storage state object from a successful login */
+  storageStateFile: string | null
+  /** Login method — call once per test run, not per test */
+  loginAs: (email: string, password?: string) => Promise<BrowserContext>
+}
+
+export const authFixtures: Partial<AuthFixtures> = {}
+
+/**
+ * Extends a test class with auth helpers.
+ *
+ * Strategy:
+ * 1. BeforeAll-style: log in once via API, capture cookies/storageState
+ * 2. Store to a .json file
+ * 3. Subsequent tests start contexts with that storageState
+ *
+ * Within a single test, beforeEach creates the page from storageState.
+ * Across tests in the same worker, the same file is reused.
+ */
+export function extendAuthFixtures<T extends Record<string, unknown>>(
+  parent: typeof baseTest & T
+) {
+  const child = parent.extend<AuthFixtures>({
+    storageStateFile: [null, { scope: 'worker', auto: true }],
+
+    loginAs: async ({}, use, testInfo: TestInfo) => {
+      const storageFilePath = testInfo.config.storageFile ?? 'storage-states/default-user.json'
+      const resolvedPath = storageFilePath.startsWith('/')
+        ? storageFilePath
+        : `${testInfo.config.rootDir}/${storageFilePath}`
+
+      // Check if valid storage state already exists (< 1 hour old to be safe)
+      const fs = await import('fs')
+      const statsExists = fs.existsSync(resolvedPath)
+
+      if (statsExists) {
+        const mtime = fs.statSync(resolvedPath).mtimeMs
+        const age = Date.now() - mtime
+        if (age < 60 * 60 * 1000) {
+          await use(resolvedPath)
+          return
+        }
+      }
+
+      // No cached state — do a real login to generate it
+      // NOTE: This assumes a headless login endpoint exists.
+      // For local dev, you can create a "seeded" user via API.
+      const context = await parent.newContext()
+      const page = await context.newPage()
+
+      try {
+        const email = process.env.TEST_USER_EMAIL ?? 'tester@example.com'
+        const password = process.env.TEST_USER_PASSWORD ?? 'TestPass123!'
+
+        // Option A: Use API directly (fastest, most reliable)
+        const loginRes = await page.request.post('/api/auth/login', {
+          data: { email, password },
+        })
+
+        // Extract token from response
+        const body = await loginRes.json()
+        const token = (body as { token: string }).token
+
+        // Add token as both a cookie and localStorage entry
+        await context.addCookies([{
+          name: `session_token_${testInfo.workerIndex}`,
+          value: token,
+          domain: new URL(page.url()).hostname,
+          path: '/',
+          httpOnly: false,
+          secure: false,
+          sameSite: 'Lax',
+        }])
+
+        await page.evaluate(([key, val]) => {
+          localStorage.setItem(key, val)
+        }, [`session_token_${testInfo.workerIndex}`, token])
+
+        // Persist storageState for future tests/workers
+        const state = await context.storageState()
+        fs.mkdirSync(`${testInfo.config.rootDir}/storage-states`, { recursive: true })
+        fs.writeFileSync(resolvedPath, JSON.stringify(state))
+        await use(resolvedPath)
+      } finally {
+        await context.close()
+      }
+    },
+
+    authenticatedPage: async ({ page, loginAs, storageStateFile }, use) => {
+      // Use cached storageState — skips login entirely
+      if (storageStateFile) {
+        // Create a fresh context loaded with saved cookies/localStorage
+        const context = await page.context()
+        // We can't replace the context here, so fall back to normal page
+        // But subsequent tests created in afterEach/beforeEach will pick up storageState
+        await use(page)
+      } else {
+        await use(page)
+      }
+    },
+  })
+
+  // Re-export with proper types
+  return child as typeof baseTest & T & typeof authFixtures
+}
+```
+
+### Simplified Auth Fixture (Better Approach)
+
+Actually, let me simplify this. The standard Playwright pattern for storageState reuse is cleaner:
+
+```typescript
+// fixtures/auth.fixture.ts
+
+import { test as baseTest, BrowserContext, Page } from '@playwright/test'
+
+interface AuthFixtures {
+  /** Path to serialized storageState file for the logged-in user */
+  storageStatePath: string
+  /** Logs in and returns context with session cookies *
+...[truncated]
+---[Response B]:
+I'll work through the full suite design, addressing each requirement systematically.
+
+## Architecture Overview
+
+The core problem is a 15% flake rate — that's structural, not cosmetic. The fix combines four levers: deterministic API fixtures (removing race conditions from payment/shipping calls), `storageState` auth reuse (eliminating login variability), network-aware waiting (replacing artificial sleeps), and quarantining what we can't yet fix. Here's how it works end-to-end.
+
+---
+
+## 1. Project Structure & Config
+
+```
+tests/e2e/checkout/
+├── pages/
+│   ├── cart.page.ts
+│   ├── address.page.ts
+│   ├── payment.page.ts
+│   ├── confirmation.page.ts
+│   └── base.page.ts
+├── fixtures/
+│   ├── checkout.fixtures.ts
+│   ├── auth.fixtures.ts
+│   ├── api-fixtures.ts
+│   └── test-data.ts
+├── specs/
+│   ├── checkout-flow.spec.ts
+│   ├── coupon.spec.ts
+│   └── error-handling.spec.ts
+├── playwright.config.ts
+└── tsconfig.json
+```
+
+### playwright.config.ts
+
+```typescript
+import { defineConfig, devices } from '@playwright/test'
+import path from 'path'
+
+export default defineConfig({
+  testDir: './tests/e2e/checkout',
+  testMatch: '**/*.spec.ts',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,           // only retry in CI
+  workers: process.env.CI ? 8 : undefined,     // full parallelism locally
+  reporter: [
+    ['html', { outputFolder: 'test-results/report' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+    ['list'],
+  ],
+
+  // Artifacts: video + trace only when a test is retried or fails
+  use: {
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',              // video captured every run, 
+    videosPath: 'artifacts/videos/',          // but only *retained* on failure
+    trace: 'retain-on-failure',              // traces expensive — keep on retry/fail
+    tracesPath: 'artifacts/traces/',
+    actionTimeout: 5_000,
+    navigationTimeout: 15_000,
+    // Default wait strategy: network idle + no pending XHR
+    actionTimeout: 0,  // disabled — we use explicit waits
+    // Typed locators are defined per-page object (see below)
+  },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
+
+  // Per-worker data isolation: unique localStorage + cookie prefixes
+  // handled by the worker-scoped fixture (checkout.fixtures.ts).
+})
+```
+
+Key config decisions:
+- **`workers: 8`** with `fullyParallel: true` means tests run simultaneously. Each worker gets isolated browser context (automatic in Playwright). The `auth.fixtures.ts` ensures no shared session state leaks between workers via per-worker `storageState`.
+- **`retries: 2`** in CI means a test runs up to 3 times total. Combined with `trace: 'retain-on-failure'`, only the failed attempt(s) get trace/video baked into the report — this keeps artifact storage manageable.
+- **No `video: 'on-first-retry'`** trick here — we use `'retain-on-failure'` which captures but discards immediately unless the final result is failure or retry happened. This gives us videos when needed without wasting disk on passing-attempt recordings.
+
+---
+
+## 2. Fixture Hierarchy
+
+Three layers, descending order of dependency:
+
+```
+BaseFixture        →  Worker-scoped (unique prefix, cleanup)
+AuthFixture        →  Depends on BaseFixture (login once, save storageState)
+ApiFixtures        →  Depends on AuthFixture (route interception, stubs)
+CheckoutPageObjects→  Depends on ApiFixtures (the actual page classes)
+TestFixtures       →  Composition exposed to every spec
+```
+
+### Base Fixture — Worker Data Isolation
+
+```typescript
+// fixtures/base.fixtures.ts
+import { test as baseTest } from '@playwright/test'
+import { randomUUID } from 'crypto'
+
+export interface BaseFixtures {
+  workerPrefix: string      // unique per-worker key for localStorage/cookies
+}
+
+// This fixture runs ONCE per worker process.
+// Since workers isolate browser contexts, the prefix guarantees no cross-test collision.
+export const test = baseTest.extend<BaseFixtures>({
+  workerPrefix: async ({}, use, info) => {
+    const workerIndex = info.workerId ?? 'local'
+    const testSuite = path.basename(info.file, '.spec.ts')
+    const prefix = `w-${workerIndex}-${testSuite}-${randomUUID().slice(0, 8)}`
+    await use(prefix)
+  },
+})
+
+export { expect } from '@playwright/test'
+```
+
+### Auth Fixture — StorageState Reuse
+
+```typescript
+// fixtures/auth.fixtures.ts
+import { type Page } from '@playwright/test'
+import { test, expect } from './base.fixtures'
+import fs from 'fs'
+import path from 'path'
+
+export interface AuthFixtures {
+  authenticatedPage: Page
+  loadStoredAuth: () => Promise<void>
+}
+
+// Pre-built auth token for our test account — never log in during a test
+const TEST_USER = { email: 'checkout@test.local', password: 'TestPass1!' }
+const AUTH_STATE_FILE = path.join(__dirname, '../../fixtures/.auth/state.json')
+
+function ensureAuthFile() {
+  if (!fs.existsSync(AUTH_STATE_FILE)) {
+    throw new Error(
+      `Auth state file missing at ${AUTH_STATE_FILE}. Run "npm run seed:auth" to generate it.`
+    )
+  }
+}
+
+export const test = test.extend<AuthFixtures>({
+  authenticatedPage: async ({ browser, workerPrefix }, use) => {
+    // Each worker gets its own browser context — no shared cookies/localStorage
+    const context = await browser.newContext({
+      storageState: AUTH_STATE_FILE,         // loads cookies + localStorage instantly
+      locale: 'en-US',
+    })
+    const page = await context.newPage()
+    
+    // Verify auth is valid before handing to test
+    await page.goto('/cart')
+    await expect(page.locator('[data-testid="cart-items"]')).toBeVisible({ timeout: 10_000 })
+    
+    await use(page)
+    await context.close()                     // clean shutdown per worker
+  },
+
+  loadStoredAuth: async ({}, use) => {
+    ensureAuthFile()
+    await use()                               // marker; logic happens above
+  },
+})
+
+export { expect } from './base.fixtures'
+```
+
+The `seed:auth` script looks like this (run once, produces `fixtures/.auth/state.json`):
+
+```bash
+# scripts/seed-auth.mjs
+import { chromium } from '@playwright/test'
+const browser = await chromium.launch()
+const page = await browser.newPage()
+await page.goto('http://localhost:3000/login')
+await page.fill('[data-testid="email"]', 'checkout@test.local')
+await page.fill('[data-testid="password"]', 'TestPass1!')
+await page.click('[data-testid="login-button"]')
+await page.waitForURL('/dashboard')
+await page.context().storageState({ path: 'fixtures/.auth/state.json' })
+await browser.close()
+```
+
+This eliminates ~40% of flake from login timing issues. Every test starts with a pre-materialized `storageState` — cookies and localStorage already populated. No form filling, no captcha, no CSRF token races.
+
+### API Fixtures — Route Interception with Deterministic Stubs
+
+```typescript
+// fixtures/api-fixtures.ts
+import { type Route, type Request } from '@playwright/test'
+import { test, expect } from './auth.fixtures'
+import {
+  cartFixture,
+  shippingRatesFixture,
+  paymentIntentFixture,
+  orderConfirmationFixture,
+} from './test-data'
+
+export interface ApiFixtures {
+  interceptShipping: (delayMs?: number) => void
+  interceptPayment: (fail?: boolean, errorMessage?: string) => void
+  interceptOrderConfirm: () => void
+  stubAllCheckoutEndpoints: () => void
+}
+
+export const test = test.extend<ApiFixtures>({
+  interceptShipping: async ({ authenticatedPage }, use) => {
+    authenticatedPage.route('**/api/shipping/rates*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(shippingRatesFixture()),
+      })
+    })
+    await use()                             // marker — test code runs after route setup
+    authenticatedPage.unroute('**/api/shipping/rates*')
+  },
+
+  interceptPayment: async ({ authenticatedPage, workerPrefix }, use) => {
+    authenticatedPage.route('**/api/payments/intent*', async (route, request) => {
+      if (request.method() === 'POST') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(paymentIntentFixture({ id: `${workerPrefix}-pi-1` })),
+        })
+      } else {
+        await route.continue()
+      }
+    })
+
+    authenticatedPage.route('**/api/payments/confirm*', async (route) => {
+      const fulfillBody = {
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, orderId: `${workerPrefix}-ORD-001` }),
+      }
+      await route.fulfill(fulfillBody)
+    })
+
+    await use()
+    authenticatedPage.unroute('**/api/payments/intent*')
+    authenticatedPage.unroute('**/api/payments/confirm*')
+  },
+
+  interceptOrderConfirm: async ({ authenticatedPage, workerPrefix }, use) => {
+    authenticatedPage.route('**/api/orders/*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(orderConfirmationFixture(`${workerPrefix}-ORD-001`)),
+      })
+    })
+    await use()
+    authenticatedPage.unroute('**/api/orders/*')
+  },
+
+  stubAllCheckoutEndpoints: async ({ interceptShipping, interceptPayment, interceptOrderConfirm }, use) => {
+    // Composite helper — one call to wire everything
+    await use()
+  },
+})
+
+export { expect } from './auth.fixtures'
+```
+
+Critical detail: routes are registered *before* navigation begins and cleaned up *after* the test ends. The `unroute` calls prevent cross-contamination between tests within the same worker. Worker prefix injected into fixture IDs gives each parallel worker unique order/payment identifiers, preventing ID collisions.
+
+### Test Data Fixtures
+
+```typescript
+// fixtures/test-data.ts
+import type { ShippingRate, PaymentIntent, Order } from '../types/checkout'
+
+const SHIPPING_RATES: ShippingRate[] = [
+  { id: 'standard', name: 'Standard', price: 5.99, eta: '5-7 days' },
+  { id: 'express', name: 'Express', price: 12.99, eta: '1-2 days' },
+]
+
+export function shi
+...[truncated]
+---[Response C]:
+Continuing from where I left off...
+
+---
+
+# Playwright E2E Suite for 4-Step Checkout Flow
+
+## Problem Context
+
+15% flake rate typically comes from:
+- **Race conditions**: DOM updates ahead of network responses
+- **Network timing**: Variable latency on shipping/payment APIs
+- **Animation timing**: CSS transitions on step navigation
+
+## Architecture Overview
+
+```
+tests/
+├── fixtures/
+│   ├── app.ts              # Base app fixture (storageState, API routes)
+│   ├── auth.ts             # Auth fixture (login via storageState reuse)
+│   ├── checkout.ts         # Checkout-specific fixtures
+│   ├── database.ts         # Per-worker DB isolation
+│   └── index.ts            # Fixture barrel + type exports
+├── pages/
+│   ├── base-page.ts        # PageObject base class with typed locators
+│   ├── cart-page.ts        # Cart step PO
+│   ├── address-page.ts     # Address step PO
+│   ├── payment-page.ts     # Payment step PO
+│   └── confirmation-page.ts # Confirmation step PO
+├── api/
+│   ├── fixtures/
+│   │   ├── shipping.json   # Deterministic shipping responses
+│   │   ├── payment.json    # Deterministic payment responses
+│   │   └── order.json      # Order confirmation responses
+│   ├── interceptors/
+│   │   ├── shipping.ts     # Shipping API stub
+│   │   ├── payment.ts      # Payment API stub
+│   │   └── order.ts        # Order API stub
+│   └── server.ts           # Optional local mock server fallback
+├── specs/
+│   ├── happy-path.spec.ts
+│   ├── edge-cases.spec.ts
+│   └── regression.spec.ts
+├── config/
+│   ├── test.setup.ts       # Global setup (clean DB, seed data)
+│   ├── test.teardown.ts    # Global teardown
+│   └── workers.ts          # Per-worker initialization
+├── utils/
+│   ├── wait-strategies.ts  # Custom wait utilities
+│   └── trace-policy.ts     # Trace/video on-demand logic
+└── playwright.config.ts    # Main config
+```
+
+---
+
+## 1. Configuration (`playwright.config.ts`)
+
+```typescript
+import { defineConfig, devices } from '@playwright/test';
+import path from 'path';
+
+export default defineConfig({
+  // ── Core Strategy ──────────────────────────────────────────────
+  testDir: './specs',
+  testIgnore: '**/*.disabled.ts',
+  timeout: 30_000,           // generous but bounded per-test
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,  // retry ONCE only in CI (not to mask bugs locally)
+  workers: process.env.CI ? 8 : undefined,
+  fullyParallel: true,
+  reporter: [
+    ['list'],
+    ['html', { open: 'never' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+  ],
+
+  // ── Global Setup / Teardown ────────────────────────────────────
+  globalSetup: require.resolve('./config/test.setup'),
+  globalTeardown: require.resolve('./config/test.teardown'),
+
+  // ── Use shared fixtures across all tests ───────────────────────
+  use: {
+    baseURL: process.env.STAGING_URL ?? 'http://localhost:3000',
+    trace: 'off',              // OFF by default — turned on selectively (see `trace-policy.ts`)
+    video: 'off',              // OFF by default — turned on selectively
+    screenshot: 'only-on-failure',
+    actionTimeout: 5_000,
+    navigationTimeout: 15_000,
+    // No extra login — auth comes from storageState injected via fixtures
+  },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
+
+  // ── Storage state routing ──────────────────────────────────────
+  // The auth fixture writes a per-run token here; other fixtures read it.
+  preserveWhitespace: true,
+});
+```
+
+### Key Design Decisions in Config
+- **`retries: 2` in CI only** — one replay lets us distinguish real flakes from transient issues without masking real bugs during local dev
+- **Workers capped at 8** — matches requirement, but each worker gets isolated state (see below)
+- **Trace/video `off` globally** — never record artifacts for passing tests; policy below controls selective capture
+
+---
+
+## 2. Page Object Model with Typed Locators
+
+### `pages/base-page.ts`
+
+```typescript
+import { Page, Locator, expect as playExpect } from '@playwright/test';
+
+/**
+ * Every page object extends this so that:
+ * 1) Locator lookups are always wrapped in explicit waits
+ * 2) Typing errors are caught at compile-time (no magic strings leaking)
+ */
+export abstract class BasePage {
+  protected readonly page: Page;
+
+  constructor(page: Page) {
+    this.page = page;
+  }
+
+  // ── Safe locator builders ─────────────────────────────────────
+
+  /** Data-testid-based locator — no CSS/XPath brittle selectors */
+  get(id: string): Locator {
+    return this.page.getByTestId(id);
+  }
+
+  /** Semantic heading locator */
+  heading(text: string | RegExp): Locator {
+    return this.page.getByRole('heading', { name: text });
+  }
+
+  /** Button by visible text (partial match supported) */
+  button(text: string | RegExp): Locator {
+    return this.page.getByRole('button', { name: text });
+  }
+
+  /** Input field by label or placeholder */
+  input(label: string | RegExp): Locator {
+    return this.page.getByLabel(label);
+  }
+
+  /** Assert visibility with explicit implicit-wait style (waits for hidden → visible) */
+  async waitForVisible(locator: Locator, timeoutMs = 5_000): Promise<void> {
+    await playExpect(locator).toBeVisible({ timeout: timeoutMs });
+  }
+
+  /** Assert presence in DOM (even if obscured/hidden) */
+  async waitForElement(locator: Locator, timeoutMs = 5_000): Promise<void> {
+    await playExpect(locator).toHaveCount({ min: 1, timeout: timeoutMs });
+  }
+
+  /** Wait for an element to become detached (e.g., spinner disappearing) */
+  async waitForDetached(locator: Locator, timeoutMs = 5_000): Promise<void> {
+    await playExpect(locator).toBeHidden({ timeout: timeoutMs });
+  }
+
+  /** Smart wait: element disappears then reappears (handles optimistic UI) */
+  async waitForOptimisticUpdate(
+    locator: Locator,
+    { appearTimeout = 3_000, settleMs = 200 } = {}
+  ): Promise<void> {
+    try {
+      // If already visible, just wait a micro-settle
+      const isVisible = await locator.isVisible();
+      if (isVisible) {
+        await this.page.waitForTimeout(settleMs);
+        return;
+      }
+    } catch { /* not visible yet — proceed with detach+reattach pattern */ }
+
+    // Block 1: wait until it's gone (or doesn't exist)
+    try {
+      await playExpect(locator).toBeHidden({ timeout: 1_000 });
+    } catch {
+      /* ignore — it might have been already detached */
+    }
+
+    // Block 2: wait for it to come back
+    await playExpect(locator).toBeVisible({ timeout: appearTimeout });
+  }
+}
+```
+
+### `pages/cart-page.ts`
+
+```typescript
+import { BasePage } from './base-page';
+import type { Page } from '@playwright/test';
+
+/**
+ * Cart page page-object.
+ * All locators use data-testid attributes on the frontend.
+ * Example HTML: <button data-testid="proceed-to-address">Next</button>
+ */
+export class CartPage extends BasePage {
+  readonly itemsList = () => this.get('cart-items-list');
+  readonly itemRow = (index: number) => this.get(`cart-item-${index}`);
+  readonly priceBadge = () => this.get('item-price');
+  readonly subtotal = () => this.get('cart-subtotal');
+  readonly nextButton = () => this.button('Proceed to Address');
+
+  constructor(page: Page) {
+    super(page);
+  }
+
+  /** Navigate to cart URL */
+  async goto(): Promise<void> {
+    await this.page.goto('/cart');
+    // Wait for the list to render before returning — caller doesn't need to guess
+    await this.waitForElement(this.itemsList());
+  }
+
+  /** Assert cart has exactly N items */
+  async assertItemCount(count: number): Promise<void> {
+    const rows = this.itemRow(0);
+    // We query total count by using count() on a generic row selector
+    const rowCount = await this.page.locator('[data-testid^="cart-item-"]').count();
+    await playExpect(rowCount).toEqual(count);
+  }
+
+  /** Click through to the address step */
+  async clickProceedToAddress(): Promise<void> {
+    await this.nextButton().click();
+    // Don't immediately navigate — the frame switch needs a moment
+    // Caller should await the next page's constructor, which handles its own waitForVisible
+  }
+}
+```
+
+### `pages/address-page.ts`
+
+```typescript
+import { BasePage } from './base-page';
+import type { Page } from '@playwright/test';
+
+export class AddressPage extends BasePage {
+  readonly firstName = () => this.input('First Name');
+  readonly lastName = () => this.input('Last Name');
+  readonly addressLine1 = () => this.input('Street Address');
+  readonly city = () => this.input('City');
+  readonly zipCode = () => this.input('ZIP Code');
+  readonly country = () => this.input('Country');
+  readonly shippingSelect = () => this.get('shipping-method-select');
+  readonly nextButton = () => this.button('Proceed to Payment');
+  readonly shippingEstimate = () => this.get('shipping-estimate');
+
+  constructor(page: Page) {
+    super(page);
+  }
+
+  async goto(): Promise<void> {
+    await this.page.goto('/checkout/address');
+    await this.waitForVisible(this.firstName());
+  }
+
+  async fillShipping(address: {
+    firstName: string;
+    lastName: string;
+    addressLine1: string;
+    city: string;
+    zipCode: string;
+    country: string;
+  }): Promise<void> {
+    await this.firstName().fill(address.firstName);
+    await this.lastName().fill(address.lastName);
+    await this.addressLine1().fill(address.addressLine1);
+    await this.city().fill(address.city);
+    await this.zipCode().fill(address.zipCode);
+    await this.country().selectOption(address.country);
+  }
+
+  /** Select a shipping method — triggers stubbed estimate update */
+  async selectShippingMethod(methodId: 'standard' | 'express'): Promise<void> {
+    await this.shippingSelect().selectOption(methodId);
+    // Wait for the stubbed estimate to populate
+    await this.waitForVisible(this.shippingEstimate());
+  }
+
+  async clickProceedToPayment(): Promise<void> {
+    await this.nextButton().click();
+  }
+}
+```
+
+### `pages/payment-page.ts`
+
+```typescript
+import { BasePage } from './base-page';
+import type { Page } from '@playwright/test';
+
+export class PaymentPage 
+...[truncated]
+---[Response D]:
+## Checkout Flow E2E Test Suite — Complete Design & Implementation
+
+### Architecture Overview
+
+The suite addresses the 15% flake rate by replacing arbitrary waits with deterministic API intercepts, reusing auth state via `storageState`, capturing traces/videos selectively on retries only, and isolating per-worker fixtures. Below is the full implementation.
+
+---
+
+### 1. Configuration — `playwright.config.ts`
+
+```typescript
+import { defineConfig, type ReporterDescription } from '@playwright/test'
+
+const CI = !!process.env.CI
+const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:3000'
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  outputDir: './test-results/.tmp',
+  fullyParallel: true,
+  forbidOnly: CI,
+  retries: CI ? 2 : 0,
+  workers: CI ? 8 : undefined,
+  timeout: 30_000,
+  expect: { timeout: 10_000 },
+  reporter: [
+    ['html', { open: CI ? 'never' : 'on-failure', outputFolder: 'playwright-report' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+    ...(CI ? [['github']] : []),
+  ] as ReporterDescription[],
+
+  // ---- artifact strategy: off by default, turned on per-fixture on retry ----
+  use: {
+    baseURL: BASE_URL,
+    trace: 'off',
+    video: 'off',
+    screenshot: 'only-on-failure',
+    actionTimeout: 5_000,
+    navigationTimeout: 15_000,
+  },
+
+  // ---- web server if needed; otherwise rely on already-running app ----
+  // webServer: { command: 'npm run dev', port: 3000, timeout: 60_000, reuseExistingServer: !CI },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    // Add Firefox / WebKit when browser coverage is required:
+    // { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
+    // { name: 'webkit',  use: { ...devices['Desktop Safari'] } },
+  ],
+})
+```
+
+Key decisions:
+- **`trace: 'off'` / `video: 'off'`** at config level — never recorded by default. Individual fixtures enable them *only* on worker retries (see §3).
+- **Workers**: unbounded locally, capped at 8 in CI. `fullyParallel: true` enables safe concurrent execution.
+- **`forbidOnly: CI`** fails fast on `.only` in CI pipelines.
+
+---
+
+### 2. Fixture Hierarchy
+
+The fixture tree replaces login-in-each-test with one-time authenticated browser contexts. It layers: `base → auth → storage-state → api-intercepts → checkout`.
+
+#### 2a. Shared base fixtures — `tests/e2e/fixtures/base.ts`
+
+```typescript
+import { test as base } from '@playwright/test'
+import { CartPage } from '../../pages/CartPage'
+import { AddressPage } from '../../pages/AddressPage'
+import { PaymentPage } from '../../pages/PaymentPage'
+import { ConfirmationPage } from '../../pages/ConfirmationPage'
+
+export const test = base.extend<{
+  pages: ReturnType<typeof makePages>
+}>({
+  pages: async ({}, use) => {
+    const pages = makePages()
+    await use(pages)
+  },
+})
+
+function makePages() {
+  return {
+    get cart() { return new CartPage() },
+    get address() { return new AddressPage() },
+    get payment() { return new PaymentPage() },
+    get confirmation() { return new ConfirmationPage() },
+  }
+}
+```
+
+All page objects are created per-test but share the same `page` fixture injected by Playwright — no duplication.
+
+#### 2b. Auth via storageState — `tests/e2e/fixtures/auth.ts`
+
+```typescript
+import { test as base } from '@playwright/test'
+import type { StorageState } from '@playwright/test/api'
+
+const STORAGE_PATH = './fixtures/storage-state.json'
+
+export const test = base.extend<{
+  authStorage: StorageState
+  adminLogin: () => Promise<void>
+}>({
+  authStorage: async ({}, use) => {
+    // Lazy-init: read existing file or perform one login
+    let state: StorageState
+    try {
+      const fs = await import('fs')
+      state = JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf-8'))
+    } catch {
+      state = await performFreshLogin()
+      const fs = await import('fs')
+      fs.writeFileSync(STORAGE_PATH, JSON.stringify(state, null, 2))
+    }
+    await use(state)
+  },
+
+  adminLogin: async ({ page }, use) => {
+    await use(async () => {
+      const state = await performFreshLogin()
+      const fs = await import('fs')
+      fs.writeFileSync(STORAGE_PATH, JSON.stringify(state, null, 2))
+    })
+  },
+})
+
+async function performFreshLogin(): Promise<StorageState> {
+  // This runs once.  Use a dedicated auth endpoint — not the main UI.
+  const ctx = await base.storageState()  // placeholder — see actual impl below
+  throw new Error('Implement performFreshLogin() with your real credentials')
+}
+```
+
+**Production version** using API call (fastest, most reliable):
+
+```typescript
+// tests/e2e/fixtures/auth.ts  — production version
+import { test as base, expect } from '@playwright/test'
+import type { StorageState } from '@playwright/test/api'
+import path from 'path'
+
+const STORAGE_PATH = path.resolve(__dirname, '../fixtures/storage-state.json')
+
+interface AuthCreds { email: string; password: string }
+const CREDS: AuthCreds = {
+  email: process.env.E2E_ADMIN_EMAIL ?? 'admin@example.com',
+  password: process.env.E2E_ADMIN_PASSWORD ?? 'changeme123',
+}
+
+export const test = base.extend<{
+  storageState: StorageState
+}>({
+  storageState: async ({}, use) => {
+    let state: StorageState | null = null
+
+    try {
+      const fs = await import('fs')
+      const raw = fs.readFileSync(STORAGE_PATH, 'utf-8')
+      state = JSON.parse(raw)
+      // Validate expiry — cookie names match your app
+      const cookies = state.cookies ?? []
+      const expired = cookies.some(
+        (c: { name: string; value: string; domain?: string; path?: string; expires?: number; httpOnly?: boolean; secure?: boolean; sameSite?: 'Strict' | 'Lax' | 'None' }) =>
+          c.expires !== undefined && c.expires < Date.now() / 1000
+      )
+      if (expired) state = null
+    } catch { /* file missing — will re-login */ }
+
+    if (!state) {
+      state = await relogin()
+      const fs = await import('fs')
+      const dir = path.dirname(STORAGE_PATH)
+      if (!(await import('fs').then(fs => fs.existsSync(dir)))) {
+        await import('fs').then(fs => fs.mkdirSync(dir, { recursive: true }))
+      }
+      fs.writeFileSync(STORAGE_PATH, JSON.stringify(state, null, 2))
+    }
+
+    await use(state)
+  },
+})
+
+async function relogin(): Promise<StorageState> {
+  const { request } = await import('@playwright/test')
+  const res = await request.post('/api/auth/login', {
+    data: CREDS,
+  })
+  await expect(res).toBeOK()  // custom matcher — see extensions
+  const body = await res.json() as { token: string; refreshToken: string }
+
+  return {
+    cookies: [],
+    origins: [{
+      origin: new URL('/api/auth/me', CREDS.email).origin, // adjust baseURL
+      localStorage: [
+        { name: 'accessToken', value: body.token },
+        { name: 'refreshToken', value: body.refreshToken },
+      ],
+    }],
+  }
+}
+```
+
+This avoids UI login entirely. Tests that need auth get the same serialized state reused across all workers — no per-test overhead.
+
+#### 2c. API Intercepts (payments + shipping stubbed) — `tests/e2e/fixtures/stubs.ts`
+
+```typescript
+import { test as base } from './auth'
+import { test as baseForTest } from '@playwright/test'
+import { CART_FIXTURE, SHIPPING_FIXTURES, PAYMENT_FIXTURES, ORDER_FIXTURE } from '../../api/fixtures'
+
+// ---------- Shipping interceptor ----------
+async function interceptShipping(page) {
+  await page.route '**/api/shipping/calculate', async route => {
+    const req = route.request()
+    const body = req.postDataJSON() as { method?: string }
+    const fixture = SHIPPING_FIXTURES[body.method?.toLowerCase() ?? 'standard']
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(fixture),
+    })
+  }
+
+  await page.route '**/api/shipping/track*', async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ trackingId: 'TRK-0000', status: 'in_transit' }),
+    })
+  }
+}
+
+// ---------- Payment interceptor ----------
+async function interceptPayment(page, outcome: 'success' | 'declined' = 'success') {
+  await page.route '**/api/payments/validate', async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ valid: true }),
+    })
+  }
+
+  await page.route '**/api/payments/tokenize', async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ token: 'tok_mock_visa_4242' }),
+    })
+  }
+
+  await page.route '**/api/payments/charge', async route => {
+    const fixture = PAYMENT_FIXTURES[outcome]
+    await route.fulfill({
+      status: outcome === 'success' ? 200 : 402,
+      contentType: 'application/json',
+      body: JSON.stringify(fixture),
+    })
+  }
+}
+
+// ---------- Order creation interceptor ----------
+async function interceptOrder(page, override = {}) {
+  await page.route '**/api/orders', async route => {
+    const body = { ...ORDER_FIXTURE, ...override }
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    })
+  }
+}
+
+// ---------- Cart interceptor ----------
+async function interceptCart(page) {
+  await page.route '**/api/cart', async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(CART_FIXTURE),
+    })
+  }
+  await page.route '**/api/cart/**', async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(CART_FIXTURE),
+    })
+  }
+}
+
+export const test = baseForTest.extend<{
+  stubShipping: () => Promise<void>
+  stubPayment: (outcome?: 'success' | 'declined') => Promise<void>
+  stubOrder: (override?: Record<string, unknown>) => Promise<void>
+  stubCart: () => Promise<void>
+  stubAll: () => Promise<void>
+}>({
+  stubShipping: async ({ page }, use) => {
+    await interceptShipping(page)
+    await use()
+  },
+  stubPayment: async ({ page }, use) => {
+    await interceptPayment(page)
+    await use(
+...[truncated]
+---[Response E]:
+Here's a complete Playwright E2E suite design targeting all your requirements.
+
+## Architecture Overview
+
+```
+tests/e2e/checkout/
+├── config/
+│   ├── playwright.config.ts          # Worker config, timeouts, retries
+│   └── fixtures.json                 # Deterministic fixture data (shipped/stubbed)
+├── fixtures/
+│   ├── base.fixture.ts               # Test-fixtures layer (auth state, routes)
+│   ├── checkout.fixtures.ts          # Page object factories, helpers
+│   └── index.ts                      # Re-export + type exports
+├── pages/
+│   ├── base.page.ts                  # Base page class with typed locators
+│   ├── cart.page.ts
+│   ├── address.page.ts
+│   ├── payment.page.ts
+│   ├── confirmation.page.ts
+│   └── api.stub.service.ts           # Route-interception service
+├── helpers/
+│   ├── waiting-strategies.ts         # Custom waitFor* helpers
+│   └── isolate-data.ts              # Per-worker/test data isolation
+├── middleware/
+│   └── retry-tracing.ts             # Video+trace only on retry
+├── e2e/
+│   ├── 01-cart-check.spec.ts
+│   ├── 02-address-check.spec.ts
+│   ├── 03-payment-check.spec.ts
+│   ├── 04-confirmation-check.spec.ts
+│   └── _setup/                       # Auth state bootstrap
+│       ├── login.setup.ts            # Runs ONCE, generates storageState
+│       └── auth-state.json           # Generated, gitignored
+├── __fixtures__/                    # Deterministic stub payloads
+│   ├── shipping-tiers.json
+│   ├── payment-success.json
+│   └── payment-failure.json
+└── quarantine/                      # Flaky-spec policy marker
+    └── quarantine-manifest.json      # {flaky:[], lastAudit:"date", maxFlake:0.05}
+```
+
+---
+
+## 1. `playwright.config.ts`
+
+```ts
+import { defineConfig, devices } from '@playwright/test';
+import path from 'path';
+
+const IS_CI = !!process.env.CI;
+const WORKERS = process.env.PW_WORKERS ? Number(process.env.PW_WORKERS) : 8;
+const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:3000';
+const AUTH_STATE = path.resolve(__dirname, 'e2e/_setup/auth-state.json');
+
+export default defineConfig({
+  testDir: './e2e',
+  // Only match checkout spec files; quarantine specs run separately
+  testMatch: '**/*.spec.ts',
+  // Timeout budget — generous per-test, but strict overall
+  timeout: 60_000,
+  expect: { timeout: 10_000 },
+  // Retries baked in at framework level (complements fixture-level retry hooks)
+  retries: IS_CI ? 1 : 0,
+  workers: WORKERS,
+  fullyParallel: true,
+  // Fail fast: one production-blocking failure stops the pipeline
+  forbidOnly: IS_CI,
+
+  /* ---- Artifact policy: video + trace ONLY on retry/failure ---- */
+  snapshotPathTemplate: '__screenshots__/{testFilePath}/{arg}',
+  outputDir: './test-results',
+  preserveOutput: 'failures-only',   // never store artifacts from first-pass passes
+  video: 'retain-on-failure',
+  trace: 'retain-on-failure',
+
+  /* ---- Shared project definitions ---- */
+  projects: [
+    {
+      name: 'checkout-flows',
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: BASE_URL,
+        storageState: AUTH_STATE,          // auth injected upstream, no per-test login
+        viewport: { width: 1440, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+      },
+    },
+    {
+      /* ---- Quarantine project: serial, no workers, dedicated timeout ---- */
+      name: 'quarantine',
+      testMatch: /quarantine\/.*\.spec\.ts/,
+      timeout: 120_000,
+      retries: 0,                         // quarantine has its own retry harness
+      dependencies: ['checkout-flows'],     // runs after main suite
+      fullyParallel: false,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: BASE_URL,
+        viewport: { width: 1440, height: 900 },
+      },
+    },
+  ],
+
+  /* ---- Reporter strategy ---- */
+  reporter: IS_CI
+    ? [['list'], ['json', { outputFile: 'test-results/report.json' }],
+       ['junit', { outputFile: 'test-results/junit.xml' }]]
+    : [['list'], ['html', { open: 'never' }]],
+});
+```
+
+---
+
+## 2. Fixture Data (`__fixtures__/`)
+
+Ship these as static JSON — zero network calls, fully deterministic.
+
+```json
+// __fixtures__/shipping-tiers.json
+{
+  "standard":  {"id":"ship_std","carrier":"USPS","price":499,"eta_days":5},
+  "express":   {"id":"ship_exp","carrier":"FedEx","price":1299,"eta_days":2},
+  "overnight": {"id":"ship_ovn","carrier":"FedEx","price":2499,"eta_days":1}
+}
+```
+
+```json
+// __fixtures__/payment-success.json
+{
+  "transactionId": "txn_ok_{{unique}}",
+  "status": "captured",
+  "amountCents": 1747,
+  "cardLast4": "4242",
+  "brand": "visa"
+}
+```
+
+```json
+// __fixtures__/payment-failure.json
+{
+  "errorCode": "insufficient_funds",
+  "message": "Your card was declined.",
+  "status": "failed"
+}
+```
+
+All `{{unique}}` placeholders are interpolated by the isolation helper at test start so every parallel worker gets distinct IDs.
+
+---
+
+## 3. Data Isolation Helper
+
+```ts
+// helpers/isolate-data.ts
+import { randomUUID } from 'crypto';
+import { test as base } from '@playwright/test';
+
+/** Unique namespace suffix guaranteeing no cross-test collisions. */
+let __workerNonce = process.env.TEST_NONCE || randomUUID().slice(0, 8);
+
+export function makeIsolated<T extends Record<string, unknown>>(
+  template: T, replacements: Record<string, string> = {},
+): T {
+  const json = JSON.stringify(template);
+  const merged = { nonce: __workerNonce, uid: randomUUID(), ...replacements };
+  const replaced = Object.entries(merged).reduce(
+    (s, [k, v]) => s.replaceAll(`{{${k}}}`, v), json,
+  );
+  return JSON.parse(replaced) as T;
+}
+
+export function freshNonce() {
+  __workerNonce = randomUUID().slice(0, 8);
+  return __workerNonce;
+}
+```
+
+Every fixture consumer wraps its payload through `makeIsolated()` so two concurrent workers never share the same transaction ID, order number, or email.
+
+---
+
+## 4. Base Page Object with Typed Locators
+
+```ts
+// pages/base.page.ts
+import { Page, Locator, expect as pwExpect } from '@playwright/test';
+import { injectWaitStrategies } from '../helpers/waiting-strategies';
+
+/** Union of all semantic locator descriptors used by this application. */
+interface LocatorKey {
+  // Cart
+  'cart.items':          string; // CSS/data-testid
+  'cart.item.remove':    string;
+  'cart.checkout.btn':   string;
+  'cart.subtotal':       string;
+
+  // Address
+  'address.form.name':       string;
+  'address.form.addressLine1': string;
+  'address.form.city':       string;
+  'address.form.zip':        string;
+  'address.submit.btn':      string;
+  'address.errorBanner':     string;
+
+  // Payment
+  'payment.cardNumber':      string;
+  'payment.expiry':          string;
+  'payment.cvv':             string;
+  'payment.submit.btn':      string;
+  'payment.errorText':       string;
+
+  // Confirmation
+  'confirmation.orderId':    string;
+  'confirmation.summary':    string;
+  'confirmation.continue':   string;
+}
+
+export abstract class BasePage {
+  readonly page: Page;
+  readonly locators: ReturnType<typeof this.locatorMap>;
+
+  constructor(page: Page) {
+    this.page = page;
+    this.locators = this.locatorMap();
+  }
+
+  /** Override in subclasses — returns a map of CSS selectors keyed by semantic name. */
+  protected abstract locatorMap(): Record<keyof LocatorKey, string>;
+
+  /* ---- Typed locator access ---- */
+  locator<K extends keyof LocatorKey>(key: K): Locator {
+    return this.page.locator(this.locators[key]);
+  }
+
+  /** Alias to keep call-sites terse. */
+  $<K extends keyof LocatorKey>(key: K): Locator {
+    return this.locator(key);
+  }
+
+  /* ---- Convenience assertions (delegate to our custom waiting strategies) ---- */
+  async waitForLoaded(timeout = 5000) {
+    await this.$((await this.rootSelector())).first().waitFor({
+      state: 'visible',
+      timeout,
+    });
+  }
+
+  /** Element-free strategy: assert the page *content* is ready, not network status. */
+  async waitForPageStable(pollingMs = 200, cycles = 3) {
+    await pollForConsistency(() => this.captureSnapshot(), pollingMs, cycles);
+  }
+
+  private rootSelector(): string {
+    // Default root; override in each subclass
+    return 'body';
+  }
+
+  /** Snapshot of key text nodes used for stability checking — captures DOM state,
+   * not network idle. */
+  private captureSnapshot(): string {
+    return this.page.textContent('main') ?? '';
+  }
+
+  /** Assert that two consecutive polls of the snapshot produce identical results. */
+  async waitForStability(pollingMs = 200, stableCycles = 3) {
+    return pollForConsistency(() => this.captureSnapshot(), pollingMs, stableCycles);
+  }
+}
+
+/** Run fn repeatedly until `cycles` consecutive runs return equal values.
+ * This replaces `networkidle` with a content-convergence check. */
+async function pollForConsistency(
+  fn: () => string, pollingMs: number, cycles: number,
+) {
+  let previous = '';
+  let matches = 0;
+  while (matches < cycles) {
+    await new Promise(r => setTimeout(r, pollingMs));
+    const current = fn();
+    if (current === previous) {
+      matches++;
+    } else {
+      matches = 0;
+      previous = current;
+    }
+  }
+}
+```
+
+---
+
+### Subclass examples
+
+```ts
+// pages/cart.page.ts
+import { BasePage } from './base.page';
+
+export class CartPage extends BasePage {
+  protected locatorMap(): Record<string, string> {
+    return {
+      'cart.items': '[data-testid="cart-items"]',
+      'cart.item.remove': '[data-testid="cart-item-remove"]',
+      'cart.checkout.btn': '[data-testid="cart-checkout-btn"]',
+      'cart.subtotal': '[data-testid="cart-subtotal"]',
+    };
+  }
+
+  rootSelector() { return '[data-testid="cart-page-root"]'; }
+
+  async goTo() { await this.page.goto('/cart'); }
+
+  async clickCheckout() {
+    await this.$('cart.checkout.btn').click();
+    await this.waitForLoaded();
+  }
+
+  get subtotalText() {
+    return this.$('cart.subtotal').textContent();
+  }
+}
+```
+
+```ts
+// pages/address.page.ts
+import { BasePage } from './base.page';
+
+export class AddressPage extends BasePage {
+  protected locatorMap(): Record<string, string> {
+    return {
+      'address.form.name':       '[data-testid=
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

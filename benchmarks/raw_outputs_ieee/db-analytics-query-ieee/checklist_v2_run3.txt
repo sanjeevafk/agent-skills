@@ -1,0 +1,396 @@
+[exit=0 latency=37.07s]
+This is a comprehensive PostgreSQL performance diagnosis and remediation. Let me work through it systematically.
+
+## Problem Anatomy
+
+**Query characteristics:**
+- 800M-row events table, 2M-row users table
+- Filters: `tenant_id` (equality), `event_type` (equality), `created_at` (range)
+- Window function: `RANK()` 
+- Join: events → users
+- Current symptoms: Seq Scan → Sort Spill to Disk → Stale Estimates (expected 100, got 2M)
+
+---
+
+## Node-by-Node EXPLAIN ANALYZES Diagnosis
+
+### Node 1: Seq Scan on events
+```
+Seq Scan on events  (cost=0.00..45M rows=800M width=...)
+  Filter: (tenant_id = 'abc' AND event_type = 'click' AND created_at > ...)
+```
+**Root cause**: No index exists covering the WHERE clause columns. Postgres scans all 800M rows, discarding most in the filter. This is O(n) — catastrophic at this scale.
+
+### Node 2: Hash Join / Nested Loop with users
+```
+Hash Join  (cost=... rows=2M width=...)
+  Hash Cond: (events.user_id = users.id)
+```
+**Root cause**: The join processes millions of rows because the upstream filter returned 2M instead of the planner's estimated 100. The join operator doesn't matter yet — you can't optimize downstream if the row injection at the top is wrong.
+
+### Node 3: Sort (Window Function)
+```
+Sort  (cost=... rows=2M width=...)
+  Sort Method: external merge  Disk: 256MB
+  ->  WindowAgg
+        ->  Sort (by tenant_id, partition_date DESC)
+```
+**Root cause**: Sort spills to disk because `work_mem` is too low. The planner chose an incorrect row estimate (100 vs 2M reality), so it allocated far too little memory. External merge sorts are ~10x slower than in-memory sorts.
+
+### Root Cause Chain
+```
+No index ──→ Seq Scan returns 2M rows
+       ──→ Planner has bad stats (expects 100)
+       ──→ Allocates work_mem for 100-row sort
+       ──→ 2M rows spill to disk during sort
+       ──→ 40s total
+```
+
+---
+
+## Index Strategy
+
+### Decision: Composite B-Tree (NOT partial, NOT individual indexes)
+
+```sql
+-- WHY this composite order matters:
+CREATE INDEX idx_events_tenant_type_date
+  ON events (tenant_id, event_type, created_at DESC);
+```
+
+| Column | Role | Reason |
+|--------|------|--------|
+| `tenant_id` | Equality (position 1) | High selectivity, drives index pruning. Placed first so the index starts at one position. |
+| `event_type` | Equality (position 2) | Second equality. With both equality columns up front, the index seeks to an exact point and reads sequentially. |
+| `created_at DESC` | Range + descending (position 3) | Range columns go last (they "use up" the index). Declared DESC because the window function partitions by date descending — Postgres can satisfy the ORDER BY from the index alone, eliminating the sort entirely. |
+
+### Why NOT other strategies?
+
+**Partial index?** Only justified if >70% of queries target a specific subset (e.g., `WHERE archived IS FALSE`). If your tenant/event mix is broad, the partial index saves storage but won't help most queries. Defer this until you have query telemetry.
+
+**Covering index with INCLUDE?** Yes — add frequently projected columns:
+```sql
+CREATE INDEX idx_events_covering
+  ON events (tenant_id, event_type, created_at DESC)
+  INCLUDE (user_id, event_data, partition_date);
+```
+This avoids heap lookups entirely if the query only needs these columns. On 800M rows, each heap lookup is ~200 bytes of random I/O; avoiding them cuts I/O by ~3x. Tradeoff: the index grows from ~12 bytes/row to ~52 bytes/row (~8.4 GB → ~36 GB). Worth it if this query runs frequently.
+
+**Individual indexes on each column?** Never. Each index is a separate structure consuming ~9.6 GB each (for 800M rows × 12 bytes/row). Postgres can use only ONE index per table scan (unless using IndexScan with bitmap). A single composite index beats three individual indexes because it narrows the search space multiplicatively.
+
+### Foreign Key Index on user_id
+```sql
+-- Critical for the join to users table
+CREATE INDEX IF NOT EXISTS idx_events_user_id
+  ON events (user_id);
+```
+Without this, the join forces a Seq Scan on events for every users row (Nested Loop) or a full Hash build. This is likely the silent killer when the index above still returns large result sets.
+
+---
+
+## Fixing the Stale Estimate Problem
+
+The planner thinks 100 rows come back but 2M do. This happens when:
+
+1. **Statistics are stale** — `pg_statistic` hasn't been updated since data distribution changed
+2. **Correlation skew** — `event_type` values are heavily skewed (one type = 95% of rows) but stats sampled evenly
+
+### Immediate fix: Update statistics on the exact columns used
+```sql
+ANALYZE events (tenant_id, event_type, created_at, user_id);
+```
+This collects histogram and MCV (most common value) data specifically for the filter columns. Runs in seconds, takes effect immediately.
+
+### Long-term: Increase target statistics for skewed columns
+```sql
+-- For event_type which likely has heavy skew
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+-- Or 1000-4000 depending on cardinality
+ANALYZE events;
+```
+Default STATISTICS is 100. At 1000, Postgres builds a histogram with 1000 buckets instead of 100, dramatically improving cardinality estimates on skewed columns.
+
+### Persistent fix: Automated maintenance
+```sql
+-- Enable pg_stat_statements for query-level stats tracking
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Ensure autovacuum/analyze is aggressive enough for 800M tables
+ALTER TABLE events SET (autovacuum_analyze_scale_factor = 0.01);
+-- Instead of default 0.1 (which means analyze after 80M changes)
+-- 0.01 means analyze after 8M changes — much fresher stats
+```
+
+---
+
+## Partitioning Decision: By Month — YES, but with caveats
+
+### When partitioning is justified (your case ✓):
+- Table exceeds 500M rows (you have 800M)
+- Queries always include the partition key (`created_at`)
+- You benefit from partition pruning (eliminates scanning old months)
+
+### When it's NOT justified ✗:
+- Queries span many months (pruning advantage lost)
+- Writes are bursty (partition creation overhead)
+- JOINs reference the partition key across partitions (Postgres cannot merge results efficiently)
+
+### Implementation: Declarative partitioning by month
+```sql
+-- Step 1: Create the parent table (new schema)
+CREATE TABLE events_partitioned (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id     text    NOT NULL,
+  user_id       bigint  NOT NULL REFERENCES users(id),
+  event_type    text    NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  partition_date date    GENERATED ALWAYS AS (created_at::date) STORED,
+  event_data    jsonb,
+  -- Add any other columns from your original events table
+  CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)
+) PARTITION BY RANGE (created_at);
+
+-- Step 2: Create monthly partitions (backfill existing data)
+CREATE TABLE events_y2024m01 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE events_y2024m02 PARTITION OF events_partitioned
+  FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+-- ... repeat for all months containing data, plus future months
+
+-- Step 3: Rebuild the composite index on each partition
+-- Partitions inherit indexes defined on the parent:
+CREATE INDEX idx_events_part_tenant_type_date
+  ON events_partitioned (tenant_id, event_type, created_at DESC);
+
+-- Step 4: Create auto-partition extension (pg_partman)
+-- This automates future partition creation
+-- CREATE EXTENSION pg_partman SCHEMA partman;
+-- SELECT partman.create_parent('public.events_partitioned', 'created_at', 'range', 'monthly');
+```
+
+### Expected improvement from partitioning alone:
+If your query covers 1 month of a 24-month history, that's **~83% reduction** in rows scanned before even applying filters. Combined with the composite index, this eliminates the seq scan entirely within the relevant partition.
+
+---
+
+## Rewritten Query
+
+### Original (likely pattern) — SLOW
+```sql
+SELECT
+  u.name,
+  e.tenant_id,
+  e.event_type,
+  e.created_at,
+  RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) as rn
+FROM events e
+JOIN users u ON u.id = e.user_id
+WHERE e.tenant_id = 'abc123'
+  AND e.event_type = 'click'
+  AND e.created_at BETWEEN '2024-06-01' AND '2024-07-01'
+ORDER BY e.created_at DESC
+LIMIT 50 OFFSET 0;
+```
+
+### Fixed — FAST
+
+```sql
+-- Option A: Direct query (works well with the composite index)
+-- The index satisfies WHERE + ORDER BY + LIMIT in one pass — no sort needed
+
+WITH ranked_clicks AS (
+  SELECT
+    e.user_id,
+    e.tenant_id,
+    e.event_type,
+    e.created_at,
+    RANK() OVER (
+      PARTITION BY e.tenant_id
+      ORDER BY e.created_at DESC
+    ) AS rn
+  FROM events e
+  WHERE e.tenant_id = 'abc123'
+    AND e.event_type = 'click'
+    AND e.created_at >= '2024-06-01'
+    AND e.created_at <  '2024-07-01'
+)
+SELECT
+  u.name,
+  rc.tenant_id,
+  rc.event_type,
+  rc.created_at,
+  rc.rn
+FROM ranked_clicks rc
+JOIN users u ON u.id = rc.user_id
+WHERE rc.rn <= 50                    -- Push limit into join filter
+ORDER BY rc.created_at DESC;
+```
+
+### Why this rewrite works:
+
+| Change | Impact |
+|--------|--------|
+| Composite index `(tenant_id, event_type, created_at DESC)` | Eliminated Seq Scan. Index seek goes directly to `'abc123'` → `'click'` → `'2024-06-01'`. Descending order satisfies `ORDER BY` natively. Zero sort. |
+| Partial inequality on `created_at` (`>=` / `<` not `BETWEEN`) | Cleaner index bounds. `BETWEEN` on timestamptz can include boundary ambiguities. Explicit bounds are safer and sometimes generate better plans. |
+| `users.id` indexed (FK) | Join becomes Index Scan on users instead of Hash Build. For 2M rows, Hash Join is actually fine, but Index Scan avoids hashing the entire table. |
+| CTE materialization boundary | Forces Postgres to evaluate the WHERE + RANK separately from the join to users. Without `materialize:` hint, Postgres might push the join upstream, inflating intermediate rows. In PG 12+, CTEs are inlined by default unless referenced multiple times — see the explicit materialization note below. |
+| Cursor-style pagination (see below) | Replaces OFFSET with keyset pagination for O(log n) page navigation. |
+
+### Materialization choice: CTE vs Materialized View
+
+| Approach | Use When | Cost |
+|----------|----------|------|
+| **CTE (above)** | Query runs sporadically (< 10/min), results fit in memory | Near-zero overhead, inline optimization applies |
+| **Materialized View** | Same aggregation reused across many queries, data updates hourly/daily | Storage cost, requires `REFRESH MATERIALIZED VIEW CONCURRENTLY` |
+| **Explicit `MATERIALIZED` hint** (PG 12+) | CTE predicate is selective and expensive, join would otherwise blow up intermediate rows | `WITH ranked_clicks AS MATERIALIZED (...)` — guarantees the CTE is executed once, then joined |
+
+Recommendation: Start with the CTE as written. If execution plans show the optimizer pushing the join *into* the CTE (inflating rows before the WHERE filters), add `AS MATERIALIZED`:
+
+```sql
+WITH ranked_clicks AS MATERIALIZED (
+  SELECT
+    e.user_id,
+    e.tenant_id,
+    e.event_type,
+    e.created_at,
+    RANK() OVER (
+      PARTITION BY e.tenant_id
+      ORDER BY e.created_at DESC
+    ) AS rn
+  FROM events e
+  WHERE e.tenant_id = 'abc123'
+    AND e.event_type = 'click'
+    AND e.created_at >= '2024-06-01'
+    AND e.created_at <  '2024-07-01'
+)
+-- rest unchanged
+```
+
+---
+
+## Cursor Pagination (Replace OFFSET)
+
+OFFSET is O(n) — Postgres must count and skip N rows every time. Cursor pagination is O(log n):
+
+```sql
+-- First page:
+SELECT
+  u.name, e.tenant_id, e.event_type, e.created_at,
+  RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rn
+FROM events e
+JOIN users u ON u.id = e.user_id
+WHERE e.tenant_id = 'abc123'
+  AND e.event_type = 'click'
+  AND e.created_at >= '2024-06-01'
+  AND e.created_at <  '2024-07-01'
+ORDER BY e.created_at DESC
+LIMIT 50;
+
+-- Next page (pass last_seen_created_at from previous result):
+SELECT
+  u.name, e.tenant_id, e.event_type, e.created_at,
+  RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rn
+FROM events e
+JOIN users u ON u.id = e.user_id
+WHERE e.tenant_id = 'abc123'
+  AND e.event_type = 'click'
+  AND e.created_at >= '2024-06-01'
+  AND e.created_at <  '2024-07-01'
+  AND e.created_at < :last_seen_created_at   -- cursor condition
+ORDER BY e.created_at DESC
+LIMIT 50;
+```
+
+The composite index supports this perfectly — the seek starts at `:last_seen_created_at` and walks backwards. No sorting needed after the initial index seek.
+
+---
+
+## Configuration Adjustments
+
+```sql
+-- These should already be set system-wide via ALTER SYSTEM
+
+-- Connection limits (adjust based on RAM — 1 GB per connection for work_mem)
+ALTER SYSTEM SET max_connections = 200;
+
+-- Work mem: increase from default 4MB. This prevents sort spilling.
+-- At 8MB, a 2M-row sort with 100-byte tuples = ~200 MB.
+-- External merge would need ~200MB / 8MB = 25 segments.
+-- With 64MB work_mem, that's only ~4 segments = near-total in-memory sort.
+ALTER SYSTEM SET work_mem = '64MB';
+
+-- Statement timeout (prevents runaway queries)
+ALTER SYSTEM SET statement_timeout = '30s';
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s';
+
+-- Maintenance cost settings (for 800M row table)
+ALTER SYSTEM SET maintenance_work_mem = '1GB';
+-- This speeds up VACUUM, CREATE INDEX, and ANALYZE
+
+-- Monitoring
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Security defaults
+REVOKE ALL ON SCHEMA public FROM public;
+
+-- Reload
+SELECT pg_reload_conf();
+```
+
+**Why `work_mem = 64MB` specifically:** The sort spill happened because the planner allocated memory for 100 rows (its estimate), not 2M. Even with correct estimates, a sort over hundreds of thousands of rows with window functions will exceed 4MB. Setting work_mem to 64MB ensures most analytical sorts stay in memory. Note: work_mem is allocated *per sort operation*, so concurrent queries multiply actual memory usage. Don't set this above your available RAM ÷ max_connections.
+
+---
+
+## Complete Deployment Plan (Ordered)
+
+```sql
+-- PHASE 1: Statistics (minutes, zero risk, immediate effect)
+ANALYZE events (tenant_id, event_type, created_at, user_id);
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ANALYZE events;
+
+-- PHASE 2: Composite index (creates in background, minutes to hours)
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_date
+  ON events (tenant_id, event_type, created_at DESC);
+
+-- Covering variant (only if these columns are always selected):
+-- CREATE INDEX CONCURRENTLY idx_events_covering
+--   ON events (tenant_id, event_type, created_at DESC)
+--   INCLUDE (user_id, event_data, partition_date);
+
+-- PHASE 3: FK index (if not already present)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user_id
+  ON events (user_id);
+
+-- PHASE 4: Verify improvement
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT e.user_id, e.tenant_id, e.event_type, e.created_at,
+       RANK() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at DESC) AS rn
+FROM events e
+WHERE e.tenant_id = 'abc123'
+  AND e.event_type = 'click'
+  AND e.created_at >= '2024-06-01'
+  AND e.created_at <  '2024-07-01';
+-- Expected: Index Scan using idx_events_tenant_type_date
+-- Expected: Rows re-checked = 0
+-- Expected: Buffers shared hits >> dirty reads
+-- Expected: Duration < 2s
+
+-- PHASE 5: Partitioning (offline maintenance window, weeks of effort)
+-- See partitioning section above. Run during low-traffic period.
+-- Migrate data in batches to avoid lock contention.
+```
+
+---
+
+## Expected Results
+
+| Metric | Before | After Phase 1-3 | After Phase 5 (Partitioning) |
+|--------|--------|-----------------|------------------------------|
+| Seq Scan | Yes | No | No |
+| Sort Method | External Merge (disk) | In-Memory (heap sort) | In-Memory (smaller dataset) |
+| Row Estimate Error | 20,000% (100 vs 2M) | < 10% | < 10% |
+| Rows Scanned | 800M | ~50K-500K (depending on selectivity) | ~4-40K (single month) |
+| Query Time | 40s | 1-3s | 200-800ms |
+
+The dominant win comes from the composite index eliminating the sequential scan and the sort spill simultaneously (via `DESC` ordering in the index matching the `ORDER BY`). Partitioning provides an additional 10-50x reduction when queries target narrow date ranges, which reporting dashboards typically do.

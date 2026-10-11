@@ -1,0 +1,420 @@
+[exit=0 latency=26.26s]
+Here's the full production implementation for the stateless Go API — Deployment, HPA, PDB, and supporting resources.
+
+---
+
+## Complete Manifests
+
+### Namespace + ServiceAccount
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api
+  labels:
+    environment: production
+    team: backend
+
+---
+# Pattern A — app does NOT call K8s API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: go-api-sa
+  namespace: api
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-api
+  namespace: api
+  labels:
+    app: go-api
+spec:
+  type: ClusterIP
+  selector:
+    app: go-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+```
+
+### Deployment — Production Template
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: api
+  labels:
+    app: go-api
+    version: "1.0.0"
+    environment: production
+  annotations:
+    # Roll-triggered on image change only; omitting stale config annotations.
+spec:
+  replicas: 5                    # min from HPA override
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                # allow 1 extra pod during upgrade
+      maxUnavailable: 0          # zero-dropping invariant — never kill a serving pod
+  selector:
+    matchLabels:
+      app: go-api
+  template:
+    metadata:
+      labels:
+        app: go-api
+        version: "1.0.0"
+      annotations:
+        # Signal to tooling; triggers rollout when changed.
+        checksum/config: ""
+    spec:
+      serviceAccountName: go-api-sa
+      automountServiceAccountToken: false
+
+      # --- Termination drain: gives in-flight requests time to finish ---
+      terminationGracePeriodSeconds: 60   # Go handler default ~30s, headroom for slow consumers
+
+      # --- Init container: pre-warm cache so readiness is truthful from day one ---
+      initContainers:
+        - name: cache-warmup
+          image: curlimages/curl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              echo "Warm-up count=$CACHE_WARMUP_REQUESTS url=http://localhost:8080/warm";
+              for i in $(seq 1 $CACHE_WARMUP_REQUESTS); do
+                curl -sf -o /dev/null http://localhost:8080/warm || exit 1;
+              done;
+              echo "Cache warmed successfully.";
+          env:
+            - name: CACHE_WARMUP_REQUESTS
+              value: "5"           # tune to your cold-start profile
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "50m", memory: "64Mi" }
+
+      containers:
+        - name: go-api
+          image: ghcr.io/org/go-api:1.4.2   # pinned — never :latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # === Probes ===
+          startupProbe:
+            httpGet:
+              path: /healthz       # minimal check; no cache dependency
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 5       # 30 × 5s = 150s total budget (covers 20s warm + binary start)
+            timeoutSeconds: 3
+            successThreshold: 1
+
+          livenessProbe:           # detects deadlock / hung goroutines
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10   # skip until startup has proved container is alive
+            periodSeconds: 10
+            failureThreshold: 3       # 3 × 10s = 30s unresponsive → restart
+            timeoutSeconds: 3
+            successThreshold: 1
+
+          readinessProbe:          # removes pod from Service endpoints before draining
+            httpGet:
+              path: /ready         # returns 503 until cache warms (~20s)
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3     # 3 × 5s = 15s → mark not-ready
+            timeoutSeconds: 3
+            successThreshold: 1
+
+          # === Resources (avoid p99 CPU throttling) ===
+          resources:
+            requests:
+              cpu: "250m"            # enough headroom for p99 under normal load
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"           # 1 core burst ceiling — above GC/pause overhead
+              memory: "512Mi"
+
+          # === Security context ===
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: secrets
+              mountPath: /etc/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache-volume
+              mountPath: /var/cache
+
+      volumes:
+        - name: secrets
+          secret:
+            secretName: go-api-secrets   # replace with SealedSecrets/ESO in prod
+        - name: tmp
+          emptyDir: { medium: Memory }
+        - name: cache-volume
+          emptyDir: { medium: Memory, sizeLimit: "256Mi" }
+
+      # --- Scheduling ---
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [go-api]
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: go-api
+```
+
+#### Key Go-side wiring notes (for the engineer implementing)
+
+```go
+// main.go — signal handling & graceful shutdown
+func main() {
+    srv := &http.Server{Addr: ":8080", Handler: mux}
+
+    // readiness gate: close chan when cache is warm (~20s)
+    go func() {
+        warmCache(context.Background())  // blocks ~20s
+        close(cacheReadyCh)              // signals /ready to return 200
+    }()
+
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+
+    go func() {
+        if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatal(err)
+        }
+    }()
+
+    <-stop                                // Kube sends SIGTERM
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    srv.Shutdown(ctx)                     // drains in-flight requests, stops listener
+}
+```
+
+### HPA — CPU + Custom Queue Depth Metrics
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api-hpa
+  namespace: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+  minReplicas: 3                       # lower bound
+  maxReplicas: 10                      # upper bound
+  metrics:
+    # --- CPU-based scaling ---
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70       # scale when avg CPU > 70% of *requests*
+
+    # --- Custom metric: per-pod queue depth (from Prometheus Adapter) ---
+    - type: Pods
+      pods:
+        metric:
+          name: queue_depth_per_pod     # exporter bucket: http_requests_in_flight / num_pods
+        target:
+          type: AverageValue
+          averageValue: "5"           # scale when avg queue > 5 pending reqs/pod
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # short stabilisation to react fast
+      policies:
+        - type: Percent
+          value: 100                     # allow doubling pods
+          periodSeconds: 60
+        - type: Pods
+          value: 4                       # but cap at +4 pods per window
+          periodSeconds: 60
+      selectPolicy: Max
+
+    scaleDown:
+      stabilizationWindowSeconds: 300    # longer cooldown — prevents flapping
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min
+```
+
+### PDB — Survive Node Drains
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+With `minAvailable: 2` and `maxUnavailable: 0` on the deployment strategy, a node taint/cordon will **never** violate either constraint simultaneously — the scheduler requires 4 healthy pods to even begin evicting, which keeps the cluster above the minimum at all times.
+
+---
+
+## Probe Threshold Arithmetic Explained
+
+| Probe | Formula | Budget | Purpose |
+|-------|---------|--------|---------|
+| **startupProbe** | `failureThreshold(30) × periodSeconds(5)` | **150 s** | Container might take up to 2.5 min from 0→serving. During this window liveness is *disabled*. Once startupProbe succeeds → liveness takes over. |
+| **livenessProbe** | `failureThreshold(3) × periodSeconds(10)` | **30 s** | After container passes startup, 30s of consecutive failures means the process is likely deadlocked/hung and needs a hard restart. Not for slow starts. |
+| **readinessProbe** | `failureThreshold(3) × periodSeconds(5)` | **15 s** | After 15s of failures, pod gets removed from Service endpoints → new traffic stops routing here. This is the *first phase* of termination. Liveness still protects it internally. |
+
+**Why this works for a 20s cold-cache warmup:**
+
+```
+t=0     : container starts
+t=0-20  : /ready returns 503 (cache warming), /healthz returns 200 (process alive)
+t=20    : /ready returns 200 (cache ready), pod added back to endpoints
+t=150   : worst case — startupProbe gives 150s safety margin
+```
+
+Critical detail: `/healthz` should be a **lightweight** check (ping DB, check PID). It must NOT depend on the cache. `/ready` depends on cache being warm. This separation lets startup/liveness pass even while readiness fails — preventing premature restarts during warmup.
+
+---
+
+## Zero-Drop Termination Drain Sequence
+
+```
+┌─────────────────┐    SIGTERM     ┌──────────────────┐   HTTP 503    ┌──────────────┐
+│   Load Balancer  │ ──────────►   │     Go API        │ ──────────►  │  Clients     │
+│  (ELB/ALB/NGINX) │               │                   │               │              │
+└─────────────────┘               │  1. Stop listener  │               └──────────────┘
+                                  │  2. Mark /ready=503│  ▲
+                                  │  3. Wait 30s for   │  │ LB health-check
+                                  │     in-flight reqs │  │  interval (≈10-15s)
+                                  │  4. Kill remaining │  │
+                                  └──────────────────┘  │
+                                                       │
+                                              kubelet waits
+                                        terminationGracePeriodSeconds (60s)
+                                                  then SIGKILL
+```
+
+**The sequence, step-by-step:**
+
+1. **Kubelet sends SIGTERM** → Go handler catches it, calls `srv.Shutdown()`
+2. **Go shuts down the HTTP listener** immediately — no new connections accepted
+3. **Readiness probe now returns 503** → kubelet reports not-ready → CNI plugin updates iptables/IPVS → traffic stops routing to this pod
+4. **LB health checks fail** (after their own interval, typically 10-15s) → load balancer removes the instance
+5. **In-flight requests drain** → `srv.Shutdown()` waits up to 30s for them to finish
+6. **SIGKILL at 60s** → last resort, but should never fire if step 5 completes in ≤30s
+
+**Why `maxUnavailable: 0` matters here:** The rolling update won't terminate an existing pod until the replacement is passing its *readiness* probe AND the PDB constraint (`minAvailable: 2`) is satisfied. So there's always a serving replica available during deploy.
+
+---
+
+## Resource Sizing Rationale
+
+```
+CPU Requests: 250m    ← Set high enough that the scheduler guarantees this much,
+                        avoiding involuntary throttling at p99 under contention.
+
+CPU Limits:   1000m   ← 4× request — headroom for burst (GC pauses, cold cache,
+                        batch processing). Above this the OOM/Kill switch doesn't
+                        fire on CPU — the kernel just throttles.
+
+Memory Reqs:  256Mi   ← Match typical heap + stack for a Go service.
+Memory Limits: 512Mi  ← 2× request — Go's GC typically needs 25-40% overhead above
+                        live heap. This prevents OOMKill while allowing GC breathing room.
+```
+
+| Workload | Why This Sizing |
+|----------|----------------|
+| Go API | Go runtime allocates from OS via `mmap` in chunks; GC pause scales with heap size. Keeping limits at 2× requests avoids both CPU throttle and OOMKill at p99 latency tails. JVM apps need much higher ratios (3-4×) because the JVM reserves `-Xmx` upfront in native memory. |
+| Sidecar | 10-50m / 32-64Mi — negligible footprint, don't let sidecars steal resources from main container. |
+
+---
+
+## Secrets: File Mount vs Env Var
+
+```yaml
+# PRODUCTION PATTERN — use Sealed Secrets or External Secrets Operator
+# Plain kubectl Secret shown below as a structural reference only.
+
+apiVersion: external-secrets.io/v1beta1       # CRD from External Secrets Operator
+kind: ExternalSecret
+metadata:
+  name: go-api-secrets
+  namespace: api
+spec:
+  refreshInterval: 1h                          # rotate check frequency
+  secretStoreRef:
+    name: aws-secretsmanager                   # Provider-specific store ref
+    kind: SecretStore
+  target:
+    name: go-api-secrets                       # Creates a native K8s Secret
+    creation: Owner                            # ESO manages lifecycle
+  data:
+    - secretKey: db-url
+      remoteRef:
+        key: prod/go-api/database-url
+    - secretKey: api-key
+      remoteRef:
+        key: prod/go-api/api-key
+```
+
+This creates a native `Secret` named `go-api-secrets`, which mounts into the Deployment volume mount at `/etc/secrets`. Files appear atomically — no shell interpolation, no env var leakage in `/proc/*/environ`, no accidental log exposure via debug tools.
+
+If you're not using ESO, swap the `ExternalSecret` for a `SealedSecret` (Bitnami):
+
+```yaml
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: go-api-secrets
+  namespace: api
+spec:
+  encryptedData:
+    db-url: AgBy...  # encrypted blob — safe to commit
+```

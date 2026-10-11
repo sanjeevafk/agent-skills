@@ -1,6 +1,6 @@
 ---
 name: pattern-planning
-description: Structure agent behavior into explicit planning phases: static plan-and-solve, dynamic ReAct loops, or hierarchical DAG decomposition.
+description: "Structure agent behavior into explicit planning phases: static plan-and-solve, dynamic ReAct loops, or hierarchical DAG decomposition."
 metadata:
   category: agent-architecture
   tier: core

@@ -1,0 +1,1164 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+Audit a Solidity constant-product AMM pool where the swap function updates user balances before settling internal reserves, prices swaps against a spot balance read from token.balanceOf(address(this)), and accepts arbitrary token donations. A liquidity bootstrapping front-end also quotes trades without slippage bounds. Enumerate the concrete attack paths (including first-depositor inflation and oracle spot-price manipulation), rank them by exploitability, and provide a hardened swap implementation with the correct ordering, price bounds, and reserve accounting.
+
+---
+[Response A]:
+## Concrete Attack Audit: Constant-Product AMM Pool
+
+### Architecture Under Review
+
+| Component | What It Does | Why It's Dangerous |
+|---|---|---|
+| **Swap ordering** | User balance credited *before* reserve transfer | Reentrancy can consume swapped funds repeatedly |
+| **Price oracle** | `token.balanceOf(address(this))` read at runtime | Donations shift the pool's apparent reserves → price manipulation |
+| **Donation sink** | Any ERC-20 sent to pool address increases reserve count | A single deposit inflates one side of the pair → permanent arbitrage profit for attacker |
+| **Frontend quoting** | Trades shown with zero slippage tolerance | Users sign/execute assuming best execution; MEV bots front-run by 1-2% |
+
+---
+
+### Ranked Attack Paths
+
+#### 1. Donation-Driven Reserve Inflation (CVSS-like severity: Critical — Exploitability: Trivial)
+
+**Attack flow:**
+
+```
+attacker deploys TokenB (or sends existing B) directly to the pool:   10,000 B
+pool's on-chain reserve_of(B) jumps from 1,000 → 11,000              ← no trade event
+attacker swaps tiny amount A → B at now-artificially-rich B price:    0.01 A gets ~9.09 B
+arbiter notices mispricing, drains rest of A-side at manipulated rate
+attacker profits; legitimate users get brutal slippage
+```
+
+**Why it works:** The constant-product formula `x · y = k` is evaluated over stale `balanceOf` reads that conflate pool assets with donations. The invariant was never meant to include non-contribution tokens.
+
+**Fix:** Never derive reserves from `balanceOf`. Use internally tracked `_reserveA` / `_reserveB` that only advance through explicit deposit/swap events. Reject or explicitly ignore incoming transfers that don't come through a typed function.
+
+---
+
+#### 2. First-Depositor Inflation / Ghost Liquidity (Critical — Exploitability: Easy)
+
+**Attack flow:**
+
+```
+deployer provides 1,000 A + 1,000 B → receives 1,000 LP shares
+(implicit k = 1,000,000)
+removes ALL deposited tokens via a "withdraw" that burns LP at face value
+→ pool retains 0 actual tokens but k = 1,000,000 is embedded in every swap quote
+next depositor provides 100 A, gets quoted ~100 B but pool has nothing to pay
+collapses entirely
+```
+
+Even without an explicit withdraw, if the pool mints LP tokens equal to min(reserveA, reserveB), a malicious first depositor who already holds a large off-chain position can:
+
+```
+deposits 1 A + 1 B → LP = 1
+on-chain price now looks like 1:1
+drains all real A liquidity by swapping B→A at inflated price
+```
+
+This is the classic "first mover exploits initial liquidity ratio" seen in early Uniswap forks and Sushiswap ghost liquidity.
+
+**Fix:** Enforce minimum initial liquidity thresholds; track deposits atomically in a single `addLiquidity(tx.aIn, tx.bIn)` call; do not mint more LP than mathematically justified by the smaller reserve.
+
+---
+
+#### 3. Reentrancy in Swap (High — Exploitability: Easy)
+
+**Attack flow:**
+
+```solidity
+// Current (broken) swap ordering
+function swap(uint amountIn) external {
+    // ... calculate amountOut ...
+    
+    // BUG: credit buyer FIRST
+    balances[msg.sender].tokenB += amountOut;   // user state modified
+    
+    // Then pull from seller
+    tokenA.transferFrom(msg.sender, address(this), amountIn);
+    reserves.tokenA += amountIn;                 // reserve update last
+}
+```
+
+If `balances[msg.sender].tokenB += amountOut` triggers a callback (e.g., `msg.sender` is a contract with `afterSwap()` hook, or the recipient is the caller itself via a self-referential pattern), the reentering call computes `amountOut` against reserves that haven't yet been updated — yielding extra tokens per iteration.
+
+**Fix:** State mutations after external calls. Push, don't pull. Update reserves *before* transferring out.
+
+---
+
+#### 4. Oracle Spot-Price Manipulation via Sandwiched Donations (Medium-High — Exploitability: Moderate)
+
+**Attack flow:**
+
+```
+block N: attacker deposits 500K TokenB to pool
+block N: attacker calls swap(A→B). Price read uses balanceOf = 500K B
+         vs 1K A → ratio skewed 500:1 instead of 1:1
+block N+1: attacker removes donation (if donate() exists) or lets it sit
+           other LPs bear perpetual dilution
+```
+
+Unlike a flash-loan sandwich (which is mitigated by slippage bounds), this permanently distorts the pool's internal accounting until the next round of trading corrects it — but correction costs are socialized across all LPs.
+
+---
+
+#### 5. Frontend Zero-Slippage MEV Extraction (Medium — Exploitability: Trivial for bots)
+
+Any interface showing "you will receive exactly X" without enforcing on-chain slippage gives MEV bots perfect front-running targets. They insert a buy order ahead of the user's transaction, inflating the price, then let the user's trade slip into the worse rate. Result: user gets 0.5-2% less than quoted.
+
+---
+
+### Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title HardenedConstantProductAMM
+ * @notice Correct reserve accounting, safe swap ordering, explicit slippage,
+ *         no donation-based price distortion, and anti-manipulation guards.
+ */
+contract HardenedConstantProductAMM is Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // ── Core state ──────────────────────────────────────────────
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    /// @dev Internal reserves — NEVER derived from balanceOf.
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    /// @dev LP token backing total deposits. Burns/mints match reserve growth.
+    string private constant _LP_NAME  = "HCP-LP";
+    string private constant _LP_SYMBOL = "HCLP";
+
+    /**
+     * @dev Mapping from address → LP shares. Supply = sum of all values.
+     *     Tracks contributions so withdrawals are proportional.
+     */
+    mapping(address => uint256) public lpBalance;
+    uint256 public totalLpSupply;
+
+    // ── Swaps ───────────────────────────────────────────────────
+    /// @dev Slippage guard: price must stay within [minX / (1 + MAX_SLIPPAGE), maxX * (1 + MAX_SLIPPAGE)]
+    uint256 public constant MAX_SLIPPAGE_BPS = 50;          // 0.5% default global cap
+    uint256 public constant FEE_BPS          = 30;           // 0.3% protocol fee
+    uint256 public constant MIN_LIQUIDITY    = 100;          // locked forever to prevent empty-pool drain
+
+    // ── Events ──────────────────────────────────────────────────
+    event Swap(
+        address indexed sender,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 reserveAAfter,
+        uint256 reserveBAfter
+    );
+    event AddLiquidity(
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 lpMinted
+    );
+    event RemoveLiquidity(
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 lpBurned
+    );
+
+    constructor(address _tokenA, address _tokenB) Ownable(msg.sender) {
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  SWAP — protected by reentrancy guard, correct ordering, slippage bounds
+    // ---------------------------------------------------------------------------
+
+    /**
+     * @notice Swap tokenA for tokenB (or reverse).
+     * @param direction  true  = A→B   false = B→A
+     * @param amountIn   exact amount of input token
+     * @param minAmountOut enforced slippage bound (caller-calculated from frontend)
+     */
+    function swap(
+        bool           direction,   // true = A→B
+        uint256        amountIn,
+        uint256        minAmountOut
+    ) external nonReentrant returns (uint256 amountOut) {
+
+        require(amountIn > 0, "AMM: zero-in");
+        require(minAmountOut > 0, "AMM: min-out-zero");
+
+        uint256 reserveIn;
+        uint256 reserveOut;
+        address  sender  = msg.sender;
+
+        // Snapshot reserves BEFORE any external call
+        if (direction) {
+            reserveIn  = reserveA;
+            reserveOut = reserveB;
+        } else {
+            reserveIn  = reserveB;
+            reserveOut = reserveA;
+        }
+
+        require(reserveIn > 0 && reserveOut > 0, "AMM: insufficient liquidity");
+
+        // Compute output using the standard constant-product curve with fee:
+        //   amountOut = reserveOut * (1 - feebps/10000) * amountIn / (reserveIn + amountIn)
+        uint256 amountInAfterFee = amountIn * (10_000 - FEE_BPS) / 10_000;
+        amountOut = (reserveOut * amountInAfterFee) / (reserveIn + amountInAfterFee);
+
+        // Slippage check
+        require(amountOut >= minAmountOut, "AMM: slippage");
+
+        // ── ORDERING IS CRITICAL ──
+        // 1. Update INTERNAL reserves FIRST (no external call yet)
+        if (direction) {
+            reserveA += amountIn;
+            reserveB -= amountOut;
+        } else {
+            reserveB += amountIn;
+            reserveA -= amountOut;
+        }
+
+        // 2. Now it is safe to transfer tokens (reserves reflect the new reality)
+        if (direction) {
+            tokenA.safeTransferFrom(sender, address(this), amountIn);
+            tokenB.safeTransfer(sender, amountOut);
+        } else {
+            tokenB.safeTransferFrom(sender, address(this), amountIn);
+            tokenA.safeTransfer(sender, amountOut);
+        }
+
+        emit Swap(sender, amountIn, amountOut, reserveA, reserveB);
+        return amountOut;
+    }
+
+    // ---------------------------------------------------------------------------
+    //  ADD LIQUIDITY — atomic deposit, LP minting, no donation abuse
+    // ---------------------------------------------------------------------------
+
+    /**
+     * @notice Deposit both sides simultaneously. LP = sqrt(a * b) adjusted for
+    
+...[truncated]
+---[Response B]:
+# Constant-Product AMM Audit: Attack Analysis & Hardened Implementation
+
+## Executive Summary
+
+Five distinct attack paths span three vulnerability classes: spot-price oracle manipulation, accounting flaws from raw `balanceOf` reserve math, and execution-order failures (CEI violations, missing slippage). Two critical-severity exploits allow near-total theft of LP funds with negligible capital.
+
+---
+
+## Ranked Attack Paths
+
+### 🔴 Priority 1 — Flash-Loan Spot-Price Manipulation (CRITICAL · ~0.5% capital required)
+
+| Step | Action |
+|------|--------|
+| 1 | Attacker calls `swap()` with `amountOutMin = 0` and no deadline |
+| 2 | Router flash-loans 100× the pool's TokenA reserves and deposits them via `deposit()` |
+| 3 | Pool's spot price (`balanceOf(A)/balanceOf(B)`) skews 100:1 |
+| 4 | Attacker swaps a small amount of TokenB for TokenA at the distorted price, receiving vastly more than fair value |
+| 5 | Repays flash loan + fees; keeps the spread |
+
+**Root cause:** Price derives from `token.balanceOf(address(this))`, which reflects every token ever sent to the contract, including flash-loaned ones. Zero TWAP damping.
+
+### 🟠 Priority 2 — Donation-Based Reserve Inflation (HIGH · free capital required)
+
+| Step | Action |
+|------|--------|
+| 1 | Attacker calls `donateTokens(TokenB, 1_000_000)` sending tokens directly to the pool |
+| 2 | Pool's recorded reserves jump, but no new LP shares were minted |
+| 3 | Next `deposit()` caller gets `shares = assets × totalShares / totalReservesA` — inflated denominator under-mints their shares |
+| 4 | When a legit LP later withdraws face-value, the attacker pockets the gap |
+
+**Root cause:** Reserves are set from raw `balanceOf(address(this))` rather than measuring actual received amounts. Arbitrary donations permanently distort the invariant.
+
+### 🟠 Priority 3 — Reentrancy via Premature Balance Update (HIGH · callback-capable token needed)
+
+```solidity
+// VULNERABLE FLOW:
+balances[user].outToken += amountOut;        // effects AFTER interaction
+tokenOut.transfer(user, amountOut);          // interaction FIRST
+// if tokenOut is malicious/fallback-triggering:
+//   user callback fires → read stale balances/reserves → duplicate payout
+reserves[tokenB] -= amountOut;               // state mutation after external call
+```
+
+Outputs to the user must always be written back to storage *before* any `transfer` call that might trigger a callback.
+
+### 🟡 Priority 4 — Front-End Sandwich / No-Slippage Quotes (MEDIUM · standard MEV)
+
+Server-side quoting without `amountOutMin` lets any user submission become a free sandwich target. Bot frontruns, user fills, bot back-runs — zero friction.
+
+### 🟢 Priority 5 — First-Depositor Price Capture (LOW-MEDIUM · timing-dependent)
+
+On an empty pool (`_totalAssets == 0`), the first depositor sets initial pricing. A frontrunner can capture a small edge, but this is bounded and far less impactful than P1–P3.
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+contract HardenedAMMPool is ReentrancyGuard, Ownable2Step {
+    using SafeERC20 for IERC20;
+
+    // ── Storage ──────────────────────────────────────────────
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    // Internal reserve accounting — never derived from balanceOf
+    uint256 private _reserveA;
+    uint256 private _reserveB;
+
+    // Total assets under management (measured on each deposit)
+    uint256 private _totalAssetsA;
+    uint256 private _totalAssetsB;
+
+    // LP share supply
+    uint256 public totalSupply;            // total lpShares minted
+    mapping(address => uint256) public balanceOfLP;
+
+    // Fee parameters
+    uint256 public feeDenominator = 1e6;
+    uint256 public feeNumeratorA;
+    uint256 public feeNumeratorB;
+
+    // Pause gating
+    bool public paused;
+
+    // Oracle TWAP cache (used internally)
+    int56 private _twapTickCumulativePrev;
+    uint32  private _twapSecondsAgo;       // configurable lookback window
+
+    // Events
+    event Swap(
+        address indexed sender,
+        address indexed recipient,
+        address indexed tokenIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event Deposit(
+        address indexed lp,
+        uint256 assetsA,
+        uint256 assetsB,
+        uint256 lpShares
+    );
+    event Withdraw(
+        address indexed lp,
+        uint256 lpSharesBurned,
+        uint256 assetsA,
+        uint256 assetsB
+    );
+    event FeesSet(uint256 feeNA, uint256 feeNB);
+    event TwapLookbackUpdated(uint32 secondsAgo);
+    event Paused(bool paused);
+
+    modifier whenNotPaused() { require(!paused, "Paused"); _; }
+
+    constructor(
+        IERC20 _a,
+        IERC20 _b,
+        uint32 twapLookbackSeconds
+    ) Ownable2Step(msg.sender) {
+        tokenA = _a;
+        tokenB = _b;
+        _twapSecondsAgo = twapLookbackSeconds;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  SWAP  — CEI-compliant, slippage-gated, reserve-checked
+    // ═══════════════════════════════════════════════════════
+    /// @param tokenIn      Which token is being sold (must be tokenA or tokenB)
+    /// @param amountIn     Exact amount to sell
+    /// @param amountOutMin Minimum acceptable output (slippage bound)
+    /// @param recipient    Address that receives the output tokens
+    /// @param deadline     Timestamp after which the tx reverts
+    function swap(
+        IERC20 tokenIn,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address recipient,
+        uint256 deadline
+    ) external nonReentrant whenNotPaused {
+        require(block.timestamp <= deadline, "Swap: expired");
+        require(recipient != address(0), "Swap: zero recipient");
+        require(amountIn > 0, "Swap: zero input");
+
+        // Determine direction
+        bool aToB;
+        if (address(tokenIn) == address(tokenA)) {
+            aToB = true;
+        } else if (address(tokenIn) == address(tokenB)) {
+            aToB = false;
+        } else {
+            revert("Swap: unsupported token");
+        }
+
+        // ── Check (effects written before interaction) ───
+        uint256 reserveIn  = aToB ? _reserveA : _reserveB;
+        uint256 reserveOut = aToB ? _reserveB : _reserveA;
+        require(reserveIn > 0 && reserveOut > 0, "AMM: empty pool");
+
+        // Apply fee to input
+        uint256 feeAmount = FullMath.mulDiv(amountIn, feeNumeratorA, feeDenominator);
+        uint256 amountInAfterFee = amountIn - feeAmount;
+
+        // Constant-product: x * y = k; amountOut = y - xy/(x+Δx)
+        // Use safe mulDiv throughout
+        uint256 amountOut = reserveOut -
+            FullMath.mulDiv(reserveOut, amountInAfterFee, reserveIn + amountInAfterFee);
+
+        require(amountOut >= amountOutMin, "AMM: slippage exceeded");
+
+        // State mutation BEFORE any external call  (CEI order)
+        if (aToB) {
+            _reserveA += amountIn;
+            _reserveB -= amountOut;
+        } else {
+            _reserveB += amountIn;
+            _reserveA -= amountOut;
+        }
+
+        // ── Interaction (external call) ──────────────────
+        tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
+        // Fee side goes to treasury / burns depending on design
+        // Here we keep fees inside pool for simplicity; alternative:
+        // if (feeAmount > 0) IERC20(tokenA).safeTransfer(treasury, feeAmount);
+
+        // Transfer output to recipient
+        if (aToB) {
+            tokenB.safeTransfer(recipient, amountOut);
+        } else {
+            tokenA.safeTransfer(recipient, amountOut);
+        }
+
+        emit Swap(msg.sender, recipient, address(tokenIn), amountIn, amountOut);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  DEPOSIT  — measures actual received, no balanceOf
+    // ═══════════════════════════════════════════════════════
+    function deposit(
+        uint256 assetsA,
+        uint256 assetsB,
+        address recipient
+    ) external nonReentrant whenNotPaused returns (uint256 lpShares) {
+        require(recipient != address(0), "Deposit: zero recipient");
+        require(assetsA > 0 && assetsB > 0, "Deposit: zero assets");
+
+        // Measure actual received tokens
+        uint256 balBeforeA = tokenA.balanceOf(address(this));
+        tokenA.safeTransferFrom(msg.sender, address(this), assetsA);
+        uint256 actualA = tokenA.balanceOf(address(this)) - balBeforeA;
+
+        uint256 balBeforeB = tokenB.balanceOf(address(this));
+        tokenB.safeTransferFrom(msg.sender, address(this), assetsB);
+        uint256 actualB = tokenB.balanceOf(address(this)) - balBeforeB;
+
+        // Burn mismatch allowance for minor rounding; reject if shortfall is large
+        uint256 minReceiveA = assetsA / 1000;  // 0.1% tolerance
+        uint256 minReceiveB = assetsB / 1000;
+        require(actualA >= minReceiveA, "Deposit: shortfall A");
+        require(actualB >= minReceiveB, "Deposit: shortfall B");
+
+        // Compute LP shares
+        if (totalSupply == 0) {
+            // Initial liquidity: proportional contribution
+            // Shares = min(actualA * totalTargetRatio, actualB * totalTargetRatio)
+            // Simple approach: use the smaller proportionality
+            uint256 idealShareA = (_totalAssetsA == 0)
+                ? actualA
+                : FullMath.mulDiv(actualA, totalSupply, _totalAssetsA);
+            uint256 idealShareB = (_totalAssetsB == 0)
+                ? actualB
+                : FullMath.mulDiv(actualB, totalSupply, _totalAssetsB);
+            lpShares = idealShareA < idealShareB ? idealShareA : idealShareB;
+            require(lpShare
+...[truncated]
+---[Response C]:
+# Solidity Constant-Product AMM — Attack Surface Audit & Hardened Implementation
+
+## Vulnerabilities Identified
+
+### 1. Reserve Denominator Inflation via Donations *(Critical — Exploitability: 9/10)*
+
+The pool prices against `token.balanceOf(address(this))`. Anyone can send tokens (donate) to the contract, inflating the reported reserve count, depressing the effective exchange rate on every subsequent swap, and stealing value from legitimate traders.
+
+**Attack:**
+1. Deposit fair amount → gets fair shares at correct ratio.
+2. Attacker sends 100× the pool's token balance as a "donation."
+3. `balanceOf(address(this))` now reflects the injected supply.
+4. Every new depositor's shares are minted against this bloated denominator — they receive far fewer shares than they should.
+5. The attacker redeems first at the true underlying ratio, pocketing the spread.
+
+The same mechanism destroys LP value if applied to either side of a two-token pool.
+
+### 2. Flash-Lone Spot-Price Manipulation *(Critical — Exploitability: 8/10)*
+
+Swaps priced off the current `balanceOf` snapshot is the classic XY=k AMM oracle problem. An attacker with minimal capital can flash-loan funds to move the price curve mid-swap, then unwind at an advantage on-chain or bridge the displaced value off-chain.
+
+**Attack (two-sided pool):**
+1. Flash-loan TokenA.
+2. Swap huge amount → drives `price = reserveB / reserveA` massively in attacker's favor.
+3. Execute the "real" trade the victim intended at the manipulated price.
+4. Reverse the flash-loan; profit = delta between manipulated and fair price.
+
+### 3. Reentrancy — User Balance Updated Before Reserve Settlement *(High — Exploitability: 7/10)*
+
+Updating `userBalances[msg.sender]` *before* adjusting internal reserves violates Check-Effects-Interactions ordering. If the token being transferred is ERC-6900-like (rebasing) or the recipient implements a fallback that calls back into the AMM, the second call reads stale reserves.
+
+**Attack:**
+1. Attacker calls `swap()` — function credits their output balance.
+2. During the `transfer`, the attacker's contract reenters `swap()`.
+3. On re-entry, `reserveA` / `reserveB` still reflect pre-call state → double-spends reserves.
+4. Repeat until pool is drained.
+
+### 4. No Slippage Bounds / Deadline *(Medium-High — Exploitability: 6/10)*
+
+Frontend quotes blind trades. Without `amountOutMin` or a `deadline`, MEV bots can sandwich the transaction — front-run with a large buy to inflate price, let the victim's trade execute at a worse rate, then back-run.
+
+### 5. First-Depositor Inflation *(Medium — Exploitability: 5/10)*
+
+If `totalShares` and `_totalAssets` initialize at zero, the first depositor effectively sets the peg. A malicious first depositor can under-deposit (e.g., send only 1 token but claim 1,000 shares), then subsequent depositors inherit an inflated ratio.
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+/// @notice Constant-product AMM with CEI ordering, TWAP oracle, internal reserve accounting,
+///         slippage bounds, donation-resistant deposit, and emergency pause.
+contract HardenedAMM is ReentrancyGuard, Pausable, Ownable2Step {
+    using SafeERC20 for IERC20;
+
+    // ──────────────── Storage ────────────────
+
+    IERC20 public immutable tokenX;
+    IERC20 public immutable tokenY;
+
+    // Internal reserve counters — NEVER derived from balanceOf(address(this)).
+    uint256 private _reserveX;
+    uint256 private _reserveY;
+
+    // Total assets under management (used for fee accrual / TVL tracking).
+    uint256 private _totalAssetsX;
+    uint256 private _totalAssetsY;
+
+    // LP share ledger.
+    uint256 public totalSupply; // total liquidity shares
+    mapping(address => uint256) public balanceOf;
+
+    // Fees (in basis points, 1 bp = 0.01%).
+    uint256 public feeRate = 30; // 0.3%
+
+    // ──────────────── Events ────────────────
+
+    event Swap(
+        address indexed caller,
+        address indexed sender,
+        IERC20 inputToken,
+        uint256 inAmount,
+        uint256 outAmount
+    );
+    event Deposited(
+        address indexed provider,
+        uint256 xDeposited,
+        uint256 yDeposited,
+        uint256 sharesMinted
+    );
+    event Withdrawn(
+        address indexed provider,
+        uint256 xWithdrawn,
+        uint256 yWithdrawn,
+        uint256 sharesBurned
+    );
+    event FeeRateUpdated(uint256 oldRate, uint256 newRate);
+    event EmergencyPauseSet(bool paused);
+
+    // ──────────────── Modifiers ────────────────
+
+    modifier nonReentrantLP() {
+        require(!reentered(), "Reentrant");
+        _;
+        reentered();
+    }
+
+    // ──────────────── Constructor ────────────────
+
+    constructor(IERC20 _x, IERC20 _y) Ownable2Step(msg.sender) {
+        require(address(_x) != address(_y), "Same token");
+        tokenX = _x;
+        tokenY = _y;
+    }
+
+    // ──────────────── Swap ────────────────
+
+    /// @notice Swaps tokenIn → tokenOut with slippage protection and deadline.
+    /// @dev Uses constant-product formula: k = reserveX * reserveY, after deducting fees.
+    function swap(
+        IERC20 inputToken,      // tokenX or tokenY
+        uint256 amountIn,
+        uint256 amountOutMin,   // slippage bound
+        uint256 deadline        // block.timestamp guard
+    ) external nonReentrant whenNotPaused returns (uint256 amountOut) {
+        require(block.timestamp <= deadline, "Expired");
+        require(amountIn > 0, "Zero input");
+
+        bool xToY = address(inputToken) == address(tokenX);
+        require(xToY || address(inputToken) == address(tokenY), "Unknown token");
+
+        // --- CHECKS already done above ---
+
+        // Calculate output using internal reserves (not balanceOf).
+        amountOut = _computeOutput(amountIn, xToY);
+        require(amountOut >= amountOutMin, "Slippage exceeded");
+
+        // --- EFFECTS: update internal accounting BEFORE transfers ---
+        if (xToY) {
+            _reserveX += amountIn; // gross input added to reserve
+            _reserveY -= amountOut; // output subtracted from reserve
+            _totalAssetsX += amountIn;
+        } else {
+            _reserveY += amountIn;
+            _reserveX -= amountOut;
+            _totalAssetsY += amountIn;
+        }
+
+        // --- INTERACTIONS: transfer tokens (last step) ---
+        if (xToY) {
+            inputToken.safeTransferFrom(msg.sender, address(this), amountIn);
+            tokenY.safeTransfer(msg.sender, amountOut);
+        } else {
+            inputToken.safeTransferFrom(msg.sender, address(this), amountIn);
+            tokenX.safeTransfer(msg.sender, amountOut);
+        }
+
+        emit Swap(msg.sender, msg.sender, inputToken, amountIn, amountOut);
+    }
+
+    // --- Private helpers ---
+
+    function _computeOutput(uint256 amountIn, bool xToY) private view returns (uint256 out) {
+        uint256 reserveIn  = xToY ? _reserveX : _reserveY;
+        uint256 reserveOut = xToY ? _reserveY : _reserveX;
+
+        // Fee taken upfront so the trader sees the net output.
+        uint256 fee = FullMath.mulDiv(amountIn, feeRate, 10_000);
+        uint256 amountInAfterFee = amountIn - fee;
+
+        // Constant product:  out = (outReserve * inNet) / (inReserve + inNet)
+        out = FullMath.mulDiv(reserveOut, amountInAfterFee, reserveIn + amountInAfterFee);
+        require(out < reserveOut, "Insufficient liquidity");
+    }
+
+    // ──────────────── Liquidity Deposit / Mint ────────────────
+
+    /// @notice Deposit paired tokens and mint LP shares.
+    ///         Measures actual received tokens internally — immune to donations.
+    function deposit(
+        uint256 amountXDesired,
+        uint256 amountYDesired,
+        uint256 minShares
+    ) external nonReentrant nonReentrantLP returns (uint256 shares) {
+        require(amountXDesired > 0 && amountYDesired > 0, "Zero desired");
+
+        // Track actual receipt.
+        uint256 balXBefore = tokenX.balanceOf(address(this));
+        uint256 balYBefore = tokenY.balanceOf(address(this));
+
+        tokenX.safeTransferFrom(msg.sender, address(this), amountXDesired);
+        tokenY.safeTransferFrom(msg.sender, address(this), amountYDesired);
+
+        uint256 xReceived = tokenX.balanceOf(address(this)) - balXBefore;
+        uint256 yReceived = tokenY.balanceOf(address(this)) - balYBefore;
+
+        // Share calculation based on ACTUAL received amounts.
+        if (totalSupply == 0) {
+            // Initial liquidity: shares = sqrt(x * y)
+            shares = FullMath.mulDiv(xReceived, yReceived, 1_000_000);
+            require(shares >= minShares, "Slippage");
+        } else {
+            // Pro-rata: shares = min(xReceived * total / totalX, yReceived * total / totalY)
+            uint256 sharesX = FullMath.mulDiv(xReceived, totalSupply, _totalAssetsX);
+            uint256 sharesY = FullMath.mulDiv(yReceived, totalSupply, _totalAssetsY);
+            shares = sharesX < sharesY ? sharesX : sharesY; // take the lesser
+            require(shares >= minShares, "Slippage");
+        }
+
+        _mint(msg.sender, shares);
+        _reserveX += xReceived;
+        _reserveY += yReceived;
+        _totalAssetsX += xReceived;
+        _totalAssetsY += yReceived;
+
+        emit Deposited(msg.sender, xReceived, yReceived, shares);
+    }
+
+    // ──────────────── Liquidity Withdrawal / Burn ────────────────
+
+    /// @notice Burn LP shares and withdraw proportional reserves.
+    function withdraw(uint256 shares)
+        external nonReentrant
+        returns (uint256 amountX, uint256 amountY)
+    {
+        require(balanceOf[msg.sender] >= shares, "Insufficient balance");
+        require
+...[truncated]
+---[Response D]:
+# Constant-Product AMM Audit — Attack Paths & Hardened Implementation
+
+## Vulnerability Summary
+
+The contract suffers from a compounding set of issues: incorrect reserve accounting, manipulable spot-price oracles, missing slippage protection, and an inflation vector in the deposit flow. Each vulnerability independently yields economic losses; together they enable near-complete drain scenarios.
+
+---
+
+## Attack Path Enumeration
+
+### A1: First-Depositor Inflation / Donation Attack — **Exploitability: HIGH**
+
+**Mechanism.** The `deposit()` shares formula divides by `token.balanceOf(address(this))`. Because the pool accepts arbitrary donations, any attacker sends tokens directly to the contract (or tricks users into doing so), inflating the denominator. When legitimate liquidity providers call `deposit()`, their share mint is computed against the inflated balance, so they receive fewer LP shares than their deposited assets warrant. Conversely, if existing LPs can withdraw based on those same inflated reserves, the donor effectively steals value from LPs.
+
+**Concrete example.** Pool: 100k USDC in reserves, 100k shares. Attacker donates 900k USDC → reserve math now reads 1M. LP deposits 10k USDC expecting ~1k shares (1% of pool), gets `10k * 100k / 1M = 1k` shares — correct only if the donated tokens are still in the pool. But when the LP tries to withdraw their 1k shares proportional to 1/101 of the pool, the *real* usable reserve is back to 100k (donated funds are trapped or inaccessible). The LP withdraws ~1k USDC that should have gone to cover the donation, netting profit at other LPs' expense.
+
+**Impact:** Theft from liquidity providers; dilution.  
+**Complexity:** Low — requires one donation transaction plus a deposit/withdraw cycle.
+
+### A2: Spot-Price Oracle Manipulation via Flash Loan — **Exploitability: HIGH**
+
+**Mechanism.** The swap prices against `token.balanceOf(address(this))`, a spot read that reflects all tokens held by the contract, including donations and stuck balances. An attacker flash-loans massive amounts of one asset, pushes them into the pool (triggering a donate or direct transfer if the token allows), reads the manipulated spot price, executes the swap at the artificial rate, then unwinds the flash loan. The pool's real reserves are far less than the oracle suggests.
+
+**Concrete example.** Pool has 50k WETH and 50M USDC (1:1000 price). Attacker flash-loans 5M USDC, transfers to pool. Pool balance: 10M USDC (real usable: 5M + 5M borrowed). Spot oracle reads 5M WETH / 10M USDC = 1:2000. Attacker swaps 1 WETH → receives 2000 USDC instead of the fair ~1000 USDC. Flash-loan repaid with remaining surplus. Loss = 1000 USDC extracted per round.
+
+**Impact:** Direct theft from LP reserve pool proportional to swap size.  
+**Complexity:** Low-Medium — standard flash-loan pattern well-documented across DeFi.
+
+### A3: Incorrect CEI Order / Reentrancy Drain — **Exploitability: MEDIUM**
+
+**Mechanism.** The swap updates user balances *before* settling internal reserves. If `_executeSwap` calls into the user contract (or if the token used is reentrant), the user can recursively call `swap()` again before reserves are updated, reading stale reserve state each time.
+
+```solidity
+// VULNERABLE ordering
+balances[msg.sender] += amountOut;          // state update first
+settleReserves(amountIn, amountOut);        // reserves settled after
+```
+
+A reentrant caller sees the pre-swap reserve count in `_calculateOut()` on each recursion, potentially extracting far more than they paid for.
+
+**Impact:** Multi-extraction from a single tx; up to full reserve drain on poorly constrained paths.  
+**Complexity:** Medium — requires a malicious receiver contract implementing reentrancy.
+
+### A4: No Slippage Bound on Front-End Quotes — **Exploitability: MEDIUM**
+
+**Mechanism.** The liquidity bootstrapping front-end displays trade output computed against current reserves but imposes no `amountOutMin` on-chain. Users sign/submit transactions expecting one output but the front-end doesn't enforce it. Between quote and execution, another tx can move the pool price. This enables sandwich attacks where the front-end bot sees the pending user tx, fronts it, and the user's large swap moves price against themselves.
+
+More critically, if the front-end uses a manipulated spot price (see A2) as its quote source, every user swapping through the front-end during manipulation is underpaying — the front-end becomes a vector for mass extraction.
+
+**Impact:** Sandwich losses for honest users; mass extraction during oracle manipulation.  
+**Complexity:** Low for sandwiches; requires coordination for front-end exploitation.
+
+### A5: Reserve Underflow / Overflow in Share Math — **Exploitability: LOW**
+
+**Mechanism.** Naive `(assets * totalShares) / balanceOf(...)` arithmetic can overflow on large values before division, especially if the token has high decimals or the pool scales rapidly. Additionally, if `balanceOf(address(this))` temporarily dips below the expected value (due to fees being collected elsewhere, or the donation path being reversed), the denominator can become inconsistent, producing over-minted shares.
+
+**Impact:** Shares mispricing, potential over-withdrawal.  
+**Complexity:** Medium — requires specific value ranges and timing.
+
+---
+
+## Ranking by Exploitability
+
+| Rank | Attack | Complexity | Damage Potential | Real-World Precedent |
+|------|--------|------------|------------------|---------------------|
+| 1 | A2: Flash-loan oracle manipulation | Low-Medium | High (proportional to pool TVL) | Dozens across Uniswap v1, Sushiswap clones |
+| 2 | A1: First-depositor/donation inflation | Low | High (dilution of entire LP base) | Yearn/vault donation exploits |
+| 3 | A3: Reentrancy from bad CEI order | Medium | Critical (full drain possible) | The DAO, Paradox, numerous ERC-20 drains |
+| 4 | A4: No slippage bounds / sandwich | Low-Medium | Medium (per-user losses) | Ubiquitous inDEX pools |
+| 5 | A5: Overflow in reserve math | Medium | Medium | Common in unaudited clones |
+
+Attacks A1 and A2 are the most immediately exploitable because they require no special setup beyond what any EOA can execute. A3 requires a malicious contract but is a textbook reentrancy that will trigger on any swap. All three compound: donating (A1) inflates the oracle (A2), both feeding wrong numbers into a reentrancy-prone swap (A3).
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+/**
+ * @title HardenedConstantProductAMM
+ * @notice Constant-product (x*y=k) AMM with TWAP oracle, CEI-compliant swaps,
+ *         proper reserve accounting, and slippage-enforced swaps.
+ */
+contract HardenedConstantProductAMM is ReentrancyGuard, Ownable2Step, Pausable {
+    using SafeERC20 for IERC20;
+
+    // ── Token addresses ──────────────────────────────────────────────
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    // ── Internal reserve tracking (NOT derived from balanceOf) ───────
+    // These track *deposited* reserves only. Donated/stuck balances are
+    // excluded to prevent oracle manipulation (Attack A2).
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    // ── LP share accounting ─────────────────────────────────────────
+    uint256 public totalSupply;           // total LP shares
+    uint256 private _totalAssetA;         // running sum of tokenA received
+    uint256 private _totalAssetB;         // running sum of tokenB received
+
+    // ── Fees ─────────────────────────────────────────────────────────
+    uint256 public feePercent;            // basis points (1 bp = 0.01%)
+    uint256 public constant MAX_FEE_BPS = 500; // max 5%
+
+    // ── Events ───────────────────────────────────────────────────────
+    event Swap(
+        address indexed sender,
+        uint256 amountIn,
+        uint256 amountOut,
+        bool isTokenA
+    );
+    event Deposit(
+        address indexed provider,
+        uint256 assetA,
+        uint256 assetB,
+        uint256 shares
+    );
+    event Withdraw(
+        address indexed provider,
+        uint256 shares,
+        uint256 assetA,
+        uint256 assetB
+    );
+    event FeeSet(uint256 newFeeBps);
+
+    constructor(
+        IERC20 _tokenA,
+        IERC20 _tokenB,
+        uint256 _feeBps
+    ) Ownable(msg.sender) {
+        require(address(_tokenA) != address(_tokenB), "Same token");
+        require(_feeBps <= MAX_FEE_BPS, "Fee too high");
+        tokenA = _tokenA;
+        tokenB = _tokenB;
+        feePercent = _feeBps;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SWAP — CEI ordering, TWAP oracle check, slippage bounds
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Swaps `amountIn` of tokenA or tokenB for the other.
+     * @param amountIn      Amount of input token to sell.
+     * @param amountOutMin  Minimum output amount (slippage bound).
+     * @param deadline      Unix timestamp after which the tx reverts.
+     * @param isTokenA      true = selling tokenA, false = selling tokenB.
+     * @return amountOut   Actual output amount.
+     */
+    function swap(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline,
+        bool isTokenA
+    ) external nonReentrant whenNotPaused returns (uint256 amountOut) {
+        require(amountIn > 0, "Zero in");
+        require(block.timestamp <= deadline, "Expired");
+        require(
+            isTokenA ? amountOutMin < type(uint256).max : amountOutMin < type(uint256).max,
+            "Unbounded out"
+        );
+...[truncated]
+---[Response E]:
+# Constant-Product AMM Security Audit & Hardened Implementation
+
+## Vulnerability Analysis
+
+### Attack Path 1: First-Depositor Inflation (Severity: CRITICAL | Exploitability: TRIVIAL)
+
+```
+vulnerable: shares = (assets * totalShares) / token.balanceOf(address(this))
+```
+
+The first depositor deposits X tokens with zero existing reserve. `totalShares` is 0, yielding 0 shares for any deposit amount. Any subsequent depositor then calculates their share ratio against the inflated reserve — the first depositor effectively gets all shares worth 0 cost, while later users absorb inflation.
+
+**Exploit**: Deposit 0 assets (or minimal), then withdraw when reserves exist. Or front-run legitimate deposits by being the "initial" depositor, gaining permanent minting power at zero cost.
+
+**Root cause**: Share math depends on `IERC20(balances[address(this)])` which includes prior donations and other inflows not attributable to the current user.
+
+---
+
+### Attack Path 2: Donation-Based Reserve Manipulation (Severity: HIGH | Exploitability: TRIVIAL)
+
+An attacker donates a large amount of the pool token to `address(this)`. This increases `token.balanceOf(address(this))`, artificially inflating the perceived denominator in share calculations for future deposits. Subsequent depositors receive fewer shares than they should for their asset contribution.
+
+**Combined with Attack 1**, the attacker controls both the initial state and the donation base, allowing complete extraction of value from legitimate liquidity providers.
+
+---
+
+### Attack Path 3: Oracle/Spot Price Manipulation (Severity: CRITICAL | Exploitability: MODERATE)
+
+Pricing swaps against `token.balanceOf(address(this))` is equivalent to pricing off instantaneous spot reserves. A flash loan attacker can:
+
+1. Flash borrow tokens → dump them into the pool to manipulate `balanceOf(address(this))`
+2. Execute swap at manipulated (degraded) price
+3. Repay flash loan from remaining tokens
+
+With a constant-product formula `x * y = k`, moving even a small percentage of one side significantly moves the price on the other. The attacker captures the spread differential between the manipulated spot price and fair market.
+
+**Example**: Pool has 100 TOKEN_A, 1000 TOKEN_B. Spot ratio = 1:10. Attacker flash-borrows 50 TOKEN_A, sells into pool. New balance A ≈ 150, new balance B ≈ 667. Effective price degraded to ~1:4.44. Swaps TOKEN_B to TOKEN_A at manipulated price, repays 50 TOKEN_A + fees.
+
+---
+
+### Attack Path 4: CEI Ordering Reentrancy (Severity: HIGH | Exploitability: MODERATE)
+
+```
+balances[msg.sender] -= amount;      // STATE UPDATE
+token.transfer(msg.sender, amount);  // EXTERNAL CALL
+```
+
+Wait — reading the spec again: "swap function updates user balances before settling internal reserves." If the external call (`transfer`) comes BEFORE the balance update, this is the classic reentrancy vector:
+
+```
+// VULNERABLE ORDER
+token.safeTransfer(msg.sender, amount);     // External call first
+balances[msg.sender] -= amount;              // State after
+```
+
+A malicious receiver contract could reenter the swap function before the balance is decremented, draining funds through repeated withdrawals during a single `transfer` call.
+
+Even with CEI as written (`require → transfer → subtract`), there's no guard — the transfer itself is the vulnerability because it precedes the accounting update. Some implementations also call hooks on the receiver which can reenter.
+
+---
+
+### Attack Path 5: Front-Run / MEV (Severity: MEDIUM | Exploitability: EASY)
+
+No `deadline` parameter on swap means transactions sit in the mempool indefinitely. Searchers front-run based on known price movements. No `amountOutMin` means the user accepts whatever degenerate price results from the manipulation attacks above.
+
+---
+
+### Attack Path 6: Missing Emergency Pause (Severity: MEDIUM | Exploitability: INFORMATIONAL)
+
+Without an emergency pause, once exploits are active there's no circuit-breaker to stop further drain while the team responds.
+
+---
+
+## Ranked by Exploitability
+
+| Rank | Attack | Severity | Effort Required | Profit Potential |
+|------|--------|----------|-----------------|------------------|
+| 1 | Donation + First-depositor inflation | Critical | None (anyone can call) | Unlimited |
+| 2 | Oracle/spot manipulation via flash loan | Critical | Flash loan (standard tooling) | High (spread capture) |
+| 3 | CEI ordering reentrancy | High | Basic reentrancy attack | Up to total TVL |
+| 4 | Missing slippage/deadline (MEV) | Medium | Standard MEV bot | Moderate-High |
+| 5 | No emergency pause | Medium | N/A (informational) | Delayed response |
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ERC165} from "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+/// @notice TickMath-style sqrtPriceX96 helper for computing prices from reserves
+library MathHelpers {
+    /// @dev Compute sqrtPriceX96 from reserve ratio: res0 / res1
+    /// @param reserve0 Amount of token 0 in the pool
+    /// @param reserve1 Amount of token 1 in the pool
+    /// @return sqrtPriceX96 Q96 representation of sqrt(reserve0/reserve1)
+    function computeSqrtPrice(uint128 reserve0, uint128 reserve1)
+        internal
+        pure
+        returns (uint160 sqrtPriceX96)
+    {
+        require(reserve0 > 0 && reserve1 > 0, "Zero liquidity");
+        // sqrt(a/b) = sqrt(a*2^192 / b) / 2^96, represented as Q96
+        unchecked {
+            uint256 numerator = uint256(reserve0) << 96;
+            sqrtPriceX96 = uint160(FullMath.mulDiv(numerator, 1 << 96, reserve1).sqrt());
+        }
+    }
+
+    /// @dev Get amount out for a given amount in under x*y=k
+    /// @param amountIn Amount of tokenIn to swap
+    /// @param reserveIn Current reserve of tokenIn
+    /// @param reserveOut Current reserve of tokenOut
+    /// @param feeFee Bps fee taken (e.g., 30 = 0.30%)
+    /// @return amountOut Amount of tokenOut received after fee
+    function computeAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut,
+        uint256 feeBps
+    ) internal pure returns (uint256 amountOut) {
+        require(amountIn > 0, "Zero input");
+        require(reserveIn > 0 && reserveOut > 0, "Zero liquidity");
+        require(feeBps <= 1000, "Fee too high"); // max 10%
+
+        uint256 amountInAfterFee = FullMath.mulDiv(amountIn, 10000 - feeBps, 10000);
+        uint256 numerator = FullMath.mulDiv(amountInAfterFee, reserveOut, reserveIn);
+        return numerator / (reserveIn + amountInAfterFee);
+    }
+}
+
+/// @title HardenedConstantProductAMM
+/// @notice Constant-product AMM pool with protected price discovery, CEI compliance,
+///         donation isolation, and emergency controls.
+contract HardenedConstantProductAMM is ReentrancyGuard, Ownable2Step, ERC165 {
+    using SafeERC20 for IERC20;
+
+    // -----------------------------------------------------------------------
+    // Storage
+    // -----------------------------------------------------------------------
+
+    /// @dev Token addresses (token0 < token1 by address sort order)
+    IERC20 public immutable token0;
+    IERC20 public immutable token1;
+
+    /// @notice Internal reserves for each token — updated AFTER external calls
+    uint256 public reserve0;
+    uint256 public reserve1;
+
+    /// @dev Total assets actually contributed by depositors (isolated from donations)
+    uint256 private _totalDepositedAssets;
+
+    /// @dev Total shares minted to LPs (tracked internally, never derived from balanceOf)
+    uint256 public totalSupply;
+
+    /// @dev Per-user share balances
+    mapping(address => uint256) public balanceOf;
+
+    /// @notice BPS trading fee (e.g., 30 = 0.30%)
+    uint256 public feeBps;
+
+    /// @notice Whether the pool is paused (emergency circuit breaker)
+    bool public paused;
+
+    // Events ----------------------------------------------------------------
+    event Swap(
+        address indexed sender,
+        address indexed recipient,
+        address indexed tokenIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event Deposit(
+        address indexed lp,
+        uint256 assetsDeposited,
+        uint256 sharesMinted,
+        uint256 reserved0Before,
+        uint256 reserved1Before
+    );
+    event Withdraw(
+        address indexed lp,
+        uint256 sharesBurned,
+        uint256 token0Withdrawn,
+        uint256 token1Withdrawn
+    );
+    event FeeSet(uint256 oldFeeBps, uint256 newFeeBps);
+    event Paused(bool isPaused);
+    event EmergencyPause();
+    event OwnershipTransferredFrom(address indexed prev, address indexed newOwner);
+    event OwnershipAccepted(address indexed newOwner);
+
+    // -----------------------------------------------------------------------
+    // Modifiers
+    // -----------------------------------------------------------------------
+
+    modifier nonPause() {
+        require(!paused, "Pool paused");
+        _;
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor
+    // -----------------------------------------------------------------------
+
+    constructor(
+        IERC20 _token0,
+        IERC20 _token1,
+        uint256 _feeBps
+    ) Ownable2Step(msg.sender) {
+        require(address(_token0) != address(_token1), "Same token");
+        require(_token0.address() < _token1.address(), "Token order");
+        require(_feeBps <= 1000, "Invalid fee");
+
+        token0 = _token0;
+        token1 = _token1;
+        feeBps = _feeBps;
+        paused = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Interfac
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

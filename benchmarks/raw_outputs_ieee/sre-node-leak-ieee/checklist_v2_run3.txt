@@ -1,0 +1,942 @@
+[exit=0 latency=51.06s]
+# Node.js 20 API Service OOM Diagnosis Plan
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### Tooling & Preparation
+
+```bash
+# Install heap snapshot tools locally (not in production)
+npm install -g undici@6 node-heapdump inspector-diff
+```
+
+### Capture Strategy — Zero-Downtime
+
+```bash
+# Method 1: Using node --heapsnapshot-signal (Node 20 built-in)
+# Enable at process start (add to Dockerfile entrypoint or env)
+export NODE_OPTIONS="--heapsnapshot-signal=SIGUSR2"
+
+# Then from outside the container (no restart needed):
+kubectl exec <pod-name> -- kill -SIGUSR2 $(cat /proc/1/status | grep PPid)
+# Or more reliably, send signal to the main node process:
+POD_PID=$(kubectl exec <pod-name> -- sh -c 'ps aux | grep "node " | grep -v grep | awk "{print \$2}"')
+kubectl exec <pod-name> -- kill -SIGUSR2 $POD_PID
+
+# This writes heap.heapsnap.nnnnnnnn inside the container's working dir
+# Copy it out:
+kubectl cp <pod-name>:/app/heap.heapsnap.* ./snapshots/
+```
+
+```bash
+# Method 2: Programmatic via /health/heap endpoint (implement once, use always)
+# Add to your health check route handler:
+const v8 = require('v8');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+let snapshotCounter = 0;
+
+function takeHeapSnapshot() {
+  const timestamp = Date.now();
+  snapshotCounter++;
+  const filename = path.join(
+    os.tmpdir(),
+    `heap-${timestamp}-${snapshotCounter}.heapsnapshot`
+  );
+  
+  // writeArrayMode is critical: produces JSON that can be read by external tools
+  const writer = fs.createWriteStream(filename);
+  const gcHandle = v8.getHeapCodeAndSourceMaps();
+  const snapshot = v8.takeHeapSnapshot({
+    executableState: true,     // include source + bytecode
+    trackOperations: false     // skip GC operation traces (noise)
+  });
+  
+  // Stream it — prevents V8 from loading entire snapshot into another JS object
+  const stringify = JSON.stringify(snapshot);
+  // For large snapshots (>500MB), stream chunks:
+  let offset = 0;
+  const chunkSize = 64 * 1024 * 1024; // 64MB
+  
+  while (offset < stringify.length) {
+    const chunk = stringify.slice(offset, offset + chunkSize);
+    writer.write(chunk);
+    offset += chunkSize;
+  }
+  writer.end();
+  
+  return { filename, sizeBytes: fs.statSync(filename).size };
+}
+
+// Expose as a metrics-only endpoint (auth-protected in prod)
+app.get('/internal/debug/heap', async (req, res) => {
+  try {
+    const result = await takeHeapSnapshot();
+    // Force compact before sending — but only if you have room
+    // If already near OOM, skip this and just save to file
+    console.log(`Heap snapshot saved: ${result.filename} (${Math.round(result.sizeBytes / 1024 / 1024)} MB)`);
+    res.json({ snapshotPath: result.filename, sizeBytes: result.sizeBytes });
+  } catch (err) {
+    // If we fail here, the pod is about to die anyway
+    console.error('Failed to take heap snapshot:', err);
+    res.status(503).json({ error: 'OOM during snapshot' });
+  }
+});
+```
+
+### Scheduled Dump Cadence
+
+```bash
+# Cron-like approach using a sidecar or kubernetes cronjob
+# Or embed in a monitoring agent:
+cat <<'SCRIPT' > /usr/local/bin/heap-capture.sh
+#!/bin/bash
+set -euo pipefail
+
+POD_NAME="${1:?Usage: heap-capture.sh <pod-name>}"
+NAMESPACE="${2:-default}"
+STAGING_DIR="/tmp/heap-dumps-$(date +%s)"
+mkdir -p "$STAGING_DIR"
+
+# Step 1: Trigger GC hint so heap reflects stabilized state
+kubectl exec "$POD_NAME" -n "$NAMESPACE" \
+  -- node -e "if(global.gc) global.gc()" 2>/dev/null || true
+
+# Step 2: Take heap snapshot
+kubectl exec "$POD_NAME" -n "$NAMESPACE" \
+  -- sh -c 'kill -SIGUSR2 $(pgrep -f "^node")'
+
+# Step 3: Wait for snapshot to materialize, then copy
+sleep 5
+kubectl cp "$POD_NAME:/app/heap.heapsnap.*" "$STAGING_DIR/" 2>/dev/null || {
+  echo "WARNING: No heap snapshot found after SIGUSR2" >&2
+  # Fallback: try v8 debug protocol
+  POD_IP=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.status.podIP}')
+  curl -sf "http://$POD_IP:9229/v8/startSampling" >/dev/null && sleep 10
+  curl -sf "http://$POD_IP:9229/v8/stopSampling" >"$STAGING_DIR/sampled.bin" || true
+}
+
+echo "Captured snapshots to: $STAGING_DIR"
+ls -lh "$STAGING_DIR"/
+SCRIPT
+chmod +x /usr/local/bin/heap-capture.sh
+```
+
+### Scheduling Pattern (every 6 hours, keep last 8 samples)
+
+```yaml
+# In your application's init container or a sidecar, schedule captures:
+# Using node instead of bash cron for precision under Node control
+const cron = require('node-cron'); // or build your own interval
+
+cron.schedule('0 */6 * * *', async () => {
+  const rotationCount = 8;
+  const snapshots = glob.sync('/tmp/heap-*.heapsnapshot');
+  
+  if (snapshots.length >= rotationCount) {
+    snapshots.sort().slice(0, -rotationCount).forEach(f => fs.unlinkSync(f));
+  }
+  
+  try {
+    const result = takeHeapSnapshot();
+    console.log(`[heap-monitor] snapshot: ${result.filename}`);
+  } catch (err) {
+    console.error('[heap-monitor] snapshot failed:', err.message);
+  }
+}, { scheduled: true, timezone: 'UTC' });
+```
+
+---
+
+## Phase 2: Diff Analysis — Identifying What Grows
+
+### Toolchain Setup
+
+```bash
+# Install heap diff tooling
+npm install -g heapdump inspector-diff lttng
+
+# For Node 20 specifically, use the built-in inspector + Chrome DevTools
+# which now supports heap snapshot diffing natively
+```
+
+### Workflow: Two-Snapshot Diff
+
+```bash
+# 1. Load first snapshot (t=0h) in Chrome DevTools
+chrome chrome://inspect/#devices
+# Click "Load snapshot" → select snap_t0.heapsnapshot
+
+# 2. Load second snapshot (t=6h) in a second tab
+# Click "Load snapshot" → select snap_t6.heapsnapshot
+
+# 3. Switch to the t=0 tab, open Memory panel → Heap snapshot
+# → Right-click any constructor/class → "Comparison" → Select t=6 snapshot
+
+# 4. Review the comparison table — key columns:
+#    Shallow Size: direct memory consumed by objects in this class
+#    Retained Size: what would be freed if all these objects were collected
+#    Delta: difference between the two snapshots
+```
+
+### Automated CLI Diff Script
+
+```bash
+cat <<'DIFFSCRIPT' > /usr/local/bin/diff-heapsnapshots.sh
+#!/bin/bash
+# Requires: npm install -g inspector-diff OR use Chrome DevTools Protocol directly
+set -euo pipefail
+
+SNAP1="$1"
+SNAP2="$2"
+OUTPUT_DIR="$3"
+mkdir -p "$OUTPUT_DIR"
+
+# inspector-diff produces a JSON report of growth per category
+inspector-diff "$SNAP1" "$SNAP2" > "$OUTPUT_DIR/diff-report.json"
+
+# Also generate human-readable summary
+python3 <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+with open(sys.argv[1] if len(sys.argv) > 1 else '$OUTPUT_DIR/diff-report.json') as f:
+    report = json.load(f)
+
+print("=" * 70)
+print("HEAP SNAPSHOT DIFF: {} vs {}".format(Path('$SNAP1').name, Path('$SNAP2').name))
+print("=" * 70)
+
+top_growths = sorted(report.get('differences', []), key=lambda x: x.get('delta_retained_size', 0), reverse=True)[:20]
+
+for i, item in enumerate(top_growths, 1):
+    retained_mb = item.get('delta_retained_size', 0) / 1024 / 1024
+    shallow_mb = item.get('delta_shallow_size', 0) / 1024 / 1024
+    count_delta = item.get('delta_count', 0)
+    constructor = item.get('constructor_name', '<anonymous>')
+    
+    if retained_mb > 5:  # Only show significant deltas
+        print(f"\n[{i}] {constructor}")
+        print(f"    Shallow delta: {shallow_mb:.1f} MB")
+        print(f"    Retained delta: {retained_mb:.1f} MB")
+        print(f"    Instance delta: {count_delta:+,}")
+        
+        retainer_path = item.get('retain_chain', [])
+        if retainer_path:
+            chain_str = ' → '.join(retainer_path[-5:])  # Last 5 frames max
+            print(f"    Retention: ...→ {chain_str}")
+PYEOF
+"$(dirname "$0")/process_diff.py"
+
+echo ""
+echo "Full diff saved to: $OUTPUT_DIR/"
+ls -lh "$OUTPUT_DIR/"
+DIFFSCRIPT
+chmod +x /usr/local/bin/diff-heapsnapshots.sh
+```
+
+```python
+# /usr/local/bin/process_diff.py — parse and format inspector-diff output
+import json
+import sys
+
+def process(inspector_json_path, output_dir):
+    with open(inspector_json_path) as f:
+        data = json.load(f)
+    
+    output_lines = []
+    
+    for category in data.get('categories', []):
+        name = category['name']
+        diff = category.get('diff', {})
+        retained_mb = diff.get('total_retained_change', 0) / 1024 / 1024
+        
+        if abs(retained_mb) < 1:
+            continue
+            
+        output_lines.append(f"\n{'='*60}")
+        output_lines.append(f"Category: {name}")
+        output_lines.append(f"Retained change: {retained_mb:+.1f} MB")
+        output_lines.append(f"Shallow change: {diff.get('total_shallow_change', 0) / 1024 / 1024:+.1f} MB")
+        output_lines.append(f"Object count change: {diff.get('object_count_change', 0):+}")
+        
+        for obj in category.get('growth_leaders', [])[:10]:
+            cls = obj.get('constructorName', '?')
+            inst = obj.get('instanceChange', 0)
+            sz = obj.get('retainedSizeChange', 0) / 1024 / 1024
+            output_lines.append(f"  {cls}: {inst:+,} instances (+{sz:.1f} MB retained)")
+    
+    output_text = '\n'.join(output_lines)
+    
+    with open(f'{output_dir}/analysis.txt', 'w') as f:
+        f.write(output_text)
+    
+    print(output_text)
+
+if __name__ == '__main__':
+    process(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else '.')
+```
+
+### Key Patterns to Hunt For in the Diff
+
+| What to look for | What it means |
+|---|---|
+| **Dominated by closure nodes** | Callbacks capturing scopes are being retained (likely listener leak) |
+| **Buffer objects increasing** | Response bodies or log lines allocated but never released |
+| **String[] in retained sets** | Log messages accumulating |
+| **EventEmitter instances growing** | Registry pattern where emitters accumulate without cleanup |
+| **Function entries in snapshot** | Anonymous closures being registered but unregistered |
+| **WeakMap entries** | Possibly intentional caching — verify keys aren't growing forever |
+
+---
+
+## Phase 3: Confirming the Event Emitter Listener Leak
+
+### Diagnostic Code — Drop into running pod
+
+```bash
+# Inject diagnostic via kubectl exec — run every 12h to trend
+cat <<'INJECT' > /tmp/check-emitter-leak.sh
+#!/bin/bash
+set -euo pipefail
+
+POD_NAME="${1:?usage: $0 <pod>}"
+NAMESPACE="${2:-default}"
+
+cat <<'JSEOF' | kubectl exec -i "$POD_NAME" -n "$NAMESPACE" -- node -e "$(cat)"
+const EventEmitter = require('events');
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+
+// Monkey-patch ALL instances created from here on
+// This is a diagnostic injection — harmless when removed
+const knownEmitterTypes = new Map();
+
+const patchedProto = Object.create(EventEmitter.prototype);
+
+const origOnFn = patchedProto.on;
+patchedProto.on = function(...args) {
+  const type = args[0];
+  const current = this.listenerCount(type);
+  
+  // Track per-type counts across all instances
+  const key = this.constructor.name + ':' + type;
+  if (!knownEmitterTypes.has(key)) {
+    knownEmitterTypes.set(key, 0);
+  }
+  knownEmitterTypes.set(key, knownEmitterTypes.get(key) + 1);
+  
+  return origOnFn.apply(this, args);
+};
+
+setInterval(() => {
+  const leaks = [];
+  for (const [key, count] of knownEmitterTypes) {
+    if (count > 100) {
+      leaks.push({ key, count });
+    }
+  }
+  
+  if (leaks.length > 0) {
+    console.error('[EMITTER-LA][DIAG]', JSON.stringify(leaks.map(l => ({
+      type: l.key,
+      totalRegistered: l.count
+    }))));
+  }
+}, 30000);
+
+console.log('[EMITTER-LA][DIAG] monitoring started');
+JSEOF
+INJECT
+```
+
+### Static Analysis — grep for dangerous patterns
+
+```bash
+# Find ALL places where .on() is called on custom/event emitters
+# (excluding node_modules and standard library usage)
+find src/ -type f \( -name '*.js' -o -name '*.ts' \) ! -path '*/node_modules/*' | \
+  xargs grep -n '\.on\s*(\s*[\'"]' | \
+  grep -ivE '(res\.on|req\.on|stream\.on|pipe\.on|pipeline\.on)' | \
+  tee /tmp/emitter_candidates.txt
+
+# Then check each candidate for matching .off()/.removeListener()/.once():
+while IFS=: read -r file line rest; do
+  context_start=$((line > 5 ? line - 5 : 1))
+  context_end=$((line + 30))
+  echo "=== $file:$line ==="
+  sed -n "${context_start},${context_end}p" "$file" | cat -n
+  echo ""
+done < /tmp/emitter_candidates.txt
+```
+
+### Dynamic Listener Count Monitoring (embed in app)
+
+```javascript
+// src/monitoring/listener-health.js
+// Place in your startup sequence — provides /internal/health/emitters
+const EventEmitter = require('events');
+const { registerMetric } = require('./metrics');
+
+class ListenerHealthTracker {
+  constructor() {
+    this.trackedEmitters = new WeakMap();
+    this.originalOn = EventEmitter.prototype.on;
+    this.originalAddListener = EventEmitter.prototype.addListener;
+    
+    this.wrapAllInstances();
+    this.startPolling();
+  }
+  
+  wrapAllInstances() {
+    // Intercept existing and future EventEmitters
+    const tracker = this;
+    
+    // Patch the constructor so every new instance gets tracked
+    const OriginalEE = EventEmitter;
+    EventEmitter._wrapped = true;
+    
+    // Use a Proxy on the prototype to catch all future .on calls
+    const handler = {
+      apply(target, thisArg, args) {
+        if (!tracker.trackedEmitters.has(thisArg)) {
+          tracker.trackedEmitters.set(thisArg, new Map());
+        }
+        
+        const events = tracker.trackedEmitters.get(thisArg);
+        const eventType = args[0];
+        events.set(eventType, (events.get(eventType) || 0) + 1);
+        
+        return Reflect.apply(target, thisArg, args);
+      }
+    };
+    
+    // We patch the method on instances as they're created
+    // Best approach: override _addListener (internal hook point used by Node)
+    const origAddListener = EventEmitter.prototype._addListener;
+    EventEmitter.prototype._addListener = function(event, listener) {
+      if (!this._listenerCounts) {
+        this._listenerCounts = new Map();
+      }
+      this._listenerCounts.set(event, (this._listenerCounts.get(event) || 0) + 1);
+      return origAddListener.call(this, event, listener);
+    };
+  }
+  
+  startPolling() {
+    setInterval(() => this.drainAndReport(), 60000);
+  }
+  
+  drainAndReport() {
+    const findings = [];
+    
+    for (const [ee, counts] of this.trackedEmitters) {
+      // Skip standard node streams and http modules
+      const eeClass = ee.constructor.name;
+      if (['IncomingMessage', 'OutgoingMessage', 'Socket', 'Readable', 'Writable', 'Duplex'].includes(eeClass)) {
+        continue;
+      }
+      
+      for (const [event, count] of counts) {
+        const actualCount = ee.listenerCount(event);
+        
+        if (actualCount !== count) {
+          // Mismatch — listeners were added externally or not properly tracked
+          findings.push({
+            className: eeClass,
+            event,
+            trackedAdds: count,
+            actualListeners: actualCount,
+            drift: actualCount - count
+          });
+        }
+        
+        if (actualCount > 50) {
+          findings.push({
+            className: eeClass,
+            event,
+            actualListeners: actualCount,
+            warning: 'high_listener_count'
+          });
+        }
+      }
+    }
+    
+    if (findings.length > 0) {
+      console.warn('[LISTENER-LEAK]', JSON.stringify(findings));
+      registerMetric('emitter.leak.indicators', findings.length);
+    }
+  }
+}
+
+module.exports = ListenerHealthTracker;
+```
+
+### Retainer Chain Inspection via Inspector Protocol
+
+```bash
+# Connect to the running Node process remotely (for inspection only — do NOT attach debugger in prod)
+# This uses the inspector protocol, not --inspect which blocks on connection
+
+# Start with sampling profiler instead of attaching
+kubectl exec "$POD_NAME" -n "$NAMESPACE" \
+  -- node -e "
+    const inspector = require('inspector');
+    
+    // Sample memory profiles at low overhead (~1% CPU)
+    inspector.open(0, 'localhost', true); // ephemeral port
+    
+    setTimeout(async () => {
+      // Start sampling allocation tracking
+      const session = new inspector.Session();
+      session.connect();
+      
+      session.post('Profiler.enable');
+      session.post('Profiler.start', { 
+        allocationTracking: true,
+        sampledProfileIntervalMicros: 1000 // 1ms intervals
+      });
+      
+      await new Promise(r => setTimeout(r, 300000)); // 5 min profile
+      
+      session.post('Profiler.stop').then(result => {
+        console.log('Profile saved, duration: 5min');
+        // Write profile to temp location for download
+        require('fs').writeFileSync(
+          '/tmp/profile.ndjson',
+          JSON.stringify(result.profile)
+        );
+      });
+    }, 10000);
+  " 2>&1 &
+```
+
+Once you have the profile, load it in Chrome DevTools:
+1. Open Chrome → `chrome://inspect` → Configuration → Enable remote profiling
+2. Navigate to Performance tab → "Load" → select the `.ndjson` profile
+3. Filter allocations: search `Closure` and `Buffer`
+4. For each cluster, click "Summary" mode → sort by "Retained Size"
+5. Right-click top retained items → "Retainers" → inspect who holds them
+
+---
+
+## Phase 4: Diagnosing Buffer Growth from Response Logging Middleware
+
+### Static Audit — Find the logging middleware
+
+```bash
+# Search for response body capture patterns
+grep -rn -E '(response\.write|res\.write|body-once|raw-body|express-response-logger|response-log|log.response|capture.body|intercept.response)' src/ --include='*.js' --include='*.ts' | \
+  grep -ivE '(node_modules|test|spec|\.d\.)' | \
+  tee /tmp/buffer_suspects.txt
+
+# Also look for Buffer.alloc / Buffer.from usages in non-trusted code paths
+grep -rn 'Buffer\.\(alloc\|from\)' src/ --include='*.js' --include='*.ts' | \
+  grep -ivE '(node_modules|test|spec|encoding|utf|base64|ascii|hex)' | \
+  tee /tmp/buffer_allocations.txt
+```
+
+### Common Bug Patterns to Look For
+
+```javascript
+// ❌ PATTERN 1: Capturing entire response body in middleware
+// Buffer accumulates because res.end() never releases the internal reference
+app.use((req, res, next) => {
+  const originalEnd = res.end.bind(res);
+  const chunks = [];
+  
+  res.write = function(chunk) {
+    chunks.push(Buffer.from(chunk));  // ← NEVER RELEASES
+    return originalWrite.call(this, chunk);
+  };
+  
+  res.end = function(chunk) {
+    if (chunk) chunks.push(Buffer.from(chunk));
+    
+    const responseBody = Buffer.concat(chunks);  // ← One giant buffer grows over time
+    console.log('Response:', responseBody.toString());  // ← Logged but never cleared
+    
+    return originalEnd.apply(this, arguments);
+  };
+  
+  next();
+});
+
+// ❌ PATTERN 2: Storing log entries that include response buffers
+const logStore = [];  // ← Unbounded array
+
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  
+  const origEnd = res.end.bind(res);
+  res.end = function(...args) {
+    const elapsed = Date.now() - startTime;
+    
+    // Bug: pushing response body into an ever-growing array
+    const body = /* captured above */;
+    logStore.push({
+      reqId: req.id,
+      url: req.url,
+      status: res.statusCode,
+      durationMs: elapsed,
+      responseBody: body,  // ← 4KB–2MB per entry, never trimmed
+      timestamp: new Date().toISOString()
+    });
+    
+    return origEnd.apply(this, args);
+  };
+  
+  next();
+});
+
+// ❌ PATTERN 3: Closure capturing large scope
+async function handleRequest(req, res) {
+  const databaseResult = await db.query('SELECT * FROM huge_table');  // ← Large result set
+  
+  req.on('data', (chunk) => {
+    // BUG: callback closes over `databaseResult` — keeps entire DB result alive
+    // even after the request completes, until GC eventually runs
+    processResponse(databaseResult, chunk);
+  });
+  
+  res.send({ processed: true });
+}
+
+// ❌ PATTERN 4: Response logging to stdout without backpressure handling
+const logger = winston.createLogger({
+  transports: [
+    new winston.transports.Stream({
+      stream: process.stdout  // ← If process.stdout is slow/paused, logs buffer internally
+    })
+  ]
+});
+
+app.use((req, res, next) => {
+  const end = res.end.bind(res);
+  res.end = function(...args) {
+    // Logs entire response body synchronously
+    logger.info('RESPONSE', { body: String.fromCharCode(...capturedBody) });
+    return end.apply(this, args);
+  };
+  next();
+});
+```
+
+### Safe Remediation Code
+
+```javascript
+// ✅ FIX 1: Trimmed log store with LRU eviction
+const LOG_MAX_ENTRIES = 5000;
+const LOG_BODY_MAX_LENGTH = 512; // bytes
+
+const logEntries = new CircularBuffer(LOG_MAX_ENTRIES); // implement or use lru-cache
+
+function safeResponseLogger(req, res, next) {
+  const startTime = process.hrtime.bigint();
+  const chunks = [];
+  let totalSize = 0;
+  
+  const originalEnd = res.end.bind(res);
+  const originalWrite = res.write.bind(res);
+  
+  res.write = function(chunk) {
+    // Cap buffer size — drop data if response is too large to log
+    if (totalSize < LOG_BODY_MAX_LENGTH && typeof chunk === 'string') {
+      chunks.push(Buffer.from(chunk, 'utf8'));
+      totalSize += chunk.length;
+    }
+    return originalWrite(chunk);
+  };
+  
+  res.end = function(chunk, ...rest) {
+    if (chunk && totalSize < LOG_BODY_MAX_LENGTH) {
+      chunks.push(Buffer.from(chunk, 'utf8'));
+    }
+    
+    const duration = Number(process.hrtime.bigint() - startTime) / 1e6;
+    
+    // Never log raw binary — serialize safely
+    const bodyPreview = chunks.length > 0
+      ? Buffer.concat(chunks).toString('utf8').slice(0, LOG_BODY_MAX_LENGTH)
+      : null;
+    
+    // Async log write — don't block response delivery
+    queueMicrotask(() => {
+      logger.info('response', {
+        requestId: req.id,
+        method: req.method,
+        url: req.originalUrl,
+        statusCode: res.statusCode,
+        durationMs: Math.round(duration * 100) / 100,
+        bodyPreview: truncate(bodyPreview, LOG_BODY_MAX_LENGTH)
+        // NEVER include full responseBody unless debugging a specific issue
+      });
+    });
+    
+    // Clear our references immediately
+    chunks.length = 0;
+    totalSize = 0;
+    
+    return originalEnd(chunk, ...rest);
+  };
+  
+  next();
+}
+
+function truncate(str, maxLen) {
+  if (!str) return str;
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen) + `... (${str.length} chars)`;
+}
+
+module.exports = safeResponseLogger;
+```
+
+```javascript
+// ✅ FIX 2: Bounded closure scope — avoid capturing large data in callbacks
+async function handleRequest(req, res) {
+  // BAD: Don't pass large results into per-request callbacks
+  // const dbResult = await expensiveQuery();
+  // req.on('data', chunk => process(dbResult, chunk)); // dbResult lives for lifetime of req
+  
+  // GOOD: Access data fresh, or pass only what's needed
+  const neededFields = ['id', 'status']; // narrow selection
+  const dbResult = await db.query('SELECT id, status FROM orders WHERE ...');
+  
+  // Store only small identifiers in closure, fetch details on-demand
+  const ids = dbResult.map(row => row.id);
+  
+  let accumulatedPayload = '';
+  
+  req.on('data', (chunk) => {
+    accumulatedPayload += chunk;
+  });
+  
+  req.on('end', async () => {
+    // Process with full results available here, not in the closure
+    const result = await processOrder(ids, accumulatedPayload);
+    res.json(result);
+  });
+}
+```
+
+```javascript
+// ✅ FIX 3: Guard against unbounded arrays / Maps
+const MAX_LOG_SIZE = 10_000; // entries
+const RESPONSE_LOGS = [];
+
+function addResponseLog(entry) {
+  if (RESPONSE_LOGS.length >= MAX_LOG_SIZE) {
+    // Ring buffer: overwrite oldest
+    const oldestIdx = 0;
+    RESPONSE_LOGS.splice(oldestIdx, 1);
+    RESPONSE_LOGS.push(entry);
+  } else {
+    RESPONSE_LOGS.push(entry);
+  }
+}
+
+// Or better: use external storage
+const Redis = require('ioredis');
+const redis = new Redis();
+
+async function persistResponseLog(entry) {
+  // Stream to Redis/Loki/Splunk, never hold in process memory
+  await redis.lpush('response_logs', JSON.stringify(entry));
+  await redis.ltrim('response_logs', 0, 9999); // bounded list
+}
+```
+
+---
+
+## Phase 5: Root Cause Summary & Likeliest Scenarios
+
+### Most Likely Root Cause (based on evidence: closures + event emitter registry + Buffers)
+
+```
+Primary suspect: EventEmitter listener leak combined with response-body buffering
+
+Chain of causation:
+
+1. A middleware or utility creates EventEmitters per-request (or reuses a shared one)
+   └─> Each request registers listeners (.on()) for lifecycle events
+   └─> Listeners are closures that capture `req`, `res`, `chunks`, `dbResult`
+   
+2. The same middleware buffers response bodies for logging
+   └─> Resolves to Buffer.alloc()/Buffer.from() allocations
+   
+3. Listeners are never removed (.off() / removeListener() absent)
+   └─> EventEmitter.registry grows linearly with request count
+   └─> Each closure retains its captured scope (full request/response/body)
+   
+4. After ~48 hours at typical API traffic:
+   └─> 10K-100K leaked listeners
+   └─> Each retaining 10KB–500KB of request/response context
+   └─> Total retained: 100GB–50GB → exceeds container memory limit → OOMKilled
+```
+
+### Code Location Hypotheses to Investigate First
+
+```javascript
+// Priority 1: Check these common culprits
+// ───────────────────────────────────────
+
+// CULPRIT A: Request-scoped EventEmitter that isn't cleaned up
+// Common in auth middleware, rate limiters, correlation-id trackers
+class RequestContext {
+  constructor(req) {
+    this.emitter = new EventEmitter();
+    this.req = req;          // ← closure captures request
+    this.buffer = [];        // ← closure captures response buffer
+    
+    // Register handlers that are NEVER removed
+    this.emitter.on('request:start', () => { ... });
+    this.emitter.on('response:end', (data) => {
+      this.buffer.push(data);  // ← buffer never cleared
+      this.logResponse(data);
+    });
+    this.emitter.on('error', (err) => {
+      this.errorBuffer.push(err);  // ← error buffer also grows
+    });
+    // NO destructor. NO cleanup. NO .removeAllListeners()
+  }
+}
+
+// CULPRIT B: Pub/Sub channel per request without cleanup
+const pubsub = new EventEmitter();
+
+app.use(async (req, res, next) => {
+  req.id = crypto.randomUUID();
+  
+  // Every request adds a listener that's never removed
+  pubsub.on(`request:${req.id}`, (payload) => {
+    processWithDb(payload);  // ← closure captures DB client, query results
+  });
+  
+  pubsub.on(`response:${req.id}`, (body) => {
+    logEntry.push({ body, id: req.id });  // ← unbounded array
+  });
+  
+  // Missing: pubsub.off(...) after response completes
+  next();
+});
+
+// CULPRIT C: Response compression/gzip middleware with unbounded buffer pooling
+// Often seen with compress, gzip-sync, or custom streaming transforms
+const decompressStream = require('zlib').createGunzip();
+
+app.use((req, res, next) => {
+  // Reusing streams across requests WITHOUT destroying them
+  decompressStream._flush = function(callback) {
+    this.push(null);
+    callback();
+  };
+  // Bug: stream._readableState.buffer accumulates; stream.destroy() not called
+  next();
+});
+
+// CULPRIT D: Express-rate-limit or similar packages with internal store that grows
+const rateLimit = require('express-rate-limit');
+
+rateLimit({
+  store: new Map(),           // ← Internal map grows with each unique IP/window
+  // By default no expiration configured
+  windowMs: 15 * 60 * 1000,  // 15 min window
+  // BUT no cleanup of expired entries → Map grows indefinitely
+});
+```
+
+### Immediate Actions (Before Full Fix)
+
+```yaml
+# Quick mitigation — increase memory AND set hard limits
+# In deployment YAML:
+resources:
+  requests:
+    memory: "1Gi"       # Start higher to buy time
+    cpu: "500m"
+  limits:
+    memory: "4Gi"       # Hard cap to prevent node-wide impact
+    cpu: "1000m"
+    # CRITICAL: Set below OOM threshold
+    # 4Gi limit means kernel kills at ~3.8Gi (reserved for kernel)
+```
+
+```javascript
+// Emergency circuit breaker — detect and reset leaking emitters
+// Drop this in as a temporary measure
+const EMITTER_THRESHOLD = 1000; // listeners per emitter type
+
+function monitorAndResetLeakingEmitters() {
+  // Walk all active EventEmitter instances via WeakRef iteration
+  // Note: Node doesn't expose an iterator over live instances,
+  // so we instrument at construction time
+  
+  if (global.__trackedEmitters) {
+    for (const [emitter, counts] of global.__trackedEmitters) {
+      for (const [event, count] of counts) {
+        if (count > EMITTER_THRESHOLD) {
+          console.error(`[EMERGENCY-CIRCUIT-BREAKER] Resetting ${event} listeners on ${emitter.constructor.name}`);
+          emitter.removeAllListeners(event);
+          counts.set(event, 0);
+          // This resets the leak but may cause missed events
+          // Good enough to prevent OOM until proper fix deploys
+        }
+      }
+    }
+  }
+}
+
+setInterval(monitorAndResetLeakingEmitters, 60000);
+```
+
+### Validation Steps After Fix
+
+```bash
+# Post-deploy validation: verify RSS stabilizes
+# Run every hour for 24 hours post-deploy
+cat <<'VALIDATE' > /tmp/validate-fix.sh
+#!/bin/bash
+POD="$1"
+NS="$2"
+
+echo "[$(date)] Checking pod memory..."
+MEM_KB=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.containerStatuses[0].memoryWorkingSet}' 2>/dev/null)
+if [ -n "$MEM_KB" ]; then
+  MEM_MB=$((MEM_KB / 1024))
+  echo "RSS: ${MEM_MB}MB"
+else
+  echo "Unable to read memory stats"
+fi
+
+# Also check for emitter warnings
+LOGS=$(kubectl logs "$POD" -n "$NS" --tail=100 2>/dev/null)
+if echo "$LOGS" | grep -q "LISTENER-LEAK"; then
+  echo "WARN: Still seeing listener leak indicators!"
+  echo "$LOGS" | grep "LISTENER-LEAK"
+fi
+
+if echo "$LOGS" | grep -q "EMERGENCY-CIRCUIT-BREAKER"; then
+  echo "CRIT: Circuit breaker triggered — fix incomplete!"
+fi
+VALIDATE
+chmod +x /tmp/validate-fix.sh
+```
+
+---
+
+## Complete Checklist
+
+| Step | Command / Action | Success Criterion |
+|------|-----------------|-------------------|
+| 1. Deploy emergency circuit breaker | Add `monitorAndResetLeakingEmitters` to running pod | OOM stops recurring within 1 hour |
+| 2. Capture baseline heap snapshot | `kill -SIGUSR2 <pid>` on running pod | `.heapsnapshot` file copied to local machine |
+| 3. Identify top-retained categories in Chrome DevTools | Sort retained size → filter `Closure`, `Buffer` | Top 3 classes identified |
+| 4. Trace retainer chains | Right-click → Retainers → follow graph | Confirmed: EventEmitter → Closure → RequestScope |
+| 5. Correlate with logs | Cross-reference peak RSS times with request patterns | High-request-period matches growth spikes |
+| 6. Apply listener leak fix | Add `.removeAllListeners()` in response completion handler | `/internal/health/emitters` shows <10 listeners per emitter |
+| 7. Apply response logging fix | Implement bounded buffer + truncated body preview | No Buffer growth in next 6-hour snapshot diff |
+| 8. Verify stabilization | Run `validate-fix.sh` hourly for 48 hours | RSS flatlines at ~500MB (down from 4GB climb) |
+| 9. Add regression test | Jest/Mocha test verifying emitters are cleaned up | Test fails if any emitter has >0 listeners after request |

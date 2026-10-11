@@ -1,0 +1,350 @@
+[exit=0 latency=30.48s]
+I need to deliver the actual analysis instead of describing what I'd do. Here's the complete diagnosis plan:
+
+---
+
+## Step-by-Step Diagnosis Plan: Node.js 20 API Memory Leak
+
+### Phase 1: Capture Heap Snapshots in Production Safely
+
+**Don't call `process.memoryUsage()` and hope.** You need structured snapshots you can diff.
+
+```bash
+# In kubernetes, exec into the pod (or use kubectl debug)
+kubectl exec -it <pod> -- node -e "
+  const fs = require('fs');
+  process.stdout.write(JSON.stringify(process.memoryUsage()));
+"
+```
+
+For heap snapshots, use the `--heapsnapshot-signal` flag at **container startup** so you never need to restart:
+
+```yaml
+# Deployment container spec
+args: ["node", "--heapsnapshot-signal=SIGUSR1", "server.js"]
+```
+
+Then capture without restart:
+
+```bash
+# Trigger snapshot — gets written to /proc/<pid>/fd/1 or configured output dir
+kubectl exec -it <pod> -- kill -SIGUSR1 $(cat /proc/self/status | grep Pid | awk '{print $2}')
+```
+
+**Safer approach for production:** Install `heapdump` as a health-check endpoint rather than signal-based:
+
+```js
+// Add this only to a non-public internal route or use kubectl exec
+const { writeSnapshot } = require('./heap-utils'); // see below
+app.get('/internal/debug/heap', async (req, res) => {
+  const path = `/tmp/heap-${Date.now()}.heapsnapshot`;
+  await writeSnapshot(path);
+  res.json({ path });
+});
+```
+
+**Critical:** Copy the snapshot OUT of the pod before deleting it. A `.heapsnapshot` file is ~500MB for a 4GB heap. Write to an ephemeral volume, then `kubectl cp`.
+
+```bash
+kubectl cp <pod>:/tmp/heap-*.heapsnapshot ./snapshot-before.heapsnapshot
+```
+
+Wait 6 hours (or trigger manually twice), capture again, diff both locally using Chrome DevTools or `clinic.js heapprof`:
+
+```bash
+npx clinic heapprof --profile snapshot-before.heapsnapshot snapshot-after.heapsnapshot
+```
+
+This gives you a DOM-style retainer tree you can inspect visually.
+
+### Phase 2: Identify the Retainer Chain for Closures in the Event Emitter Registry
+
+**Hypothesis:** Listeners are being added but never removed, retaining references to their enclosing scope (closures), which retain references to request objects, Buffer allocations, etc.
+
+**Concrete steps:**
+
+1. **Identify the emitter and listener count over time:**
+
+```js
+const EventEmitter = require('events');
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+const origOnce = EventEmitter.prototype.once;
+
+const listenerRegistry = new WeakMap();
+
+EventEmitter.prototype.on = function(...args) {
+  const count = this.listenerCount(args[0]);
+  const entry = new Error('stack trace for registration').stack;
+  console.error(`[listener-add] ${this.constructor.name} "${String(args[0])}" count=${count}`);
+  if (!listenerRegistry.has(this)) listenerRegistry.set(this, []);
+  listenerRegistry.get(this).push(entry);
+  return origOn.apply(this, args);
+};
+
+// Same for addListener and once...
+```
+
+Deploy this instrumentation and tail logs. If you see unbounded growth in listener counts on any specific event name — that's your leak source. The stack trace tells you exactly which code path adds the listener.
+
+2. **In the heap snapshot, search for retained closures:**
+
+Open `snapshot-after.heapsnapshot` in Chrome DevTools → Memory tab → "Load..." → select the file → switch to "Comparison" view → load the earlier snapshot. Filter by:
+- **"detailed summary"**: sort by "Retained Size" descending
+- Search for `"EventEmitter"` or your custom emitter class
+- Click into it → expand the "Retainers" tree
+- Follow chains back through closure scopes to find what external objects they hold
+
+Key question: **Are request/response objects, Buffers, or config objects visible in the closure's captured scope?** That confirms the listener retains those objects, preventing GC.
+
+3. **Confirm with allocation tracking (lower overhead than snapshots):**
+
+```js
+// Drop this into the service temporarily
+if (process.env.ALLOCATION_TRACKING) {
+  const weakmap = global.__leakTrack = new Map();
+  const track = (tag) => {
+    const err = new Error('allocation site');
+    err.tag = tag;
+    const id = Math.random().toString(36).slice(2);
+    weakmap.set(id, err.stack.split('\n').slice(1, 4).join(''));
+    setImmediate(() => weakmap.delete(id)); // auto-expire
+    return id; // caller must store this for cleanup
+  };
+  global.__trackRequest = () => track('request-object');
+  global.__trackResponse = () => track('response-object');
+  global.__trackBuffer = () => track('buffer');
+}
+```
+
+Tag objects at creation points. Over time, if tags accumulate without decay, you've confirmed a leak at that allocation site.
+
+### Phase 3: Confirm Whether the Emitter Registry Leaks Listeners
+
+**Test: Force GC and measure delta.** This is critical because V8 defers GC:
+
+```bash
+# Before forcing GC
+kubectl exec <pod> -- node -e "
+  const m = require('vm').runInNewContext('process.memoryUsage()', { process });
+  console.log('before-gc:', JSON.stringify(m));
+  // requires --expose-gc flag
+"
+
+# After
+kubectl exec <pod> -- node -e "
+  global.gc && global.gc();
+  const m = require('vm').runInNewContext('process.memoryUsage()', { process });
+  console.log('after-gc:', JSON.stringify(m));
+"
+```
+
+If RSS drops significantly after forced GC, the objects are still reachable but could be freed — **confirming a retention issue**. If RSS barely changes, you have an active allocation stream outpacing GC.
+
+**Programmatic listener leak detector (safe for production):**
+
+```js
+function monitorEmitters(emitter, label) {
+  const originalEmit = emitter.emit.bind(emitter);
+  emitter.emit = function(event, ...args) {
+    const count = this.listenerCount(event);
+    if (count > 100) {
+      console.error(`[listener-leak] ${label} "${String(event)}" has ${count} listeners`);
+    }
+    return originalEmit(event, ...args);
+  };
+}
+```
+
+**Audit all `.on()`/`.addListener()` calls in your codebase for missing `.removeListener()` or `.off()`.** Common patterns that cause leaks:
+
+| Pattern | Why It Leaks | Fix |
+|---------|-------------|-----|
+| `.on('event', async () => { ... })` | Async callbacks retain their outer scope via `catch` handlers | Use `.once()` where appropriate; wrap in try/catch |
+| Inline arrow functions as listeners | No reference to pass to `.off()`, so removal is impossible | Extract to named function or use `Symbol.for('cleanup')` tagging |
+| Class methods added as listeners without teardown | Instance stays alive, listener stays bound | Implement `[Symbol.dispose]` or `destroy()` method calling `.off()` |
+| Event emitted on every request to a shared emitter | Listeners accumulate per-request | Use `emitter.once()` or emit to a scoped emitter |
+| `middleware -> emitter.on(...)` pattern | Middleware creates new listener per request | Move listener registration to module init, not per-request |
+
+### Phase 4: Diagnose the Buffer Growth from Response-Logging Middleware
+
+**Hypothesis:** The middleware buffers response bodies (full request + response payloads) into memory for logging, never truncating or releasing them.
+
+**Reproduce the exact accumulation pattern:**
+
+```js
+// Instrument the middleware to log buffer sizes per request
+const express = require('express');
+
+function leakingLogger(req, res, next) {
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  
+  let responseBody = Buffer.alloc(0);
+  const requestId = req.id || Math.random().toString(36).slice(2);
+  
+  res.write = (...args) => {
+    const chunk = Buffer.isBuffer(args[0]) ? args[0] : Buffer.from(args[0], 'utf8');
+    responseBody = Buffer.concat([responseBody, chunk]);
+    // BUG: responseBody grows indefinitely across requests
+    return originalWrite(...args);
+  };
+  
+  res.end = (...args) => {
+    if (args[0]) {
+      const chunk = Buffer.isBuffer(args[0]) ? args[0] : Buffer.from(args[0], 'utf8');
+      responseBody = Buffer.concat([responseBody, chunk]);
+    }
+    
+    // BUG: storing full body in a global/log array forever
+    global.__logBuffers ||= [];
+    global.__logBuffers.push({
+      id: requestId,
+      url: req.url,
+      size: responseBody.length,
+      // BAD: stores entire body content, not just metadata
+      body: responseBody.toString('utf8'),
+      timestamp: Date.now()
+    });
+    
+    originalEnd(...args);
+  };
+  
+  next();
+}
+```
+
+**Key questions to answer:**
+
+1. **Is there a global array/map accumulating logged entries?** Check your logging middleware for any unbounded collection. Look for patterns like:
+   ```js
+   global.responseLogs.push(logEntry);  // ← leak
+   requestLogCache.set(url, responseData); // ← no eviction
+   ```
+
+2. **Does the response body get truncated?** Check `res.maxResponseSize` or similar limits:
+   ```js
+   // Fix: limit response body capture to first N bytes
+   const MAX_LOG_BODY = 2048;
+   res.write = (...args) => {
+     const chunk = Buffer.isBuffer(args[0]) ? args[0] : Buffer.from(args[0], 'utf8');
+     if (responseBody.length < MAX_LOG_BODY) {
+       responseBody = Buffer.concat([responseBody, chunk]);
+     }
+     return originalWrite(...args);
+   };
+   ```
+
+3. **Are you using a circular reference between the request object, response object, and log entry?** This prevents even mark-and-sweep GC from reclaiming the objects.
+
+### Phase 5: Likely Root Causes & Fixes (Prioritized by Probability)
+
+Based on the evidence (closures in event-emitter registry + Buffer growth from response-logging), here's the ranked probability:
+
+**Root Cause #1 (most likely): Per-request event listener registration on a shared emitter**
+
+```js
+// BAD — runs on every request, creates a new listener each time
+app.use((req, res, next) => {
+  appEmitter.on('request-complete', (data) => {
+    logger.info(data); // captures `req` and `res` in closure
+  });
+  next();
+});
+
+// FIX — register once at startup, not per-request
+const handler = (data) => logger.info(data);
+appEmitter.on('request-complete', handler); // registered once
+
+// Or better, emit directly without a persistent listener
+app.use(async (req, res, next) => {
+  const end = res.end.bind(res);
+  res.end = (...args) => {
+    appEmitter.emit('request-complete', { url: req.url, status: res.statusCode });
+    end(...args);
+  };
+  next();
+});
+```
+
+**Root Cause #2: Response-body buffering with no cap or eviction**
+
+```js
+// BAD — unbounded buffer accumulation
+global.__responseCache ||= new Map();
+global.__responseCache.set(reqId, { body: fullResponseBody });
+
+// FIX — bounded cache with LRU eviction
+import LRUCache from 'lru-cache';
+const responseCache = new LRUCache({
+  max: 5000,          // max entries
+  maxSize: 50 * 1024 * 1024, // 50MB total
+  sizeCalculation: (entry) => entry.body.length,
+  allowStale: false
+});
+```
+
+**Root Cause #3: Async error handlers retaining request context**
+
+```js
+// BAD — async handler + unhandled rejection retains whole frame
+emitter.on('heavy-task', async (ctx) => {
+  try {
+    await heavyOperation(ctx.request); // ctx includes req/res/buffers
+  } catch (err) {
+    // if this throws, the error object retains ctx
+    sendError(err); // may also attach ctx to error.meta
+  }
+});
+
+// FIX — detach sensitive data before async boundaries
+emitter.on('heavy-task', async ({ payload, userId }) => {
+  // Only pass what the async function needs, not the entire context object
+});
+```
+
+### Phase 6: Validation Checklist
+
+After applying fixes, validate with this runbook:
+
+```bash
+# 1. Set OOM score adjustment higher for testing (so pod dies faster in staging)
+# deployment.yaml:
+# securityContext:
+#   seccompProfile:
+#     type: RuntimeDefault
+
+# 2. Run with explicit GC intervals to simulate aggressive GC
+node --max-old-space-size=512 --gc-interval=1000 server.js
+
+# 3. Hit the service with realistic load for 30 minutes
+hey -z 30m -c 50 http://service:3000/api/heavy-endpoint
+
+# 4. Measure delta:
+kubectl exec <pod> -- node -e "
+  global.gc();
+  const m = process.memoryUsage();
+  console.log(JSON.stringify({ rss: m.rss, heapTotal: m.heapTotal, heapUsed: m.heapUsed, external: m.external }));
+"
+
+# 5. Compare against baseline: RSS should stay within ±50MB of the 300MB baseline
+```
+
+### Emergency Mitigation (If You Can't Fix Immediately)
+
+```yaml
+# Kubernetes pod disruption budget + automatic restarts
+resources:
+  limits:
+    memory: "2Gi"   # lower than current 4GB trigger point
+  requests:
+    memory: "512Mi"
+livenessProbe:
+  httpGet:
+    path: /health
+  initialDelaySeconds: 30
+  periodSeconds: 10
+# K8s will OOM-kill the container periodically, trading availability for stability
+```
+
+**Note:** This is a bandage, not a fix. The heap snapshots + listener audit in Phases 1-3 will tell you exactly which lines to change. Start by finding every `.on()` call in middleware or route handlers — that's almost always the source when closures in an emitter registry grow unboundedly.

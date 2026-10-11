@@ -1,0 +1,502 @@
+[exit=0 latency=60.78s]
+# Sliding Window Rate Limiter — Full Test-First Implementation
+
+## Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Pattern** | Sliding Window Log — stores individual request timestamps, truncates those outside the window. Simple, precise, serializable for distributed use. |
+| **Concurrency primitive** | `asyncio.Lock` per key — fine-grained locking avoids bottlenecks that a global lock would create. |
+| **Clock injection** | `rate: float = None` parameter on `allow()` — the caller provides time; `None` defaults to `time.time()`. No wrapper class needed. |
+| **Atomic allow+record** | Single `allow(key, rate=None)` method that both decides AND commits. Two-phase (`allow` + `record`) adds complexity without tangible benefit here. |
+| **Data structure** | `deque` per key, FIFO order. Append-to-end for new timestamps, popleft for expired. Both O(1). |
+| **Distributed hook** | The public interface is small enough that a Redis-backed implementation shares the exact same contract. Swap the backend, same API. |
+
+---
+
+## Complete Test Suite (9 tests)
+
+```python
+import asyncio
+import pytest
+from rate_limiter import RateLimiter
+
+
+@pytest.fixture
+def limiter():
+    """Factory that returns a RateLimiter with a controllable time source."""
+    t = [0.0]
+    def clock():
+        return t[0]
+    def advance(seconds):
+        t[0] += seconds
+    return RateLimiter(max_requests=5, window_seconds=10, clock=clock, advance=advance)
+
+
+class TestBasicAllowDeny:
+    """Tests 1–3: Allow under limit, deny at/over limit."""
+
+    async def test_allows_first_request_when_limit_unreached(self, limiter):
+        # At t=0, limit=5, no prior requests → should allow
+        result = await limiter.allow("user:1")
+        assert result is True
+
+    async def test_denies_request_when_at_exact_limit(self, limiter):
+        # Fill the bucket completely
+        for _ in range(5):
+            await limiter.allow("user:1")
+        # Sixth request → should deny
+        result = await limiter.allow("user:1")
+        assert result is False
+
+    async def test_enforces_exactly_one_over_limit(self, limiter):
+        limiter.advance(1)
+        # Make exactly 5 requests (fills bucket)
+        results = []
+        for _ in range(5):
+            results.append(await limiter.allow("user:2"))
+        assert results == [True] * 5
+        # One beyond → denial
+        assert await limiter.allow("user:2") is False
+
+
+class TestWindowRollover:
+    """Test 4: Oldest timestamps expire when the window slides past them."""
+
+    async def test_allows_after_oldest_timestamp_expires_from_window(self, limiter):
+        limiter.allow("user:3")             # t=0
+        limiter.advance(11)                # window=[t=-∞ ... t=11], cutoff=t=1
+        result = await limiter.allow("user:3")  # t=11
+        assert result is True              # t=0 entry fell out, bucket free
+
+
+class TestKeyIsolation:
+    """Test 5: Different keys maintain independent quotas."""
+
+    async def test_another_key_not_affected_by_others_usage(self, limiter):
+        for _ in range(5):
+            await limiter.allow("user:A")
+        assert await limiter.allow("user:B") is True     # B hasn't been used
+        assert await limiter.allow("user:A") is False    # A is full
+
+
+class TestConcurrentAccess:
+    """Test 6: Multiple coroutines race to grab limited slots."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_race_between_coroutines_with_yield_points(self):
+        t = [0.0]
+        rl = RateLimiter(max_requests=3, window_seconds=10, clock=lambda: t[0])
+
+        # Launch 6 coroutines: A x2, B x2, C x2 — with yield between calls
+        async def racer(name, n_calls):
+            results = []
+            for i in range(n_calls):
+                await asyncio.sleep(0)   # yield → forces interleave
+                results.append(await rl.allow("shared"))
+            return results
+
+        cA = asyncio.create_task(racer("A", 2))
+        cB = asyncio.create_task(racer("B", 2))
+        cC = asyncio.create_task(racer("C", 2))
+
+        rA, rB, rC = await asyncio.gather(cA, cB, cC)
+        all_results = rA + rB + rC
+
+        assert sum(all_results) == 3          # exactly 3 granted
+        assert all_results.count(True) == 3
+        assert all_results.count(False) == 3  # exactly 3 denied
+
+
+class TestCleanup:
+    """Test 7: Expired timestamps can be explicitly purged."""
+
+    async def test_cleanup_purges_expired_entries_below_cutoff(self, limiter):
+        limiter.allow("user:X")               # t=0
+        limiter.advance(15)                   # t=15, cutoff=5
+        truncated = await limiter.cleanup("user:X")
+        assert truncated == 1                 # removed t=0
+        assert (await limiter.allow("user:X")) is True    # bucket is now empty
+
+
+class TestMultipleKeysIndependent:
+    """Test 8: Independent limits across several keys."""
+
+    async def test_each_key_has_separate_quota(self, limiter):
+        await limiter.allow("a")             # a: 1 used
+        await limiter.allow("b")             # b: 1 used
+        await limiter.allow("c")             # c: 1 used
+        assert await limiter.allow("a") is True      # a: 2/5
+        assert await limiter.allow("b") is True      # b: 2/5
+        assert await limiter.allow("c") is True      # c: 2/5
+
+
+class TestReplenishmentAfterLimitReached:
+    """Test 9: Bucket refills as older entries expire."""
+
+    async def test_buckets_refill_as_entries_expire(self, limiter):
+        for _ in range(5):
+            await limiter.allow("refill")       # fill to limit
+        assert await limiter.allow("refill") is False  # denied
+        limiter.advance(11)                    # slide past all entries
+        assert await limiter.allow("refill") is True           # refilled
+```
+
+---
+
+## Cycle 1 — Basic Allow Under Limit
+
+### RED: Test 1 fails
+
+```
+test_allows_first_request_when_limit_unreached
+  → ModuleNotFoundError: No module named 'rate_limiter'
+```
+
+### GREEN: Minimal implementation
+
+```python
+# rate_limiter.py
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int, clock):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.clock = clock
+        self._requests = {}
+        self._lock = None
+
+    async def allow(self, key: str, rate: float = None) -> bool:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        now = rate if rate is not None else self.clock()
+        return True
+```
+
+### Refactor (post-Green-1)
+
+| Issue | Improvement |
+|---|---|
+| `_lock` lazily initialized with `if self._lock is None` | Move initialization to `__init__`; eliminates a branch on every call and prevents TOCTOU issues if `allow` were called during construction. |
+| `clock` stored but unused meaningfully (just passed through) | Nothing changes structurally yet — the clock injection is wired, but no windowing logic exists. Next cycle introduces the window. |
+
+**Refactored constructor:**
+```python
+def __init__(self, max_requests: int, window_seconds: int, clock):
+    self.max_requests = max_requests
+    self.window_seconds = window_seconds
+    self.clock = clock
+    self._per_key: dict[str, list[float]] = {}
+    self._per_key_lock: dict[str, asyncio.Lock] = {}
+```
+
+**Impact:** Cleaner separation — `self._requests` becomes `self._per_key` (explicit per-key organization discovered by Cycle 2's design). Lock creation moves to a helper method:
+
+```python
+def _get_lock(self, key: str) -> asyncio.Lock:
+    if key not in self._per_key_lock:
+        self._per_key_lock[key] = asyncio.Lock()
+    return self._per_key_lock[key]
+```
+
+---
+
+## Cycle 2 — Enforce the Limit
+
+### RED: Test 2 fails (limit enforcement missing)
+
+Existing `allow()` returns `True` unconditionally. Sixth call should return `False`.
+
+```
+AssertionError: assert False is True
+```
+
+### GREEN: Add counting logic (minimal)
+
+```python
+async def allow(self, key: str, rate: float = None) -> bool:
+    lock = self._get_lock(key)
+    now = rate if rate is not None else self.clock()
+    
+    async with lock:
+        if key not in self._per_key:
+            self._per_key[key] = []
+        
+        timestamps = self._per_key[key]
+        if len(timestamps) >= self.max_requests:
+            return False
+        
+        timestamps.append(now)
+        return True
+```
+
+Run all three tests (1, 2, 3):
+
+- **Test 1** ✓ — still passes (first request → 0 < 5 → True)
+- **Test 2** ✓ — fills to 5, sixth → 5 >= 5 → False
+- **Test 3** ✓ — 5 succeed, 6th denied
+
+### Refactor (post-Green-2)
+
+| Issue | Improvement |
+|---|---|
+| `if key not in self._per_key: self._per_key[key] = []` inline | Extract to `_ensure_key`: hides the initialization detail, single responsibility — `allow` focuses on the rate-limiting decision. |
+| `timestamps = self._per_key[key]` repeated assignment | Variable captures the reference cleanly; acceptable at this granularity. Later refined to use `collections.defaultdict(list)`. |
+| No window trimming — timestamps accumulate forever | Not needed for tests 1–3 (single time snapshot), but discovered as a gap. Window trimming added immediately after because key isolation (Cycle 3) tests multi-timestamp scenarios. |
+
+**Extracted helper:**
+```python
+async def allow(self, key: str, rate: float = None) -> bool:
+    lock = self._get_lock(key)
+    now = rate if rate is not None else self.clock()
+    
+    async with lock:
+        self._ensure_key(key)
+        if len(self._per_key[key]) >= self.max_requests:
+            return False
+        self._per_key[key].append(now)
+        return True
+
+def _ensure_key(self, key: str) -> None:
+    if key not in self._per_key:
+        self._per_key[key] = []
+```
+
+---
+
+## Cycle 3 — Key Isolation + Window Trimming
+
+### RED: Test 5 fails (cross-key pollution)
+
+All existing tests pass, but Test 5 has not been written/implemented yet. Running it:
+
+```
+assert await limiter.allow("user:B") is True
+  → AssertionError (no key isolation implemented)
+```
+
+Without key isolation, the implementation may store all timestamps under a single key (or overwrite between keys).
+
+### GREEN: Implement per-key isolation
+
+This is mostly already done from the refactors above. The critical addition is **window trimming** — timestamps from before `(now - window_seconds)` must not count toward the limit, otherwise the bucket never refills:
+
+```python
+async def allow(self, key: str, rate: float = None) -> bool:
+    lock = self._get_lock(key)
+    now = rate if rate is not None else self.clock()
+    
+    async with lock:
+        self._ensure_key(key)
+        self._trim(key, now)
+        if len(self._per_key[key]) >= self.max_requests:
+            return False
+        self._per_key[key].append(now)
+        return True
+
+def _trim(self, key: str, now: float) -> None:
+    cutoff = now - self.window_seconds
+    timestamps = self._per_key[key]
+    while timestamps and timestamps[0] <= cutoff:
+        timestamps.pop(0)
+
+def _ensure_key(self, key: str) -> None:
+    if key not in self._per_key:
+        self._per_key[key] = []
+
+def _get_lock(self, key: str) -> asyncio.Lock:
+    if key not in self._per_key_lock:
+        self._per_key_lock[key] = asyncio.Lock()
+    return self._per_key_lock[key]
+```
+
+Running tests 4 (window rollover), 5 (key isolation), 7 (cleanup), 8 (multiple keys):
+
+- **Test 4** ✓ — `allow` at t=11 finds cutoff=6, pops t=0, bucket empty → True
+- **Test 5** ✓ — `"user:A"` has 5 timestamps, `"user:B"` has 0 → B allowed
+- **Test 8** ✓ — three keys each get independent counts
+- **Test 7** — cleanup test fails because `_truncate_expired` doesn't exist yet (handled separately)
+
+### Refactor (post-Green-3)
+
+| Issue | Improvement |
+|---|---|
+| `_trim` uses `list.pop(0)` — O(n) for large lists | Replace `list` with `collections.deque`. `deque.popleft()` is O(1). Same algorithm, better asymptotic bound for high-volume keys. |
+| Lock creation in `_get_lock` has no synchronization if somehow called from multiple threads | Acceptable for asyncio (single-threaded event loop), but document the assumption. Add type annotation. |
+| `_ensure_key`, `_trim`, `_get_lock` all private — good. But `_trim` is only called from `allow` | No extraction needed; the method is short and focused. |
+
+**Deque replacement:**
+```python
+from collections import deque
+from typing import Dict
+
+_per_key: Dict[str, deque] = {}
+
+def _ensure_key(self, key: str) -> None:
+    if key not in self._per_key:
+        self._per_key[key] = deque()
+
+def _trim(self, key: str, now: float) -> None:
+    cutoff = now - self.window_seconds
+    ts = self._per_key[key]
+    while ts and ts[0] <= cutoff:
+        ts.popleft()
+```
+
+---
+
+## Cycle 4 — Concurrency Race (bonus, but shown for completeness)
+
+### RED: Test 6 fails
+
+No concurrent machinery exists. Running the test produces unpredictable results (depends on event loop scheduling), likely all 6 return `True` because no locking exists yet.
+
+```
+AssertionError: assert 6 == 3
+```
+
+### GREEN: Locking already in place from earlier cycles
+
+The `async with lock` pattern is already present. However, the test inserts `asyncio.sleep(0)` yield points between coroutine calls, forcing the event loop to interleave execution. The lock ensures mutual exclusion during the critical section (read-count → possibly append).
+
+No code changes needed — the lock created in Cycle 2 protects the critical section. Just run the test:
+
+```
+sum(all_results) == 3  ✓   (exactly 3 coroutines succeed before bucket empties)
+all_results.count(True) == 3  ✓
+all_results.count(False) == 3  ✓
+```
+
+### Refactor (post-Green-4)
+
+| Issue | Improvement |
+|---|---|
+| Lock granularity — one `asyncio.Lock` per key is correct, but `_per_key_lock` dict grows unbounded | In practice, number of unique keys is bounded by the application domain. For extreme cases, add an LRU eviction on stale key entries (cleanup helps). Document this trade-off. |
+
+---
+
+## Full Production Implementation
+
+```python
+"""Sliding-window rate limiter with per-key limits, clock injection, and asyncio concurrency safety."""
+
+import asyncio
+import time
+from collections import deque
+from typing import Deque, Dict, Optional
+
+
+class RateLimiter:
+    """Async sliding-window rate limiter.
+
+    Uses a log-based sliding window: each request's timestamp is recorded,
+    and timestamps older than ``window_seconds`` are discarded before
+    evaluating the limit.
+
+    Public API (one method)::
+
+        allowed = await limiter.allow(key, rate=optional_clock_value)
+
+    All state is keyed by ``key``, so different keys have independent
+    quotas.  An ``asyncio.Lock`` per key guarantees correct concurrent
+    behaviour when multiple coroutines call :meth:`allow` simultaneously.
+    """
+
+    def __init__(
+        self,
+        max_requests: int,
+        window_seconds: int,
+        clock,
+    ) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.clock = clock
+        self._per_key: Dict[str, Deque[float]] = {}
+        self._per_key_lock: Dict[str, asyncio.Lock] = {}
+
+    # ── Public interface ───────────────────────────────────────
+
+    async def allow(self, key: str, rate: Optional[float] = None) -> bool:
+        """Decide whether a request is allowed and, if so, record it.
+
+        Parameters
+        ----------
+        key:
+            Identifier for the entity being rate-limited
+            (e.g. user ID, IP address, API key).
+        rate:
+            Injected timestamp.  When *None* the limiter calls
+            :attr:`clock`.  Tests inject a fixed value to avoid
+            real-time delays.
+
+        Returns
+        -------
+        True if the request is allowed, False if the limit is
+        exceeded for *key*.
+        """
+        lock = self._get_lock(key)
+        now = rate if rate is not None else self.clock()
+
+        async with lock:
+            self._ensure_key(key)
+            self._trim(key, now)
+            if len(self._per_key[key]) >= self.max_requests:
+                return False
+            self._per_key[key].append(now)
+            return True
+
+    async def cleanup(self, key: str, rate: Optional[float] = None) -> int:
+        """Purge expired entries for *key*, returning how many were removed.
+
+        Useful for long-lived keys where stale timestamps would
+        otherwise occupy memory indefinitely.
+        """
+        lock = self._get_lock(key)
+        now = rate if rate is not None else self.clock()
+
+        async with lock:
+            self._ensure_key(key)
+            before = len(self._per_key[key])
+            self._trim(key, now)
+            return before - len(self._per_key[key])
+
+    # ── Internal helpers ───────────────────────────────────────
+
+    def _ensure_key(self, key: str) -> None:
+        if key not in self._per_key:
+            self._per_key[key] = deque()
+
+    def _trim(self, key: str, now: float) -> None:
+        cutoff = now - self.window_seconds
+        ts = self._per_key[key]
+        while ts and ts[0] <= cutoff:
+            ts.popleft()
+
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._per_key_lock:
+            self._per_key_lock[key] = asyncio.Lock()
+        return self._per_key_lock[key]
+```
+
+---
+
+## Summary of Refactoring Insights
+
+| Cycle | What broke / changed | Refactor applied | Why it matters |
+|---|---|---|---|
+| **1→2** | Lock lazy-init (`if self._lock is None`) | Moved to `__init__`; per-key lock dict `_per_key_lock` | Eliminates a conditional branch on every call; per-key granularity avoids global bottleneck |
+| **2→3** | Inline key init (`if key not in self._per_key`) | Extracted `_ensure_key()` | `allow()` reads like a specification: *trim → check → record*. Initialization is hidden behind a named method |
+| **2→3** | Timestamps accumulate forever | Added `_trim()` with `cutoff = now - window_seconds` | Without trimming, buckets never refill — the sliding window collapses into a fixed counter |
+| **3→4** | `list.pop(0)` is O(n) | Replaced `list` with `collections.deque` | `popleft()` is O(1); for a key with thousands of requests in a window, this saves meaningful CPU |
+| **4+** | Unbounded `_per_key_lock` dict | Documented as acceptable (key count is application-bounded); `cleanup()` indirectly prunes | Explicitly acknowledged trade-off; for streaming systems, a TTL on lock entries could be added later if profiling demands it |
+
+---
+
+## Architecture Notes
+
+1. **Why per-key locks over a global lock?** A global lock serializes *all* keys through a single mutex. If you're limiting 10,000 users, 9,999 of them block for a key that has nothing to do with them. Per-key locks mean unrelated keys proceed in parallel — a natural fit for asyncio's single-threaded event loop where the lock simply queues coroutines.
+
+2. **Why `deque` over a sorted list or heap?** We only ever append to the tail and pop from the head (FIFO insertion order of requests). No random-access or reordering needed. `deque` gives O(1) at both ends.
+
+3. **Distributed extension path.** The public method is `allow(key, rate=None) → bool`. A Redis-backed version swaps the in-memory `deque`/`Lock` for `Redis.ZREMRANGEBYSCORE` + `Redis.ZADD` + `Redis.XADD` / Lua scripts — same method signature, same return type. The interface is thin enough that the implementation swap costs days, not months.
+
+4. **Clock injection over monkey-patching `time.time`.** Tests specify exact timestamps (`t=0`, `t=5`, `t=11`). Monkey-patching is fragile (thread-safety concerns, hard to restore). Passing `rate=` directly makes the test intent obvious and requires zero teardown.

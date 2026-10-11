@@ -1,0 +1,1493 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+Diagnose a Node.js 20 API service whose RSS climbs from 300MB to 4GB over ~48 hours until OOM-killed in Kubernetes. Heap snapshots taken 6 hours apart show growth concentrated in closures retained by an event-emitter registry and in Buffer objects from a response-logging middleware. Produce a step-by-step diagnosis plan: how to capture and diff heap snapshots in production safely, how to identify the retainer chain for closures and Buffers, how to confirm whether the emitter registry leaks listeners, and the likely code-level root causes with fixes.
+
+---
+[Response A]:
+Here's a complete, actionable diagnosis plan grounded in the exact symptoms you described (RSS 300MB → 4GB over ~48h, OOM-killed, heap snapshots showing closure growth in an event-emitter registry and Buffer growth in response-logging middleware).
+
+---
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### Why `heapdump` package alone is risky on a 4GB process
+
+Taking a V8 heap snapshot of a 4GB RSS process forces V8 to traverse the entire heap and serialize it — another allocation spike. On a container limited to ~4–6GB, this can itself trigger OOM. Use these guardrails:
+
+```bash
+# Check current limits before capturing
+kubectl exec <pod> -- cat /sys/fs/cgroup/memory.max  # cgroups v2
+kubectl exec <pod> -- free -m                        # inside container (if bash available)
+kubectl top pod <pod>                                # outside, quick RSS check
+```
+
+### Recommended approach: Incremental external snapshots via SIGUSR1
+
+Node.js 20 supports `--heapsnapshot-near-heap-limit=3` which writes snapshots automatically *before* each near-limit invocation, but that won't help a slow climb. Instead:
+
+**Option A: `node --heapsnapshot-signal=SIGUSR2`** (built-in, no deps)
+
+Signal the process externally from a safe cron-job context:
+
+```bash
+# In a separate Kubernetes CronJob or sidecar, every 30min:
+POD_PID=$(kubectl exec <pod> -- ps aux | grep 'node' | grep -v grep | awk '{print $2}')
+kubectl exec <pod> -- kill -USR2 $POD_PID
+
+# Snapshots land at /tmp/ heapprofiler output
+kubectl exec <pod> -- ls -lh /tmp/ isolate-*.heapsnapshot
+```
+
+V8 writes to `/tmp/heapsnapshot_*.heapsnapshot` (or configurable via `NODE_HEAPDATA_OUTPUT_PATH`). This triggers from *inside* the process so the memory overhead is shared.
+
+**Option B: `async-hook-stats` + `@whatwg/streams` sampling** for lightweight continuous monitoring
+
+Install at startup via `--require`:
+
+```javascript
+// preload.js
+const asyncHookStats = require('async-hook-stats');
+setInterval(() => {
+  const stats = asyncHookStats.snapshot();
+  console.log(JSON.stringify(stats, null, 2)); // pipe to logging backend
+}, 60000);
+```
+
+This gives you per-event-loop-task async resource lifetimes without allocating a full heap dump.
+
+**Option C: External snapshot via `chrome://inspect` + DevTools protocol** (for staging mirrors)
+
+```
+node --inspect=localhost:9229 app.js
+```
+
+Connect remote Chrome DevTools, take Heap Snapshot tab. Not feasible on hardened production pods typically.
+
+### Capture cadence recommendation
+
+Take 4 snapshots across a known interval: T0 (baseline), T1 (+6h), T2 (+12h), T3 (+18h). Minimum 2 snapshots needed; 4 gives cleaner diff signal. Store each in a named directory tied to the timestamp so diffs stay organized.
+
+---
+
+## Phase 2: Diffing Snapshots and Identifying Retainer Chains
+
+### Export snapshots to JSON for programmatic analysis
+
+Convert binary `.heapsnapshot` files to searchable JSON:
+
+```bash
+npm i -g @types/node-heapsnapshot
+node -e "
+  const fs = require('fs');
+  const snap1 = fs.readFileSync('/tmp/snap_T0.heapsnapshot').toString();
+  // Actually use the 'heapsnapshot' npm package instead:
+"
+```
+
+Better — use the official tool:
+
+```bash
+npx @node-metrics/heap-diff compare snap_T0.json snap_T3.json --output diff_report.txt
+```
+
+Or the well-known [`mrmlnc`](https://github.com/mrmlnc/heap-profiler)-style approach using Chrome DevTools:
+
+1. Open `chrome://inspect` or DevTools → Memory tab
+2. Load `snap_T0.heapsnapshot` and `snap_T3.heapsnapshot`
+3. Select "Comparison" view → "Show only objects that increased"
+4. Sort by `Shallow Size` descending
+5. Right-click any retained object → **"Retainers"** tab
+
+### Reading the retainer chain
+
+In the Retainers view, follow the chain upward until you hit a root:
+
+| Root Type | What It Means | Typical Culprit |
+|-----------|---------------|-----------------|
+| `global` | Attached to global scope | Module-level static caches, improperly cleaned globals |
+| `eventlistener` | Registered with an EventEmitter | Listener leak |
+| `native` / `request_wrap` | Internal libuv handle (HTTP server, TCP socket, timer, timeout) | Unclosed timers, unclosed HTTP clients, active request wrappers |
+| `timer` | Pending setTimeout/setInterval | Missing clearTimeout |
+| `promise` | Pending promises | Unhandled promise chains, long-lived promise references |
+| `finalize` / `callback` | Async cleanup hooks | Cleanup callbacks holding state |
+
+### Specific to your two observed buckets
+
+**Closures retained by event-emitter registry:**
+Look for retainers under `eventlistener` root. Click inward until you see closures with names like `handleRequest`, `logResponse`, or anonymous function types. The retaining object will likely be an array (the internal `listeners` array of an `EventEmitter`). Follow that back to see what owns the emitter.
+
+**Buffer objects from response-logging middleware:**
+Filter snapshot by class `Uint8Array` / `Buffer`. Buffers have very shallow size attribution (they allocate on the C++ side). Look at retainers: if they're held by a promise or closure, that closure is keeping them alive. Follow up to the middleware function scope.
+
+---
+
+## Phase 3: Confirming Whether the Emitter Registry Leaks Listeners
+
+### Diagnostic pattern: Count listeners over time
+
+Add instrumentation that tracks listener counts without changing the core logic:
+
+```javascript
+const originalOn = EventEmitter.prototype.on;
+const originalAddListener = EventEmitter.prototype.addListener;
+
+const listenerMap = new WeakMap();
+
+function trackListeners(emitter, eventName, fn) {
+  if (!listenerMap.has(emitter)) listenerMap.set(emitter, new Map());
+  const events = listenerMap.get(emitter);
+  if (!events.has(eventName)) events.set(eventName, 0);
+  events.set(eventName, events.get(eventName) + 1);
+  
+  if (events.get(eventName) % 10 === 0) {
+    console.error(`[EMITTER-SAMPLE] ${emitter.constructor.name}.${eventName}: ${events.get(eventName)} listeners`);
+  }
+}
+
+EventEmitter.prototype.on = function patchedOn(eventName, fn) {
+  trackListeners(this, eventName, fn);
+  return originalOn.call(this, eventName, fn);
+};
+
+EventEmitter.prototype.addListener = function patchedAddListener(eventName, fn) {
+  trackListeners(this, eventName, fn);
+  return originalAddListener.call(this, eventName, fn);
+};
+```
+
+If you see monotonically increasing counts for a specific emitter + event name, you have confirmed a listener leak. Normal behavior is plateau at steady-state after warmup.
+
+### Quick one-shot verification via PID inspection
+
+```bash
+# Read the node process's internal event emitter count
+kubectl exec <pod> -- node -e "
+  process.on('SIGUSR1', () => {
+    const ee = require('events');
+    const origEmit = ee.EventEmitter.prototype.emit;
+    const instances = [];
+    const origInit = ee.EventEmitter.prototype.init;
+    let count = 0;
+    ee.EventEmitter.prototype.emit = function() { count++; };
+    
+    setTimeout(() => {
+      console.log(\`Total emits since hook: \${count}\`);
+      process.exit(0);
+    }, 100);
+  });
+"
+
+# Simpler: introspect the EventEmitter internals via v8 debug symbols
+# (Node 20 ships --expose-internals)
+kubectl exec <pod> -- node --eval "
+  process.on('SIGUSR1', () => {
+    const stats = require('perf_hooks').performance;
+    // perf_hooks won't give us raw listener counts, but we can inspect
+    // via the built-in debug module
+    debugger;
+  });
+"
+```
+
+The most practical live check is: instrument `_events` property access on EventEmitters. Many frameworks store the raw listeners map on `_events` or `_eventsCount`. If `_eventsCount[eventName]` grows unboundedly, you have a leak.
+
+### Structural confirmation in heap snapshots
+
+In the heap snapshot comparison, filter by class `Array` and look for arrays whose shallow size is growing. Event emitters store listeners as a plain array internally. An ever-growing array whose elements are function objects (closure type) is your smoking gun.
+
+---
+
+## Phase 4: Likely Code-Level Root Causes and Fixes
+
+### Root Cause #1: Repeated `on()` without matching `off()`/`removeListener()`
+
+**Pattern:**
+
+```javascript
+// BAD — called per-request, creates new listener each time
+router.get('/data', (req, res) => {
+  const dataEmitter = getSharedEmitter();
+  
+  // Every request registers a NEW listener that never gets removed
+  dataEmitter.on('update', (payload) => {
+    res.write(JSON.stringify(payload));
+  });
+});
+```
+
+**Fix — paired registration with guaranteed removal:**
+
+```javascript
+// GOOD
+router.get('/data', (req, res) => {
+  const dataEmitter = getSharedEmitter();
+  
+  const handler = (payload) => {
+    res.write(JSON.stringify(payload));
+  };
+  
+  dataEmitter.on('update', handler);
+  
+  // Guaranteed removal when response ends (even on error)
+  res.once('finish', () => {
+    dataEmitter.removeListener('update', handler);
+  });
+  res.once('close', () => {
+    dataEmitter.removeListener('update', handler);
+  });
+});
+```
+
+Or better, use `EventEmitter.once()` where appropriate:
+
+```javascript
+dataEmitter.once('update', handler); // auto-removed after first emission
+```
+
+### Root Cause #2: Closure capturing large response bodies
+
+**Pattern (ties directly to your Buffer observation):**
+
+```javascript
+// BAD — middleware logs responses, but captures full body in closure
+app.use((req, res, next) => {
+  const originalEnd = res.end;
+  const chunks = []; // Buffer accumulation
+  
+  res.end = function(...args) {
+    // Closure captures `chunks` array indefinitely because
+    // the emitted event holds reference to this handler closure
+    
+    const logEntry = {
+      url: req.url,
+      method: req.method,
+      statusCode: res.statusCode,
+      bodyLength: chunks.reduce((sum, c) => sum + c.length, 0),
+      // BUG: storing the actual buffer data, not just length
+      responseBody: Buffer.concat(chunks), // <-- HUGE BUFFER RETAINED
+      timestamp: Date.now(),
+    };
+    
+    // If this is stored in a global/log buffer, the closure
+    // (and all captured buffers) live forever
+    responseLog.push(logEntry);  // G
+...[truncated]
+---[Response B]:
+Here's the complete diagnosis plan for your RSS climb from 300MB → 4GB over ~48 hours with OOM kills.
+
+---
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### The Problem with Snapshots
+Taking a heap snapshot via `process.exit()` or heavy devtools usage will itself cause pauses and potentially restart the process. You need non-disruptive capture.
+
+### Method A: CLI Heap Snapshot (Recommended)
+
+```bash
+# Step 1: Generate snapshot without killing the process
+node --heapsnapshot-signal=SIGUSR2 /path/to/your/server.js
+
+# Step 2: Trigger snapshot (non-blocking, process stays alive)
+kill -USR2 <pid>
+
+# Step 3: Snapshot written to /tmp/<pid>-<sequence>.heapsnapshot
+ls /tmp/ | grep heapsnapshot
+```
+
+For Node 20+, add to your startup flags:
+
+```dockerfile
+CMD ["node", "--heapsnapshot-signal=SIGUSR2", \
+     "--max-old-space-size=1536", \
+     "--trace-warnings", \
+     "dist/index.js"]
+```
+
+- `--max-old-space-size=1536` caps at 1.5GB so Kubernetes gets time to act before the container reaches its hard limit
+- `--trace-warnings` surfaces leaked promise warnings
+- The snapshot file lands in `/tmp`, so ensure that's not on a tmpfs with tiny limits — bind-mount it to persistent storage if possible
+
+### Method B: Periodic Automated Snapshots (Cron-style)
+
+If you can't send signals directly, install a sidecar or init hook:
+
+```js
+// preload.js (inject via NODE_OPTIONS='--require ./preload')
+const fs = require('fs');
+const path = require('path');
+
+let count = 0;
+setInterval(async () => {
+  try {
+    const dir = '/tmp/heap-snapshots';
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `snapshot-${Date.now()}-${++count}.heapsnapshot`);
+    
+    // Takes snapshot asynchronously, does NOT stop the world long enough to matter
+    await new Promise((resolve) => {
+      process.emit('heapsnapshot', { filePath }, resolve);
+    });
+    
+    // Signal v8 to actually write
+    const v8 = require('v8');
+    v8.writeHeapSnapshot(filePath);
+    
+    console.error(`[health] heap snapshot written: ${filePath}`);
+  } catch (err) {
+    console.error('[health] heap snapshot failed:', err.message);
+  }
+}, 6 * 3600 * 1000); // Every 6 hours — matches your observation window
+```
+
+Run with:
+```bash
+NODE_OPTIONS="--require ./preload --heapsnapshot-signal=SIGUSR2" node dist/index.js
+```
+
+### Method C: Using Clinic.js for Continuous Profiling
+
+```bash
+npm install -g clinic
+
+clinic doctor -- node dist/index.js        # flamegraph + GC pressure
+clinic bubbleprof -- node dist/index.js     # async call trees showing leaks
+```
+
+### Diffing Two Snapshots
+
+Open both `.heapsnapshot` files in Chrome DevTools → Memory tab:
+
+1. Load the older snapshot first (300MB baseline)
+2. Click "Take heap snapshot" → load the newer one (leaked state)
+3. Switch to **Comparison** view
+4. Sort by **"Controlling size"** (not "Shallow size")
+   - Controlling size = how much total memory is attributable to these objects
+5. Filter by class name: `closure`, `Function`, `Buffer`, `String`, `NativeModule`
+
+Key columns to compare:
+| Column | What It Tells You |
+|--------|-------------------|
+| Shallow size | Direct memory of these objects only |
+| Retained size | Everything pinned because these exist |
+| Controlling size | Objects where THIS object is the primary retainer |
+
+---
+
+## Phase 2: Identifying the Retainer Chain for Closures
+
+### Step 1: Find Closure Candidates
+
+In the heap snapshot comparison:
+
+1. Take a **Summary** view sorted by constructor name
+2. Look for high counts of: `Function`, `closure`, `bound function`
+3. Note the ones where retained size has grown significantly between snapshots
+
+### Step 2: Drill Into the Event Emitter Registry
+
+Node's `EventEmitter` keeps listeners in an internal `Map` keyed by event type, values are arrays of listener functions. When listeners reference closures that capture outer scope variables, those captured references stay alive too.
+
+To find the chain:
+
+1. In DevTools, switch to **Retainers** view for a representative closure object
+2. Expand the retainers tree upward — you'll see something like:
+   ```
+   closure (myHandler)
+     └── Function (EventEmitter.listeners)
+           └── Array (listeners[])
+                 └── Map [Symbol(@events)] 
+                       └── EventEmitter instance (myEmitter)
+                             └── Server middleware registry
+                                   └── Global module singleton
+   ```
+
+3. The critical insight: **if the listener captures a request context object** (which itself holds a Buffer from the response body), every logged request response keeps that entire chain alive.
+
+### Step 3: Confirm the Event Emitter Is the Leak
+
+Add instrumentation to detect listener accumulation:
+
+```js
+// leak-detector.js — drop this into your entry point
+const EventEmitter = require('events');
+const originalAddListener = EventEmitter.prototype.on;
+const originalOnce = EventEmitter.prototype.once;
+const originalOn = EventEmitter.prototype.addListener;
+const { WeakRef, FinalizationRegistry } = require('weakref'); // polyfill in Node 20
+
+const activeEmitters = new WeakMap();
+const listenerCounts = new Map();
+
+function instrumentEmitter(emitter, label) {
+  Object.defineProperties(emitter, {
+    _leakLabel: { value: label, writable: false }
+  });
+}
+
+// Patch all existing and future emitter registrations
+const patchedEmitters = new Set();
+
+['on', 'addListener', 'once'].forEach(method => {
+  const original = EventEmitter.prototype[method];
+  
+  EventEmitter.prototype[method] = function(...args) {
+    const eventType = args[0];
+    const listener = args[1];
+    
+    // Instrument this emitter if we haven't yet
+    if (!patchedEmitters.has(this)) {
+      instrumentEmitter(this, `inferred-from-${method}`);
+      patchedEmitters.add(this);
+    }
+    
+    // Count listeners per emitter per event
+    const key = `${this._leakLabel || 'unnamed'}::${eventType}`;
+    const current = listenerCounts.get(key) || { total: 0, labels: new Set() };
+    current.total++;
+    current.labels.add(listener.constructor.name);
+    listenerCounts.set(key, current);
+    
+    return original.apply(this, args);
+  };
+});
+
+// Expose a health-check endpoint
+const http = require('http');
+http.createServer((req, res) => {
+  if (req.url === '/internal/leak-audit') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    
+    const audit = [];
+    for (const [key, val] of listenerCounts.entries()) {
+      audit.push({
+        key,
+        listenerCount: val.total,
+        types: [...val.labels].slice(0, 10)
+      });
+    }
+    
+    audit.sort((a, b) => b.listenerCount - a.listenerCount);
+    res.end(JSON.stringify({ 
+      timestamp: Date.now(),
+      eventsWithMultipleListeners: audit.filter(a => a.listenerCount > 1),
+      totalTracked: audit.length
+    }, null, 2));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(9999);
+
+console.error('[leak-detector] audit available at :9999/internal/leak-audit');
+```
+
+**What this detects**: If `/internal/leak-audit` shows listener counts growing monotonically per request (e.g., 1→2→3→...→N instead of staying at 1 after cleanup), you have confirmed the leak.
+
+### Step 4: Stack Trace Attribution for Listeners
+
+This is the smoking gun — it tells you **exactly which line of code** creates the leaking listener:
+
+```js
+// listener-tracker.js — minimal stack-based attribution
+const vm = require('vm');
+
+const originalEmit = require('events').EventEmitter.prototype.emit;
+
+const listenerOrigin = new Map();
+const stackTraceCapture = {};
+
+let captureId = 0;
+
+const originalAddListener = require('events').EventEmitter.prototype.on;
+
+require('events').EventEmitter.prototype.on = function(event, listener) {
+  // Only care about custom emitters, not Node internals
+  if (this.domain && this.constructor.name !== 'Server') {
+    const id = ++captureId;
+    
+    // Capture stack WITHOUT the listener registration itself
+    const origPrepareStackTrace = Error.prepareStackTrace;
+    Error.prepareStackTrace = (_, stack) => stack;
+    const error = new Error();
+    Error.captureStackTrace(error);
+    
+    const stack = error.stack;
+    Error.prepareStackTrace = origPrepareStackTrace;
+    
+    // Get frames, skip our own wrapper frames
+    const relevantFrames = stack.slice(3).map(frame => ({
+      function: frame.getFunctionName(),
+      file: frame.getFileName(),
+      line: frame.getLineNumber(),
+      column: frame.getColumnNumber()
+    }));
+    
+    const originKey = relevantFrames.map(f => `${f.file}:${f.line}`).join(' → ');
+    
+    if (!listenerOrigin.has(originKey)) {
+      listenerOrigin.set(originKey, { count: 0, frames: relevantFrames });
+    }
+    listenerOrigin.get(originKey).count++;
+  }
+  
+  return originalAddListener.call(this, event, listener);
+};
+
+// Expose via health endpoint
+const http = require('http');
+http.createServer((req, res) => {
+  if (req.url === '/internal/origin-trace') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    const lines = ['=== Listener Origin Trace ===\n'];
+    
+    const sorted = [...listenerOrigin.entries()]
+      .sort((a, b) => b[1].count - a[1].count);
+    
+    for (const [origin, data] of sorted) {
+      if (data.count > 1) {
+        lines.push(`${data.count}x at: ${origin}\n`);
+        for (const f of data.frames.slice(0, 4)) {
+          lines.push(`  at ${f.function} (${f.file}:${f.line})\n`);
+        }
+      }
+    }
+    
+    res.end(lines.join(''));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(9998);
+```
+
+---
+
+## Phase 3: Identifying Buffer Growth from Response Logging
+
+### The Typical Pattern
+
+Response logging middlewares commonly do one of three anti-patterns:
+
+```js
+// ANTI-PATTERN 1: Capturing full response body in middleware closure
+app.use(async (req, res, next) => {
+  const originalEnd = res.end.bind(res);
+  
+  res.end = function(...args) {
+    // ❌ This closure captures `req`, `res`, `originalEnd`, and the body data
+    logResponse({
+      url: req.url,                      
+...[truncated]
+---[Response C]:
+I'll synthesize a comprehensive diagnosis plan based on the specific symptoms you described. Here goes.
+
+---
+
+# Memory Leak Diagnosis Plan: Node.js 20 API Service
+
+## Symptoms
+
+- RSS: 300 MB → 4 GB over ~48h → OOM-Killed
+- Heap snapshots show two hotspots:
+  1. **Closures retained by an event-emitter registry**
+  2. **Buffer objects from a response-logging middleware**
+
+---
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### Option A: `heapdump` package (recommended — minimal overhead)
+
+```bash
+npm install heapdump
+```
+
+Add signal handlers to your entry point:
+
+```js
+const heapdump = require('heapdump');
+const os = require('os');
+
+process.on('SIGUSR2', async () => {
+  const filepath = `/tmp/heap-${process.pid}-${Date.now()}.heapsnapshot`;
+  await heapdump.writeSnapshot(filepath);
+  console.error(`[health] heap dump written: ${filepath}`);
+  
+  // Rotate: keep only last 3 dumps
+  const dir = '/tmp';
+  const files = (await import('fs')).promises.readdir(dir)
+    .then(fs => fs.filter(f => f.startsWith('heap-'))
+                  .sort()
+                  .slice(-3));
+  for (const f of files) {
+    if (!files.includes(f)) continue;
+    // Keep only newest 3
+  }
+});
+
+// In Docker/Kubernetes, ensure the image supports signals:
+// docker run --init ...  (uses tini to forward SIGUSR2 to PID 1)
+```
+
+In Kubernetes, trigger remotely:
+
+```bash
+kubectl exec -it <pod> -- kill -USR2 1
+# or: kubectl debug node-name -it --image=busybox -- sh -c "kill -USR2 $(pgrep node)"
+```
+
+### Option B: V8 debugging port + Chrome DevTools
+
+Start with `--inspect`:
+
+```bash
+node --inspect=0.0.0.0:9229 app.js
+```
+
+Then from a browser on a machine with network access:
+
+1. Open `chrome://inspect` → find your pod
+2. DevTools → Memory tab → **Take Heap Snapshot** (take two, 6 hours apart)
+3. Compare using **Comparison** view
+
+For automation without opening DevTools:
+
+```js
+const v8Profiler = require('v8-profiler-node8');
+
+async function takeSnapshot(label) {
+  const snapshot = v8Profiler.takeHeapSnapshot();
+  return new Promise((resolve, reject) => {
+    const ws = require('fs').createWriteStream(`/tmp/snap-${label}-${Date.now()}.heapsnapshot`);
+    snapshot.pipe(ws);
+    snapshot.on('end', () => { snapshot.dispose(); resolve(); });
+    snapshot.on('error', reject);
+  });
+}
+
+// Schedule every 6 hours
+setInterval(() => takeSnapshot('scheduled'), 6 * 3600_000);
+```
+
+### Option C: Clinic.js for continuous profiling
+
+```bash
+npm install -g clinic
+clinic doctor -- node app.js          # CPU + memory profiler
+clinic bubbleprof -- node app.js       # flamegraphs for async operations
+```
+
+Clinic runs continuously, so you don't need to time-snapshots manually. It identifies the functions consuming the most memory over time.
+
+---
+
+## Phase 2: Identifying Retainer Chains
+
+### Diagnosing the Closure / Event Emitter Leak
+
+#### Step 1: Confirm the emitter is the source
+
+```js
+// Add this to your main file (short-lived diagnostics only)
+const EventEmitter = require('events');
+const origOn = EventEmitter.prototype.on;
+const origOnce = EventEmitter.prototype.once;
+const origAddListener = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.on = function (...args) {
+  console.warn(`[listener-add] event="${args[0]}" fn="${args[1]?.name || 'anonymous'}" callers="${new Error().stack?.split('\\n')[2]?.trim()}" totalListeners=${this.listenerCount(args[0])}`);
+  return origOn.apply(this, args);
+};
+```
+
+Run this for a short window and grep the logs:
+
+```bash
+grep '\[listener-add\]' logs/*.log | awk -F'event=' '{print $2}' | cut -d'"' -f1 | sort | uniq -c | sort -rn | head -20
+```
+
+This tells you which events accumulate listeners. If an event like `request-complete` shows counts climbing monotonically (no plateau), that's your smoking gun.
+
+#### Step 2: Trace retainers in a heap snapshot
+
+Open the snapshot in Chrome DevTools → select a retained closure in the **Objects** panel → look at the **Retainers** tab. You'll see a chain like:
+
+```
+Module Scope → Registry Map → [key: "/api/data"] → Listener Array
+                                                  → Closure object
+                                                        └─ captured variables: req, res, responseData [...large Buffer here...]
+```
+
+The key insight: if the closure captures request/response objects, those carry attachedBuffers, headers, and potentially the entire decoded response body. The retainer chain tells you exactly **what variable** inside the closure is anchoring it to memory.
+
+#### Step 3: Verify with programmatic inspection
+
+```js
+function inspectEmitterLeaks(emitter) {
+  const events = emitter.eventNames();
+  for (const eventName of events) {
+    const listeners = emitter.listeners(eventName);
+    if (listeners.length > 100) {
+      console.warn(`[leak-risk] "${eventName}" has ${listeners.length} listeners`);
+      listeners.slice(0, 5).forEach((fn, i) => {
+        // Force a stack trace from the closure
+        const err = new Error();
+        Error.captureStackTrace(err, inspectEmitterLeaks);
+        console.warn(`  listener[${i}]: name="${fn.name || '(anonymous)'}" length=${fn.toString().length} chars`);
+      });
+    }
+  }
+}
+```
+
+Call this periodically (every 30s) and log results. A monotonic increase confirms the leak.
+
+#### Step 4: Check for Common EventEmitter Patterns That Leak
+
+| Pattern | Why it Leaks | Fix |
+|---------|-------------|-----|
+| `emitter.on('event', asyncHandler)` in every request handler | Async handlers are never removed; the emitter holds a strong ref to every invocation's closure | Use `.once()` when done, or use `AbortSignal` to cancel |
+| Module-level singleton emitter + per-request `.on()` | Single emitter accumulates handlers across thousands of requests | Create per-request emitters, or use `AsyncLocalStorage` for scoped context |
+| `.on()` without matching `.off()` in error recovery paths | Unhandled exceptions skip cleanup code | Always wrap in `try/finally` or use a library like `emittery` that supports auto-cleanup |
+| Named vs anonymous functions | Named functions can be removed with `.off(name)`. Anonymous cannot. | Avoid anonymous handlers on persistent emitters |
+
+### Diagnosing the Response-Logging Buffer Leak
+
+#### Step 1: Instrument the middleware
+
+```js
+// Temporarily add this around your response-logging middleware
+
+let bufferPoolSize = 0;
+let bufferPoolBytes = 0;
+const bufferSamples = [];
+
+function trackAlloc(size, label) {
+  bufferPoolSize++;
+  bufferPoolBytes += size;
+  bufferSamples.push({ ts: Date.now(), size, label, totalSize: bufferPoolSize, totalBytes: bufferPoolBytes });
+  if (bufferPoolSize % 1000 === 0) {
+    console.warn(`[buffer-leak-tracker] allocs=${bufferPoolSize} bytes=${formatBytes(bufferPoolBytes)}`);
+  }
+}
+
+function formatBytes(b) {
+  return `${(b / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Log summary every 60s
+setInterval(() => {
+  if (bufferSamples.length > 0) {
+    console.warn(`[buffer-leak-tracker] SUMMARY: totalAllocs=${bufferSamples.length}, totalBytes=${formatBytes(bufferPoolBytes)}`);
+    bufferSamples.length = 0; // reset counter (but not actual allocations)
+  }
+}, 60_000);
+```
+
+If `totalBytes` climbs linearly toward gigabytes, the middleware is not releasing Buffers.
+
+#### Step 2: Check for common middleware patterns that leak
+
+```js
+// BAD: Storing entire response body in memory for every request
+app.use(async (req, res, next) => {
+  const end = res.end;
+  res.end = function(...args) {
+    // This Buffer is NEVER freed if the array grows unbounded
+    responseBodyLog.push(Buffer.concat(args.map(a => Buffer.from(a)))); 
+    end.apply(res, args);
+  };
+  next();
+});
+
+// BAD: No limit on the log array
+const responseBodyLog = []; // grows forever
+
+// BAD: Storing decompressed data
+const decompressedBody = zlib.unzipSync(originalBuffer); // creates a much larger Buffer
+responseBodyLog.push(decompressedBody);
+
+// BAD: Async closure retaining response data
+res.on('finish', () => {
+  logger.info({ body: res.body /* large string */ }); 
+  // if the logger queues async writes and the queue backs up, 
+  // all these strings stay in memory
+});
+```
+
+#### Step 3: Trace Buffer retainers
+
+In Chrome DevTools heap snapshot:
+
+1. Switch to **Allocation instrumentation on timeline** or take another snapshot
+2. Filter by type `Uint8Array` / `ArrayBuffer` / `External` (for native Buffers)
+3. For each group, check retainers: is it held by a global array? A Map? An async queue?
+
+Key question: **Are the Buffers referenced by a global collection?** If yes → fix is to bound that collection.
+
+---
+
+## Phase 3: Root Causes & Fixes
+
+### Root Cause 1: Event Emitter Listener Accumulation
+
+**Pattern:** A module-level (singleton) EventEmitter receives `.on()` calls from every incoming request handler. Each listener closure captures request-scoped data (headers, body, session). Over 48 hours of traffic, tens of thousands of listeners accumulate.
+
+**Proof:** Monotonically increasing `emitter.listenerCount(eventType)` over time, confirmed by heap snapshot retainers showing the emitter's internal `_events` array growing.
+
+**Fixes:**
+
+```js
+// FIX 1: Use event namespacing + bounded listener counts
+class SafeEmitter extends EventEmitter {
+  constructor(maxListenersPerEvent = 50) {
+    super();
+    this.setMaxListeners(0); // we manage per-event limits
+    this._maxPerEvent = maxListenersPerEvent;
+    this._eventTimestamps = new Map();
+    
+    // Periodic cleanup
+    this._cleanupTimer = setInterval(() => this.cleanup(), 60_000);
+    this._cleanupTimer.unref();
+  }
+  
+  on(eventName, listener) {
+    if (this.listenerCount(eventName) >= this._maxPerEvent) {
+      const oldest = this._eventTimestamps.get(eventName);
+      if (oldest) {
+        this.removeListener(eventName, oldest.fn);
+        console.warn(`[safe-emitter] evicted oldest listener for "${eventName}"`);
+      }
+    }
+    this._eventTimestamps.set(eventName, { fn: listener, ts: Date.now() });
+    return super.on(eventName, listener);
+  }
+  
+  cleanup() {
+    for (const [event, entries] of t
+...[truncated]
+---[Response D]:
+I'll work through this as a systematic diagnosis problem, applying the two-strikes-and-rethink principle and tracing causation up the call stack.
+
+---
+
+## Memory Leak Diagnosis Plan — Node.js 20 API Service
+
+### Phase 1: Safe Heap Snapshot Capture in Production
+
+**Problem:** Taking heap snapshots (`--heapsnapshot-signal=SIGUSR2`) on a service at 300MB-4GB RSS risks triggering the very OOM you're investigating. GC pressure from serializing the snapshot can push an already-strained process over the edge.
+
+**Safe capture protocol:**
+
+```bash
+# 1. Check current GC state BEFORE snapshotting
+kill -SIGUSR2 $(pgrep -f node)  # triggers snapshot
+
+# 2. Snapshots land in working directory; verify immediately
+ls -lh heapsnapshot*.heapsnapshot.*
+
+# 3. Clean up old snapshots aggressively
+find . -name 'heapsnapshot*' -mmin +5 -delete
+
+# 4. For repeated captures, stagger with sufficient interval
+for i in 1 2 3; do
+  kill -SIGUSR2 $(pgrep -f node)
+  sleep 3600  # 1-hour gap minimum between captures
+done
+```
+
+**Safer alternative — sampling via V8 flags at restart:**
+
+```bash
+# Set once during deploy; V8 auto-snapshots under pressure
+node --max-old-space-size=3584 \
+     --trace-gc \
+     --heapsnapshot-signal=SIGUSR2 \
+     --expose-gc \
+     app.js
+
+# If --expose-gc is available, trigger targeted snapshots:
+curl http://localhost:9229/  # check inspector is enabled first
+node -e "require('v8').getHeapSnapshot().pipe(require('fs').createWriteStream('snap.mjs'))"
+```
+
+**Key rule:** Take snapshots at two distinct RSS points (e.g., ~500MB and ~2GB), not just one. A single snapshot shows *where* memory lives; a diff shows *what grew*.
+
+---
+
+### Phase 2: Identifying Retainer Chains for Closures
+
+**Step 1 — Snapshot comparison workflow:**
+
+Load both snapshots into Chrome DevTools (`chrome://inspect` or standalone DevTools). Switch to **Memory** tab → **Allocation instrumentation on timeline** isn't suitable for production history. Instead:
+
+```
+Left snapshot:  early.heapsnapshot.1    (RSS ~500MB)
+Right snapshot: early.heapsnapshot.2    (RSS ~2GB)
+→ Click "Compare to previous snapshot"
+→ Sort results by "ObjCount Delta" descending
+```
+
+**Step 2 — Isolate the emitter-related group:**
+
+In the comparison view, expand the groups. Look for:
+- **Detached DOM trees?** No — server-side, irrelevant
+- **Closures** — these are the primary suspect
+- **String** nodes with high delta count (closures hold string references)
+
+**Step 3 — Drill into closure retainer chains:**
+
+For each large closure group:
+1. Double-click to isolate it
+2. Switch to **Retainers** panel
+3. The left pane shows *who holds a reference to this closure*
+4. Trace upward: `EventEmitter._events → handler closure → request object → response body buffer`
+
+**What you're looking for in the chain:**
+
+```
+Global scope
+  └─ EventEmitter instance (your emitter registry)
+       └─ _events.map["request"] → array of handlers
+            └─ Closure [anonymous]         ← THE LEAK
+                 ├─ captured `req` object
+                 │    └─ req.rawBody (Buffer)
+                 ├─ captured `res` object
+                 │    └─ res.locals.logBuffer (Buffer[])
+                 └─ captured closure vars from middleware stack
+```
+
+**Step 4 — Verify with runtime filtering (not snapshot-only):**
+
+```javascript
+// Drop this into your code temporarily via hot-reload or debugger eval
+const ee = require('events');
+const originalOn = ee.EventEmitter.prototype.on;
+ee.EventEmitter.prototype.on = function(event, fn) {
+  const descriptor = Object.getOwnPropertyDescriptor(fn, 'name') || {};
+  console.warn(`LISTENER ADDED: ${this.constructor.name}.${event} → ${fn.name || '[anonymous]'}`, new Error().stack);
+  return originalOn.call(this, event, fn);
+};
+
+// Run a load test for 60 seconds, grep stderr for patterns
+```
+
+This prints every listener registration. If you see the same anonymous function bound thousands of times to the same event name on the same emitter instance, you've confirmed the leak.
+
+---
+
+### Phase 3: Confirming the Emitter Registry Leak
+
+**Hypothesis A: Listener accumulation on a shared emitter**
+
+Common pattern — every HTTP request handler attaches a listener but never removes it:
+
+```javascript
+// THE BUG — typical offender
+app.on('request', (req, res) => {
+  // This closure captures `req` and `res` indefinitely
+  emitter.on('response-finished', () => {
+    logger.info(req.url);  // closure references req
+  });
+  // .removeListener() is either never called or called with a different fn ref
+});
+```
+
+**Diagnostic:**
+
+```javascript
+// In a running process (via debugger eval or a /debug/endpoints route):
+const events = require('events');
+for (const key of Object.getOwnPropertySymbols(global)) {
+  const obj = global[key];
+  if (obj instanceof events.EventEmitter) {
+    const handlers = obj._events;
+    for (const [event, fns] of Object.entries(handlers)) {
+      const list = Array.isArray(fns) ? fns : [fns];
+      if (list.length > 100) {
+        console.warn(`LEAK CANDIDATE: ${key.description || 'unnamed'}.${event} has ${list.length} listeners`);
+      }
+    }
+  }
+}
+```
+
+**Hypothesis B: EventEmitter subclass with growing `_events` map**
+
+If you have a custom emitter class or use one that persists across requests:
+
+```javascript
+// Check the actual _events map size over time
+setInterval(() => {
+  for (const ee of [myEmitter]) {
+    const entries = Object.keys(ee._events || {});
+    const totalListeners = entries.reduce((sum, k) => {
+      const arr = ee._events[k];
+      return sum + (Array.isArray(arr) ? arr.length : 1);
+    }, 0);
+    console.log(`[${new Date().toISOString()}] ${ee.constructor.name}: ${totalListeners} listeners across ${entries.length} event types`);
+  }
+}, 30_000);
+```
+
+If listener count grows monotonically without plateauing, the registry leaks.
+
+**Fix:**
+
+```javascript
+// BAD — creates a new anonymous fn every iteration, removeListener can't match
+emitter.on('data', (chunk) => { /* ... */ });
+
+// GOOD — stable reference, removable
+function handleData(chunk) { /* ... */ }
+emitter.on('data', handleData);
+// Later, when done:
+emitter.off('data', handleData);
+
+// BEST for request-scoped cleanup:
+emitter.once('data', (chunk) => { /* fires exactly once, auto-removed */ });
+
+// OR wrap in abort controller pattern:
+const ac = new AbortController();
+emitter.on('data', handler, { signal: ac.signal });  // auto-removes when aborted
+ac.abort();  // call when request completes
+```
+
+---
+
+### Phase 4: Diagnosing the Buffer Leak in Response-Logging Middleware
+
+**Hypothesis: Response body captured as Buffer and never released**
+
+Response-logging middlewares commonly serialize the full response body for audit/analytics. The leak occurs when:
+
+```javascript
+// THE BUG — accumulates buffers across requests
+let responseLogBuffers = [];  // MODULE-LEVEL accumulator (never cleared)
+
+app.use(async (req, res, next) => {
+  const originalEnd = res.end.bind(res);
+  
+  res.end = function(...args) {
+    if (args[0]) {
+      // Each response body becomes a Buffer pushed to module-level array
+      const buf = Buffer.isBuffer(args[0]) 
+        ? args[0] 
+        : Buffer.from(args[0], res.getHeader('content-type')?.includes('json') ? 'utf8' : 'binary');
+      
+      responseLogBuffers.push({
+        url: req.originalUrl,
+        timestamp: Date.now(),
+        body: buf,        // ← Buffer reference held forever
+        size: buf.length
+      });
+    }
+    originalEnd(...args);
+  };
+  
+  next();
+});
+```
+
+**Why this doesn't get GC'd:** The module-level `responseLogBuffers` array holds strong references to every Buffer ever created. Even if individual responses complete, the array keeps them alive. Over 48 hours at any reasonable QPS, this accumulates gigabytes.
+
+**Other Buffer leak patterns to check:**
+
+```javascript
+// Pattern 2: Buffer.concat accumulating chunked uploads/uploads
+let allChunks = Buffer.alloc(0);  // STARTS AT ZERO bytes
+stream.on('data', chunk => {
+  allChunks = Buffer.concat([allChunks, chunk]);  // Creates NEW Buffer each time, old one only freed if nothing references it
+  // But if allChunks is module-scoped AND you also store references elsewhere...
+});
+
+// Pattern 3: Buffer pool/allocator without bounded size
+const bufferPool = [];
+middleware((req, res, next) => {
+  const buf = Buffer.alloc(1024 * 1024);  // 1MB per request
+  readInputStream(buf, (err, bytesRead) => {
+    bufferPool.push(buf.subarray(0, bytesRead));  // Never trimmed
+  });
+});
+
+// Pattern 4: Base64/text encoding of binary data stored persistently
+// Each base64-encoded payload is ~1.33x larger than the original Buffer
+logEntry.payload = Buffer.from(rawBody).toString('base64');  // stored in DB? Redis? In-memory cache?
+```
+
+**Diagnostic:**
+
+```javascript
+// Inspect Buffer counts and total size distribution in a live process
+(function inspectBuffers() {
+  const weakRefs = new Map();
+  
+  // Walk the JS heap for Buffer instances (Node.js Buffers are Uint8Array subclasses)
+  let totalBuffers = 0;
+  let totalBytes = 0;
+  let largeBuffers = 0;
+  
+  const snapshot = v8.getHeapUsage();
+  
+  // Check common accumulator patterns
+  function findLargeArrays(root, path = '') {
+    if (!root || typeof root !== 'object') return;
+    if (Array.isArray(root) && root.length > 1000) {
+      const hasBuffers = root.some(item => item instanceof Uint8Array);
+      if (hasBuffers) {
+        console.warn(`LARGE ARRAY WITH BUFFERS at: ${path} (length: ${root.length})`);
+        const byteTotal = root.filter(i => i instanceof Uint8Array).reduce((s, i) => s + i.byteLength, 0);
+        console.warn(`  Total bytes in buffered items: ${(byteTotal / 1e6).toFixed(1)} MB`);
+      }
+    }
+    for (const key of Object.keys(root)) {
+      findLargeArrays(root[key], `${path}.${key}`);
+    }
+  }
+  
+  console.log('=== Buffer & Accumulator Audit ===');
+  findLargeArrays(global, 'global');
+})();
+```
+
+**Fix:**
+
+```javascript
+// BAD — unbounded accumulation
+const buffers = [];
+app.use(loggingMiddleware);  // pushes every response body
+
+// GOOD — ring buff
+...[truncated]
+---[Response E]:
+# Node.js 20 Memory Leak Diagnosis Plan
+
+## Symptom Summary
+
+RSS: 300 MB → 4 GB in ~48h → OOM kill (Kubernetes default limit). Two confirmed leak buckets in heap snapshots: **closures via event-emitter registry** and **Buffer objects via response-logging middleware**.
+
+---
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### The Command
+
+```bash
+# Trigger snapshot without restart — works on running Node 20
+kill -USR1 <PID>                          # v8 flag: dumps to /proc/<pid>/fd/...
+# OR better, explicit path:
+node --heapsnapshot-signal=SIGUSR2 server.js
+kill -USR2 <PID>                          # writes to /proc/<pid>/cwd/<timestamp>.heapsnapshot
+```
+
+### Preferred: `--heapsnapshot` flag + pmap
+
+```bash
+# Ensure Node has permission to write snapshots
+node --expose-gc --heapsnapshot-signal=SIGUSR2 server.js
+
+# In production script:
+HEAPDIR="/tmp/heapsnapshots"
+mkdir -p $HEAPDIR
+SNAPSHOT="$HEAPDIR/heap_$(date +%s)_$(cat /proc/$PID/stat|awk '{print $1}').heapsnapshot"
+
+# Send signal — Node writes snapshot atomically
+echo "SIGUSR2 → $PID → $SNAPSHOT"
+kill -USR2 $PID
+
+# Verify written
+ls -la $SNAPSHOT
+# Copy to local for analysis (don't delete until analyzed)
+scp $SNAPSHOT ./analysis/
+```
+
+### Safer Alternative: Chromium DevTools Protocol (no signal)
+
+```bash
+# Attach CDP port at startup
+node --inspect=0.0.0.0:9229 server.js
+
+# From a monitoring container (non-interuptive):
+docker exec <container> node -e '
+const { execSync } = require("child_process");
+execSync(`wget -qO- http://localhost:9229/devtools/browser/capture-screenshot > /dev/null`);
+
+// Or use heap profiler via CDP
+const http = require("http");
+const req = http.request({hostname:"localhost",port:9229,path:"/json/list",method:"GET"}, res => {
+  let data = "";
+  res.on("data", chunk => data += chunk);
+  res.on("end", () => {
+    const pid = JSON.parse(data)[0].id;
+    http.request({hostname:"localhost",port:9229,path:`/${pid}/heapProfiler/addHeapSnapshotObserver`,method:"POST"}, req2 => {
+      req2.write(JSON.stringify({maxDepth:100}));
+      req2.end();
+    }).end();
+  });
+});
+req.end();
+'
+```
+
+### Timing Strategy
+
+Capture pairs to confirm *growth rate*:
+
+| Snapshot | When | Purpose |
+|----------|------|---------|
+| A | Hour 0 (baseline) | Reference state |
+| B | Hour 6 (after logs) | Compare closures + buffers |
+| C | Hour 24 | Confirm linear growth |
+| D | Hour 42 | Pre-OOM state |
+
+Use **A vs B** for rapid feedback. If same patterns grow, you have the culprit. Use **C vs D** to measure slope before committing to code changes.
+
+### Safety Constraints
+
+- **Disk space**: Allocate `/tmp/heapsnapshots` with enough free space (4GB process → ~800MB–2GB heap snapshot compressed).
+- **GC pause**: Heap profiling can add 500ms–3s pause. Avoid during peak traffic.
+- **Atomic writes**: V8 writes to `.tmp` then renames — never copy mid-write.
+- **Rotate aggressively**: Delete old snapshots after comparison to avoid filling `/tmp`.
+
+---
+
+## Phase 2: Diffing Heap Snapshots & Finding Retainer Chains
+
+### Load into Chrome DevTools / Edge DevTools
+
+1. Open `chrome://inspect` → "Open dedicated DevTools for Node"
+2. Or open any `.heapsnapshot` file via browser (`file:///path/to/snapshot.heapsnapshot`)
+3. DevTools renders the heap as a retainers graph
+
+### For Closures Retained by Event Emitter Registry
+
+**DevTools workflow:**
+
+1. Switch allocation tracking: **"Heap Snapshot" → "Take snapshot"** (not summary)
+2. Filter search: type `closure` in the search box
+3. **Crucial step**: Sort by **Retainers** column (descending)
+4. Click on top closure entries → trace back up the retainers tree
+5. Look for paths like:
+   ```
+   Closure ← EventEmitter._events ← ModuleSingleton ← global ← Global object
+   ```
+6. The retainer chain reveals *who holds the reference* to the emitter
+
+**Key insight — what to look for in the retainer chain:**
+
+- Is there a singleton/module-level `EventEmitter` with `_events` growing?
+- Are closures capturing request-scoped variables (headers, body, correlationId)?
+- Is someone calling `.on()` but never `.off()` or forgetting to emit `'removeListener'` cleanup?
+
+**Quantitative check via eval (if attached via inspect):**
+
+```javascript
+// On the live process while paused/investigating
+const ee = require('your-module'); // whatever exports the emitter
+Object.keys(ee._events).length;     // count registered event types
+ee._events['requestEnd'].length;    // listeners on a specific event
+```
+
+### For Buffer Objects from Response-Logging Middleware
+
+**DevTools workflow:**
+
+1. Take two snapshots: `before.log.js` and `after.log.js`
+2. Switch view mode: **"Comparison"** → Select both snapshots
+3. Choose **Difference** view → filter by `ArrayBuffer` or `Uint8Array` (Buffers wrap these)
+4. Look at the **delta** — how many new/more-referenced Buffers appeared
+5. Sort retained sizes (bottom-right panel, "Shallow Size" vs "Retained Size")
+
+**What the retainers typically reveal for logging:**
+
+```
+Buffer ← Object (log entry) ← Array (batch queue) ← LoggerMiddleware ← AppInstance
+```
+
+Or worse:
+
+```
+Buffer ← String (template literal interpolation) ← Request context closure ← EventEmitter listener
+```
+
+**Red flags in retainers:**
+- Buffers held by objects stored in arrays that are never pruned (unbounded queues)
+- Buffers referenced by template literals or string concatenation in log messages (Node keeps the intermediate strings alive)
+- Buffers captured in async callback closures that complete but stay referenced
+
+### Programmatic Snapshot Comparison
+
+For CI or pre-commit safety, automate the diff:
+
+```bash
+npm install heapdump @types/heapdump
+```
+
+```javascript
+// compare-heaps.js
+const heapdump = require('heapdump');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+async function captureSnapshot(pid) {
+  return new Promise((resolve, reject) => {
+    const snapshotPath = `/tmp/heap_${Date.now()}.heapsnapshot`;
+    const cp = spawn('kill', ['-USR2', String(pid)]);
+    cp.on('close', () => {
+      setTimeout(() => resolve(snapshotPath), 2000); // let V8 finish writing
+    });
+  });
+}
+
+// After capturing two snapshots, load them programmatically with node --inspect
+// Or use heapprofiler CLI if installed
+```
+
+---
+
+## Phase 3: Confirming Whether the Emitter Registry Leaks Listeners
+
+### Detection Script (run against live process)
+
+```javascript
+// leak-checker.js — drop this into your service temporarily
+const EventEmitter = require('events');
+
+// Wrap the global EventEmitter prototype to track registrations
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+const origOnce = EventEmitter.prototype.once;
+
+const registry = new Map();
+
+function wrap(handler, eventName, stack) {
+  const wrappedFn = function (...args) {
+    return handler.apply(this, args);
+  };
+  wrappedFn._meta = { eventName, stack: stack?.trim().split('\n').slice(0, 5), created: Date.now() };
+  
+  const key = `${eventName}:${wrappedFn._meta.stack?.substring(0, 50)}`;
+  if (!registry.has(key)) registry.set(key, []);
+  registry.get(key).push(wrappedFn);
+  
+  return wrappedFn;
+}
+
+EventEmitter.prototype.on = function (event, handler) {
+  const cleanStack = new Error().stack;
+  const wrapped = wrap(handler, event, cleanStack);
+  return origOn.call(this, event, wrapped);
+};
+
+EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+
+EventEmitter.prototype.once = function (event, handler) {
+  const cleanStack = new Error().stack;
+  const wrapped = wrap(handler, event, cleanStack);
+  return origOnce.call(this, event, wrapped);
+};
+
+// Expose reporting endpoint
+app.get('/internal/leak-report', (req, res) => {
+  const report = {};
+  let totalListeners = 0;
+  for (const [key, handlers] of registry.entries()) {
+    report[key] = handlers.length;
+    totalListeners += handlers.length;
+  }
+  res.json({ totalListeners, eventsByType: report });
+});
+
+// Log every 30 seconds
+setInterval(() => {
+  const counts = [];
+  for (const [key, handlers] of registry.entries()) {
+    counts.push({ event: key.split(':')[0], count: handlers.length, site: key.split(':')[1]?.substring(0, 80) });
+  }
+  console.log('[LEAK-CHECK]', JSON.stringify(counts.filter(c => c.count > 5)));
+}, 30000);
+```
+
+### What to Watch For
+
+- Listener count **increases monotonically** without decreasing
+- Specific event types accumulate disproportionately (e.g., `responseEnd:147` meaning 147 separate listeners on one event type across requests)
+- Stack traces show different request contexts binding the same event name
+
+### The Classic Pattern: Per-Request `.on()` Without Cleanup
+
+```javascript
+// LEAKY PATTERN — listener accumulates across requests
+router.get('/data', async (req, res) => {
+  const emitter = getSharedEmitter();
+  
+  emitter.on('transformComplete', (result) => {
+    res.json(result);  // closure captures `res` — NEVER cleaned up
+  });
+  
+  await transformStream(req.body);
+  // 'transformComplete' listener is now permanently registered
+  // 1 million requests = 1 million closures retained forever
+});
+```
+
+### The Fix: Per-Request Emitter or Explicit Cleanup
+
+```javascript
+// FIX 1: Use once() instead of on()
+emitter.once('transformComplete', (result) => {
+  res.json(result);
+});
+
+// FIX 2: Use AbortController pattern
+const controller = new AbortController();
+emitter.on('transformComplete', handler, { signal: controller.signal });
+// ... later
+controller.abort();
+
+// FIX 3: Per-request emitter (eliminates cross-request leakage)
+const localEmitter = new EventEmitter();
+localEmitter.on('done', callback);
+// No shared state, no leak possible
+```
+
+---
+
+## Phase 4: Likely Code-Level Root Causes & Fixes
+
+### Root Cause #1: Event Emitter Listener Accumulation ⭐ Most Likely
+
+**Symptom match:** Closures retained by event-emitter registry.
+
+**Common patterns:**
+
+```javascript
+// Pattern A: Shared emitter + per-request .on() without removal
+const logger = new EventEmitter();  // module-level singleton
+
+// In request handler:
+logger.on('error', (er
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

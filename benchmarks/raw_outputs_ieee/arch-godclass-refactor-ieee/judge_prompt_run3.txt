@@ -1,0 +1,1168 @@
+You are an expert AI evaluator. You will score 5 agent responses to the same task.
+
+[Original Task Prompt]:
+A 1,400-line OrderService class handles validation, pricing, tax, persistence, email, and audit logging, with 34 fields and direct SQL scattered through methods. Behavior must not change and there are no tests today. Lay out the refactoring campaign: characterization/golden-master tests first (including how to snapshot current SQL and email side effects), then the seam extraction order (which collaborator to interface first and why), incremental strangler steps each shippable behind the existing public API, and the target module boundaries. Specify how you prove behavior preservation at every commit.
+
+---
+[Response A]:
+## Refactoring Campaign: OrderService (1,400 LOC / 34 Fields)
+
+### Phase 0 — Characterization Tests & Golden Master Strategy
+
+You have zero tests and no guarantee behavior will survive. First commit = lock down current behavior. Every subsequent commit compares against this baseline.
+
+#### 0a. Execution-Level Snapshot: Interceptor + Replay Engine
+
+Build a thin proxy that sits *in front* of every real collaborator inside OrderService, captures the full side-effect transcript for every `public` method call, and writes deterministic JSON to disk. After the run, compare outputs byte-for-byte.
+
+```python
+# characterization/transcript_runner.py — the heart of golden-master
+import json, time, hashlib, functools
+from pathlib import Path
+from typing import Any
+
+OUTPUT_DIR = Path("tests/golden_snapshots")
+OUTPUT_DIR.mkdir(parents=True, existists=False)
+
+class TranscriptCollector:
+    """Intercepts all DB calls, email sends, and audit log writes.
+    
+    Each invocation records:
+      1. The exact SQL text + parameter values used
+      2. The email recipient, subject, body hash, attachments metadata
+      3. Audit log record keys + severity
+    
+    The transcript is a list of ordered "effects" that get hashed
+    deterministically per-order so the same inputs always produce
+    the same output file.
+    """
+    def __init__(self):
+        self.effects: list[dict] = []
+    
+    def record_sql(self, operation: str, table: str, sql: str, params: dict | None):
+        # Canonicalize: remove whitespace differences, sort param keys
+        cleaned = ' '.join(sql.split())
+        sanitized_params = dict(sorted((k, str(v)) for k, v in (params or {}).items()))
+        self.effects.append({
+            "type": "sql",
+            "operation": operation,           # INSERT|UPDATE|DELETE|SELECT
+            "table": table,
+            "sql_hash": hashlib.sha256(cleaned.encode()).hexdigest()[:12],
+            "cleaned_sql": cleaned,
+            "param_count": len(sanitized_params),
+            "params_fingerprint": hashlib.sha256(
+                json.dumps(sanitized_params).encode()
+            ).hexdigest()[:8],
+        })
+    
+    def record_email(self, to: str, subject: str, body_plain: str, 
+                     body_html: str | None, attachments: list[dict]):
+        self.effects.append({
+            "type": "email",
+            "to": to,
+            "subject_hash": hashlib.sha256(subject.encode()).hexdigest()[:12],
+            "body_md5": hashlib.md5(body_plain.encode()).hexdigest(),
+            "has_html": body_html is not None,
+            "attachment_count": len(attachments),
+        })
+    
+    def record_audit(self, action: str, entity_type: str, entity_id: str, 
+                     severity: str, detail: str):
+        self.effects.append({
+            "type": "audit",
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "severity": severity,
+            "detail_hash": hashlib.sha256(detail.encode()).hexdigest()[:12],
+        })
+    
+    def snapshot_key(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.effects, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
+
+def freeze_order_result(order_result: Any) -> dict:
+    """Convert any rich result object to pure-JSON-serializable form."""
+    # If results carry datetime, Decimal, UUID — normalize here
+    return {
+        "order_id": str(order_result.order_id),
+        "status": order_result.status,
+        "total_cents": int(order_result.total_cents),
+        "line_items": [
+            {"sku": li.sku, "qty": li.qty, "unit_price_cents": int(li.unit_price_cents)}
+            for li in order_result.line_items
+        ],
+        "created_at": str(order_result.created_at),
+    }
+
+
+def record_execution(order_service, method_name: str, args, kwargs) -> dict:
+    """Execute one OrderService public method + collect full transcript.
+    
+    This replaces every real collaborator temporarily via monkey-patch
+    or dependency injection swap (see §0b below). Returns the
+    golden-master JSON payload.
+    """
+    collector = TranscriptCollector()
+    
+    # --- Patch collaborators ---
+    _patch_db(order_service, collector)
+    _patch_emailer(order_service, collector)
+    _patch_logger(order_service, collector)
+    
+    # Execute
+    start = time.monotonic()
+    result = getattr(order_service, method_name)(*args, **kwargs)
+    elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+    
+    # Revert patches (or rely on scoped DI swap)
+    _unpatch_all(order_service)
+    
+    frozen_result = freeze_order_result(result)
+    snapshot = {
+        "method": method_name,
+        "input_hash": hashlib.sha256(
+            json.dumps({"args": args, "kwargs": kwargs}, default=str).encode()
+        ).hexdigest(),
+        "result": frozen_result,
+        "effects": collector.effects,
+        "elapsed_ms": elapsed_ms,
+        "snapshot_key": collector.snapshot_key(),
+    }
+    return snapshot
+
+
+def _patch_db(service, collector):
+    raw_conn = service._db_connection          # or however it owns its connection
+    original_execute = raw_conn.execute
+        
+    @functools.wraps(original_execute)
+    def traced_execute(sql, params=None):
+        parsed = _parse_statement(sql)         # heuristic parser
+        collector.record_sql(parsed["op"], parsed["tbl"], sql, params)
+        return original_execute(sql, params)
+    
+    raw_conn.execute = traced_execute
+
+
+def _patch_emailer(service, collector):
+    orig_send = service._mailer.send
+    @functools.wraps(orig_send)
+    def traced_send(to, subject, body_plain, body_html=None, attachments=None):
+        collector.record_email(to, subject, body_plain, body_html, attachments or [])
+        return orig_send(to, subject, body_plain, body_html=body_html, attachments=attachments)
+    service._mailer.send = traced_send
+
+
+def _patch_logger(service, collector):
+    orig_write = service._auditor.write
+    @functools.wraps(orig_write)
+    def traced_write(action, entity_type, entity_id, severity, detail):
+        collector.record_audit(action, entity_type, entity_id, severity, detail)
+        return orig_write(action, entity_type, entity_id, severity, detail)
+    service._auditor.write = traced_write
+
+
+def _parse_statement(sql: str) -> dict:
+    """Naive but sufficient statement classifier."""
+    upper = sql.strip().upper()
+    op = upper[:6]                              # SELECT|INSERT|UPDATE|DELETE
+    table_map = {
+        "INSERT INTO orders": "orders",
+        "UPDATE orders SET": "orders",
+        "INSERT INTO order_lines": "order_lines",
+        "INSERT INTO order_payments": "payments",
+        "SELECT FROM payments": "payments",
+    }
+    tbl = "unknown"
+    for key, val in table_map.items():
+        if key.upper() in sql.upper():
+            tbl = val
+            break
+    return {"op": op, "tbl": tbl}
+```
+
+#### 0b. Auto-Generating Golden-Snapshot Test Cases
+
+Don't hand-write each case. Build a **test generator** that discovers all public methods and exercises them with edge-case payloads:
+
+```python
+# tests/golden_master/test_generators.py
+import pytest
+import json
+from pathlib import Path
+from characterization.transcript_runner import record_execution, OUTPUT_DIR
+
+GOLDEN_DIR = OUTPUT_DIR
+SEED_FILE = Path("tests/golden_snapshots/.seed_ids.json")
+
+def _load_seed(id_prefix: str) -> str:
+    """Deterministic IDs so re-runs produce identical data."""
+    seeds = json.loads(SEED_FILE.read_text())
+    seq = seeds.get(id_prefix, 0)
+    seeds[id_prefix] = seq + 1
+    SEED_FILE.write_text(json.dumps(seeds, indent=2))
+    return f"{id_prefix}_{seq:04d}"
+
+
+def _golden_path(method: str, input_hash: str) -> Path:
+    return GOLDEN_DIR / f"{method}_{input_hash}.json"
+
+
+def _assert_golden(method: str, snapshot: dict):
+    """Read expected file; if missing, CREATE it (first-run mode).
+       On subsequent runs, COMPARE byte-for-byte.
+       
+       -- GATHER_MODE=1 env var tells this to *write* rather than assert.
+    """
+    import os
+    golden_path = _golden_path(method, snapshot["input_hash"])
+    
+    if os.environ.get("GATHER_MODE") == "1":
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+        print(f"[GATHER] Wrote {golden_path}")
+        return
+    
+    if not golden_path.exists():
+        pytest.fail(
+            f"NO GOLDEN SNAPSHOT FOR '{method}' (input_hash={snapshot['input_hash']}).\n"
+            f"Run with GATHER_MODE=1 to create baseline."
+        )
+    
+    expected = json.loads(golden_path.read_text())
+    assert snapshot["result"] == expected["result"], \
+        f"RESULT MISMATCH for {method}: expected {expected['result']} != got {snapshot['result']}"
+    assert snapshot["effects"] == expected["effects"], \
+        f"EFFECTS MISMATCH for {method}:\n" \
+        f"  expected {len(expected['effects'])} effects, got {len(snapshot['effects'])}\n" \
+        f"  diff keys: {set(e['snapshot_key'] for e in expected['effects']) ^ set(e['snapshot_key'] for e in snapshot['effects'])}"
+
+
+def _run_sweep(order_service_factory, method_spec):
+    """Drive one method with a fixture payload; store + assert golden."""
+    method_name = method_spec["method"]
+    fixtures = method_spec["fixtures"]   # list of {name, args, kwargs}
+    
+    for i, fixture in enumerate(fixtures):
+        svc = order_service_factory()
+        snap = record_execution(
+            svc, method_name,
+            fixture.get("args", ()),
+            fixture.get("kwargs", {}),
+        )
+        name = f"{method_name}/{fixture['name']}"
+        snap["_case_name"] = name
+        yield name, snap
+
+
+@pytest.fixture
+def order_svc():
+    """Create OrderService wired to test DB (SQLite in-memory),
+    test mailer (noop stub), test auditor (list collector)."""
+    from src.order_service import OrderService
+    db = create_test_db()          # sqlite :memory: seeded with fixtures
+    mailer = NoOpMailer()
+    audito
+...[truncated]
+---[Response B]:
+Great — since there's no existing OrderService in this repo, you're giving me a canonical monolith-service problem to solve. Here's the full campaign.
+
+---
+
+# Refactoring Campaign: 1,400-Line OrderService → Modular Architecture
+
+## Phase 0: Baseline & Guardrails (Days 1-2)
+
+**Goal**: Create an unbreakable safety net before touching any production code.
+
+### 0a. Characterization Tests via Golden Master
+
+The core insight: you can't refactor what you can't measure. But you *can* characterize behavior by intercepting its outputs.
+
+**Strategy: Test-Driven Development of the Refactor (TDDR)** — characterization tests first, then extract.
+
+```
+Characterization tests fall into three categories based on what OrderService touches:
+```
+
+#### Direct Unit Interception (No Mocks on Service Itself)
+
+Since there are no tests today, I need to test the public API surface as-is. The key is to **parameterize real collaborators behind thin interfaces**, run the current system against realistic fixtures, and capture every observable output.
+
+| What to Characterize | How |
+|---|---|
+| **Order state transitions** (create → validate → price → tax → persist → email → audit) | Pass fixture orders through `createOrder()` / `processOrder()` and assert final persisted state |
+| **Validation rules** | Feed valid/invalid payloads; assert error types and messages match exactly |
+| **Pricing logic** | Fixture with known line items, quantities, discounts; assert computed total matches expected |
+| **Tax calculation** | Fixture by jurisdiction; assert tax amount, rate applied, tax code used |
+| **Email side effects** | Intercept the mailer/sendGrid/SesClient at the constructor level; collect sent emails' recipients, subjects, bodies |
+| **Audit log entries** | Query the audit table after each operation; snapshot row count + change deltas |
+| **SQL queries executed** | Use `pg_stat_statements` or MySQL query log wrapper; record exact SQL text per method call |
+
+#### Snapshotting SQL Side Effects
+
+```python
+class SqlCaptureMixin:
+    """Drop-in replacement that records every query OrderService executes."""
+    
+    def __init__(self, delegate, captured_queries=None):
+        self._delegate = delegate
+        self._captured = captured_queries if captured_queries is not None else []
+    
+    def execute(self, sql, params=None):
+        # Normalize whitespace for comparison stability
+        normalized = ' '.join(sql.split())
+        self._captured.append({'sql': normalized, 'params': params})
+        return self._delegate.execute(sql, params)
+    
+    # proxy all other methods to _delegate
+```
+
+In the characterization test setup:
+
+```python
+def test_order_create_sql_determinism():
+    original_db = order_service._db_connection
+    captures = []
+    order_service._db_connection = SqlCaptureMixin(original_db, captures)
+    
+    result = order_service.create_order(fixture_simple_order)
+    
+    # Assert SQL set is stable — next refactoring pass must reproduce it
+    assert captures == golden_master['create_order_sql']
+```
+
+Store golden SQL in JSON fixtures alongside characterizing test inputs.
+
+#### Snapshotting Email Side Effects
+
+```python
+class EmailCapture:
+    """Intercepts send_email() calls, collects them for assertion."""
+    
+    def __init__(self):
+        self.sent_emails = []
+    
+    def send(self, recipient, subject, body, **kwargs):
+        self.sent_emails.append({
+            'recipient': recipient,
+            'subject': subject,
+            'body': body,
+            'headers': kwargs.get('headers', {}),
+        })
+
+# In test setup, replace the email collaborator:
+capture = EmailCapture()
+order_service._email_sender = capture
+
+order_service.approve_order(order_id=123)
+
+assert len(capture.sent_emails) == 2
+assert capture.sent_emails[0]['recipient'] == 'customer@example.com'
+assert 'Your order has been approved' in capture.sent_emails[0]['subject']
+```
+
+The same approach applies for SMS notifications, Slack alerts, or webhook dispatchers.
+
+#### What Not to Test
+
+Don't write golden tests for:
+- Internal helper methods (private implementation details)
+- Third-party library internals
+- Timing-related behavior (use clock abstraction instead)
+
+### 0b. Execution Strategy for Tests
+
+1. **Identify the public method boundary** — list every `public`/`@api` method on OrderService
+2. **For each method, build one positive and one negative test case** using minimal realistic data
+3. **Run the whole suite against the untouched 1,400-line class** — green = baseline locked
+4. **Commit with message**: `test(characterization): lock order service behavior before refactor`
+5. **Every subsequent commit runs this suite** — red = broken invariant, revert immediately
+
+CI gate: this characterization suite MUST pass on every PR before integration tests even run.
+
+---
+
+## Phase 1: Seam Extraction Order
+
+The extraction order follows **dependency minimization** — extract interfaces for collaborators that have the fewest callers first, so extracting others becomes trivially easy.
+
+### Layered Dependency Map
+
+Visualize the 1,400-line class as a graph. Based on your description:
+
+```
+┌─────────────────────────────┐
+│         OrderService        │
+│   (34 fields, direct SQL)   │
+├─────────────────────────────┤
+│ ┌──────────┐  ┌──────────┐ │
+│ │Validator │  │ Pricing  │ │
+│ │(pure fn) │  │(has rule │ │
+│ └──────────┘  │ deps?)   │ │
+├───────────────┼──────────┤ │
+│ ┌──────────┐  ┌──────────┐ │
+│ │ TaxCalc  │  │ Persist  │ │ ← DatabaseRepository
+│ │(pure fn) │  │          │ │
+│ └──────────┘  └──────────┘ │
+├─────────────────────────────┤
+│ ┌──────────┐  ┌──────────┐ │
+│ │ Email    │  │ Audit    │ │ ← NotificationSender, AuditLogWriter
+│ └──────────┘  └──────────┘ │
+└─────────────────────────────┘
+```
+
+### Extract Sequence (Optimal Order)
+
+| Step | Extract | Why First? | Effort | Risk |
+|------|---------|------------|--------|------|
+| **1** | `DatabaseRepository` (or `OrderGateway`) | Most invasive — direct SQL scattered everywhere. Few external callers besides OrderService itself. High blast radius but clear interface. | Medium-High | High (if wrong) |
+| **2** | `NotificationSender` (unified email/SMS/webhook) | Pure interface, zero internal dependencies. Can swap implementations instantly. | Low | Low |
+| **3** | `OrderValidator` (extract validation rules from inline checks) | Mostly pure functions. Easiest extraction because it's likely embedded conditionals. | Low | Very Low |
+| **4** | `PricingEngine` | May depend on validator; extract after validator so pricing can receive validated input cleanly. | Medium | Medium |
+| **5** | `TaxCalculator` | Usually pure function (input: item, jurisdiction → output: tax). Safe to extract once pricing is clean. | Low-Medium | Low |
+| **6** | `AuditLogWriter` | Simple append-only; may share DB connection with step 1 (so do after DB repo is extracted). | Low | Very Low |
+
+### Why This Order?
+
+1. **Database first** gives us a clean `persistOrder(Order)` and `findOrderById(id)` — every other layer now talks to an interface, not raw SQL strings. This is the highest-risk move, but also the highest-reward: it isolates the most violation of single responsibility.
+
+2. **Notifications second** is low-risk and gives a visible early win. The interface is dead-simple: `send(Notification)`. No branching logic needed inside the interface contract.
+
+3. **Validator third** decomposes the most tangled inline `if` blocks across all methods. Once these are separate, the main flow methods read like a pipeline.
+
+4. **Pricing fourth** often has domain-specific rules (promotions, bulk discounts, geo-rules). With validation cleaned up, pricing receives clean DTOs.
+
+5. **Tax fifth** is the simplest domain logic — usually a lookup table or formula. Cleanest when pulled last because it depends on finalized pricing context.
+
+6. **Audit last** because audit logging is a cross-cutting concern that should ideally use the repository interface (step 1) rather than raw DB connections.
+
+---
+
+## Phase 2: Incremental Strangler Steps
+
+Each step ships as a mergeable change behind the existing public API. No customer-visible breaking changes ever.
+
+### Strangler Step 1: Database Repository Boundary
+
+```
+Before:                          After:
+OrderService                     OrderService
+  ├─ _db.execute("SELECT...")     ├─ _db: DatabaseRepository  
+  ├─ _db.execute("INSERT...")     │  └─ findOrderById(id) -> OrderDTO
+  └─ _db.execute("UPDATE...")     ├─ _validator: Validator
+                                   ├─ _pricing: PricingEngine
+                                   ├─ _tax: TaxCalculator  
+                                   ├─ _repository: DatabaseRepository  ← NEW
+                                   │  └─ save(order), update(order)
+                                   └─ _notifications: NotificationSender
+
+Public API unchanged: createOrder(), processOrder(), cancelOrder()
+```
+
+**What changes inside**: All `_db.execute()` calls become `_repository.findX()` and `_repository.saveX()`. SQL moves into the repository implementation (initially still OrderService internals, then migrated out).
+
+**Verification**: Characterization tests confirm the SQL executed is identical (via SqlCaptureMixin). If SQL differs, commit is reverted.
+
+**Shippability**: The repository is injected via a default factory that wraps the old `_db` connection. Zero config change needed.
+
+### Strangler Step 2: Validation Extraction
+
+```python
+# Before: inline in 8 methods
+def create_order(self, payload):
+    if not payload.customer_id:
+        raise ValidationError("customer_id required")
+    if payload.total < 0:
+        raise ValidationError("negative total")
+    ... 20 more checks
+
+# After: separated
+class OrderValidator:
+    def validate_create(self, payload) -> ValidationResult:
+        errors = []
+        if not payload.customer_id: errors.append(...)
+        if payload.total < 0: errors.append(...)
+        return ValidationResult(errors)
+
+# OrderService delegates:
+def create_order(self, payload)
+...[truncated]
+---[Response C]:
+# OrderService Refactoring Campaign
+
+## Current State & Problem Profile
+
+A single `OrderService` class doing too much: input validation, pricing computation, tax calculation, database persistence, email dispatch, and audit logging across **34 fields** and **~1,400 lines** with direct SQL embedded inside business methods. No test suite exists.
+
+---
+
+## Phase 0 — Discovery & Baseline
+
+### Scope Analysis (grep-driven)
+
+Before touching any code, establish what you're dealing with:
+
+```bash
+# All methods and their approximate line counts
+grep -n 'def \|class ' src/order_service.py | grep -E '(    def |_def )'
+
+# Every raw SQL string literal — these are boundary markers
+grep -n '".*FROM\|".*INSERT\|".*UPDATE\|".*DELETE\|'.*\*.select(' src/order_service.py
+
+# Every external dependency hidden inside methods
+grep -n 'email\.send\|smtp\.\|Connection(\|cursor(\|execute(' src/order_service.py
+
+# Public API surface — nothing in here can change until Phase 4
+grep -n 'def [a-z]' src/order_service.py | head -34
+```
+
+**Deliverable**: A one-page map listing each public method, its side effects (SQL writes, emails sent), and its dependencies. This becomes the source of truth for golden-master assertions.
+
+---
+
+## Phase 1 — Golden-Master / Characterization Tests
+
+The goal: prove behavioral equivalence after every single refactor commit. These tests don't assert what the code *should* do — they assert what it *actually* does right now. That's the distinction between characterization tests (safety net) and unit tests (design intent).
+
+### Strategy Overview
+
+| Side Effect | How to Snapshot | Verification |
+|---|---|---|
+| **Database writes** | Intercept at cursor level: record `(query, params)` tuples executed during the call | Post-call replay against an in-memory DB; compare row counts |
+| **Email dispatch** | Mock/stub the email sender; capture subject, body, recipients, attachments | Assert exact strings + metadata from captured calls |
+| **Return values** | Call every public method with fixed fixtures; serialize return dicts to JSON snapshots | Diff against committed fixture files |
+| **Exceptions** | Feed invalid inputs; record exception type + message | Re-assert same exception class with same message text |
+
+### Infrastructure: Test Harness Classes
+
+```python
+"""Tests/fixtures/order_characterization.py
+
+All tests here use REAL collaborators behind lightweight stubs that record
+what happened rather than returning fake data. This preserves side-effect
+behavior while making the execution deterministic.
+"""
+
+import json
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+from src.order_service import OrderService
+from src.infrastructure.database import Connection
+from src.notifications.email import EmailSender
+
+
+# ── Stubs that record side effects ────────────────────────────────────────
+
+class SqlRecorder:
+    """Intercepts DB calls and logs (sql, params) tuples instead of hitting
+    a live database. After the service call we verify by replaying into an
+    ephemeral SQLite instance."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        self.calls.append((sql, params))
+
+    def fetchone(self, sql: str, params: tuple = ()) -> tuple | None:
+        # Return a small canned result set for lookups
+        return {"id": "ORD-001", "status": "pending"}
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return [("line1", "item-a", 10, 2)]
+
+    def lastrowid(self) -> int:
+        return 42
+
+
+class EmailCapture:
+    """Collects send_*() invocations without actually contacting SMTP."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def send_order_confirmation(self, order_id: str, to: str, items: list, total: float) -> None:
+        self.sent.append({
+            "method": "send_order_confirmation",
+            "order_id": order_id,
+            "to": to,
+            "items": items,
+            "total": total,
+        })
+
+    def send_tax_receipt(self, order_id: str, to: str, tax_amount: float) -> None:
+        self.sent.append({
+            "method": "send_tax_receipt",
+            "order_id": order_id,
+            "to": to,
+            "tax_amount": tax_amount,
+        })
+
+
+class AuditLoggerStub:
+    """Records audit entries in memory."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+
+    def log(self, action: str, entity_type: str, entity_id: str, details: dict) -> None:
+        self.entries.append({
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "details": details,
+        })
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────
+
+FIXTURE_PATH = Path(__file__).parent / "snapshots"
+
+def _load_snapshot(method_name: str) -> dict:
+    path = FIXTURE_PATH / f"{method_name}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def _save_snapshot(method_name: str, data: dict) -> None:
+    FIXTURE_PATH.mkdir(parents=True, exist_ok=True)
+    path = FIXTURE_PATH / f"{method_name}.json"
+    path.write_text(json.dumps(data, indent=2, default=str))
+
+
+# ── Base class so every characterization test gets the infrastructure ────
+
+class OrderServiceCharacterizationTest(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.sql_recorder = SqlRecorder()
+        self.email_capture = EmailCapture()
+        self.audit_logger = AuditLoggerStub()
+
+    # Helper factories that mirror how production wires the real collaborators
+    def _make_sut(self) -> OrderService:
+        return OrderService(
+            db=self.sql_recorder,          # will be replaced with Connection(...) later
+            email=self.email_capture,      # will be replaced with EmailSender(...) later
+            audit=self.audit_logger,
+        )
+
+
+# ── Concrete characterization tests ──────────────────────────────────────
+
+class CreateOrderGoldenMaster(OrderServiceCharacterizationTest):
+    """Behavior snapshot for OrderService.create_order(...).
+
+    Records: SQL executed, emails fired, return value shape,
+             audit trail, and exceptions on bad input.
+    """
+
+    def _capture_full_result(self) -> dict:
+        """Serialize everything that happened during the most recent test
+        call so we can diff it against the committed snapshot on re-runs."""
+        return {
+            "return_value": getattr(self, "_last_return_value", None),
+            "sql_calls": self.sql_recorder.calls,
+            "emails_sent": self.email_capture.sent,
+            "audit_entries": self.audit_logger.entries,
+            "exception": getattr(self, "_last_exception", None),
+        }
+
+    def _run_and_snapshot(self, method_name: str, *args, **kwargs):
+        """Execute the target method, catch any exception, then save or
+        compare the serialized outcome against the committed snapshot."""
+        try:
+            result = self._last_method(*args, **kwargs)
+            self._last_return_value = result
+            self._last_exception = None
+        except Exception as exc:
+            self._last_return_value = None
+            self._last_exception = {"type": type(exc).__name__, "message": str(exc)}
+
+        outcome = self._capture_full_result()
+
+        # On FIRST run: generate the golden snapshot file.
+        # On subsequent runs: assert behavior matches snapshot.
+        snapshot = _load_snapshot(method_name)
+        if not snapshot:
+            _save_snapshot(method_name, outcome)
+            self.skipTest(f"Generated new golden snapshot for {method_name}")
+
+        self.assertEqual(outcome["sql_calls"], snapshot["sql_calls"])
+        self.assertEqual(outcome["emails_sent"], snapshot["emails_sent"])
+        self.assertEqual(outcome["audit_entries"], snapshot["audit_entries"])
+        self.assertEqual(type(outcome["exception"]).__name__ if outcome["exception"] else None,
+                         type(snapshot["exception"]).__name__ if snapshot.get("exception") else None)
+        if outcome.get("return_value") and snapshot.get("return_value"):
+            self.assertEqual(outcome["return_value"]["order_id"],
+                             snapshot["return_value"]["order_id"])
+
+
+class UpdateOrderStatusGoldenMaster(OrderServiceCharacterizationTest):
+    pass  # identical structure — parametrized would work but clarity > cleverness here
+
+
+class CancelOrderGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+class CalculatePricingGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+class ProcessRefundGoldenMaster(OrderServiceCharacterizationTest):
+    pass
+
+
+# ── Fixture generation runner ────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    """Run with --generate flag to produce fresh golden snapshots when
+    comparing against production, not the old snapshots."""
+    generate = "--generate" in sys.argv
+    unittest.main()
+```
+
+### How to Prove Behavior Preservation at Every Commit
+
+Each commit must satisfy **three gates**:
+
+| Gate | Check | Tool |
+|---|---|---|
+| **Gate 1 — Golden master** | `python -m pytest tests/fixtures/order_characterization.py -v` — ALL existing snapshots pass | CI block |
+| **Gate 2 — No dead SQL** | `grep -c "INSERT\|UPDATE\|DELETE\|SELECT" src/old_order_service.py` should equal the baseline count — confirms you haven't accidentally dropped a statement | Pre-commit hook |
+| **Gate 3 — API surface frozen** | Public method signatures in `src/order_service.py` unchanged until Phase 4 | `inspect.signature()` regression check in CI |
+
+> If Gate 2 fails, you either added SQL (missing from golden master) or removed some (regression). Investigate immediately — do **not** suppress the failure.
+
+---
+
+## Phase 2 — Extract Interfaces (Seam Planning)
+
+With characterization tests passing (Phase 1 green), introduce seams. Each seam turns a 
+...[truncated]
+---[Response D]:
+**Important clarification**: I searched the entire codebase (grep + glob for OrderService, `*order*service*`, `class.*[Oo]rder`) and found no such class. This appears to be a hypothetical scenario based on the characteristics you described (1,400 lines, 34 fields, direct SQL, email, audit logging). I'll provide a complete, actionable plan grounded in the architecture you've described — with concrete code examples — so you can apply it directly.
+
+---
+
+## Complete Refactoring Campaign: OrderService Decomposition
+
+### Architecture Diagnosis
+
+Before the plan, let me sketch the likely coupling graph based on your description:
+
+```
+                    ┌──────────────┐
+                    │   Order      │
+                    │   Service    │
+                    │              │
+        ┌───────────┤──────────────┤──────────────┬─────────────┐
+        │           │              │              │             │
+        ▼           ▼              ▼              ▼             ▼
+  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │ Database │ │Pricing    │ │Validator │ │ Email    │ │ Audit    │
+  │ (raw     │ │Calculator │ │          │ │ Client   │ │ Logger   │
+  │  Connection)│          │ │          │ │(smtp)    │ │          │
+  └──────────┘ └───────────┘ └──────────┘ └──────────┘ └──────────┘
+        │            ▲
+        │            │
+        │     ┌──────┴───────┐
+        │     │   TaxRate    │
+        │     │  Resolution  │
+        │     └──────────────┘
+        │
+   ┌─────────┐
+   │ Cache   │
+   └─────────┘
+```
+
+**Key observations:**
+- **Repository/Collaboration**: Every method touching an order reads/writes via raw SQL → deepest coupling
+- **Pricing**: Complex nested logic, called by create/update/calculate → highest cyclomatic complexity
+- **Tax**: Likely simple function buried inside pricing → easy to isolate once pricing is extracted
+- **Email & Audit**: Localized to specific methods, single responsibility → trivial extraction, best done later
+- **Validator**: Scattered `if` blocks across methods → medium extraction effort
+
+---
+
+### Part 1: Characterization / Golden-Master Tests
+
+#### 1.1 What Behaviors Must Be Captured
+
+Golden-master tests capture the **complete observable effect** of each public method, not just return values. For OrderService this means three effect surfaces:
+
+| Surface | How to Capture | Why |
+|---------|---------------|-----|
+| Return value | Serialize to deterministic JSON (sort keys, round floats) | Directly visible |
+| Database mutations | Row counts + SHA-256 checksums of critical columns before/after | Proves no silent data change |
+| Side channels (email, audit log) | Intercept at the infrastructure boundary | Proves no behavior drift in integrations |
+
+#### 1.2 Infrastructure Hooks for Testing
+
+```python
+"""
+Infrastructure interception layer. Wraps OrderService's concrete
+dependencies with observable substitutes that can be queried after
+method execution. No behavior change — only observation.
+"""
+
+import hashlib
+import json
+import smtplib
+import socket
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from contextlib import contextmanager
+
+
+# ---- DATABASE SNAPSHOT ----
+
+@dataclass(frozen=True)
+class DbRow:
+    """Deterministic representation of a single table row."""
+    table_name: str
+    primary_key_value: str
+    normalized_columns: dict  # values converted to strings, sorted keys
+
+
+class DatabaseSnapshot:
+    """Captures a point-in-time view of order-related tables."""
+
+    ORDER_TABLES = {
+        'orders', 'order_items', 'order_tax_lines',
+        'order_payments', 'order_audit_log'
+    }
+
+    def __init__(self, connection):
+        self._conn = connection
+
+    def take(self) -> dict:
+        """Return row counts + deterministic checksums per table."""
+        snap = {}
+        cur = self._conn.cursor()
+        for table in self.ORDER_TABLES:
+            try:
+                # Get primary key column name (assumes standard naming)
+                pk_map = {'orders': 'id', 'order_items': 'id',
+                          'order_tax_lines': 'id', 'order_payments': 'id',
+                          'order_audit_log': 'id'}
+                pk_col = pk_map.get(table, 'id')
+
+                # Row count
+                cur.execute(f'SELECT COUNT(*) FROM {table}')
+                snap[table] = {'row_count': cur.fetchone()[0], 'checksums': []}
+
+                # Checksum of all data (excluding volatile fields)
+                cur.execute(f'SELECT {pk_col} FROM {table} ORDER BY {pk_col}')
+                pks = [str(r[0]) for r in cur.fetchall()]
+
+                for pk in pks:
+                    cur.execute(f'SELECT * FROM {table} WHERE {pk_col} = %s ORDER BY column_name', (pk,))
+                    rows = cur.fetchall()
+                    if rows:
+                        col_names = [d[0] for d in cur.description]
+                        # Normalize: exclude timestamps, convert bytes, sort
+                        normalized = {}
+                        for row in rows:
+                            for i, val in enumerate(row):
+                                col = col_names[i]
+                                if val is None:
+                                    normalized[col] = ''
+                                elif isinstance(val, (datetime,)):
+                                    normalized[col] = val.isoformat()  # deterministic
+                                elif isinstance(val, (int, float, bool, str)):
+                                    normalized[col] = str(val)
+                                else:
+                                    normalized[col] = repr(val)
+
+                        ck = hashlib.sha256(
+                            json.dumps(normalized, sort_keys=True).encode()
+                        ).hexdigest()
+                        snap[table]['checksums'].append({
+                            'pk': str(pk),
+                            'checksum': ck
+                        })
+            except Exception:
+                continue  # Table may not exist in test schema
+        return snap
+
+    def describe_diff(self, before: dict, after: dict) -> list[str]:
+        """Produce human-readable diffs between two snapshots."""
+        diffs = []
+        for table in self.ORDER_TABLES:
+            b = before.get(table, {})
+            a = after.get(table, {})
+
+            bc = b.get('row_count', 0)
+            ac = a.get('row_count', 0)
+            if bc != ac:
+                diffs.append(f'{table}: row_count changed {bc}→{ac}')
+
+            b_ck = {x['pk']: x['checksum'] for x in b.get('checksums', [])}
+            a_ck = {x['pk']: x['checksum'] for x in a.get('checksums', [])}
+
+            for pk in set(b_ck) | set(a_ck):
+                if b_ck.get(pk) != a_ck.get(pk):
+                    diffs.append(f'{table}[pk={pk}]: content changed')
+        return diffs
+
+
+# ---- FAKE SMTP SERVER ----
+
+@dataclass
+class CapturedEmail:
+    sender: str
+    recipient: str
+    subject: str
+    body: str
+    timestamp: str
+
+
+class FakeSmtpTransport:
+    """Wraps the real SMTP client with a capture buffer.
+    
+    The real transport still sends (to avoid test pollution), but
+    we also record every call for assertion. For truly offline tests,
+    override send_email to use this transport instead of the real one.
+    """
+
+    def __init__(self, real_transport=None):
+        self._real = real_transport
+        self._emails: list[CapturedEmail] = []
+
+    def send(self, sender: str, recipient: str,
+             subject: str, body: str) -> str:
+        msg = CapturedEmail(sender, recipient, subject, body,
+                           datetime.now(timezone.utc).isoformat())
+        self._emails.append(msg)
+        if self._real:
+            self._real.send(sender, recipient, subject, body)
+        return msg.timestamp  # return whatever the real transport returns
+
+    def get_sent_emails(self) -> list[CapturedEmail]:
+        return list(self._emails)
+
+    def reset(self):
+        self._emails.clear()
+
+
+# ---- AUDIT LOG SNAPSHOTTER ----
+
+class AuditLogCapture:
+    """Records audit entries written during method execution."""
+
+    def __init__(self, audit_repository):
+        self._repo = audit_repository
+        self._entries_before: int = 0
+        self._captured_ids: list[int] = []
+
+    def mark_before(self):
+        cur = self._repo.connection.cursor()
+        cur.execute('SELECT MAX(id) FROM order_audit_log')
+        row = cur.fetchone()
+        self._entries_before = row[0] or 0
+
+    def get_captured_entries(self) -> list[dict]:
+        cur = self._repo.connection.cursor()
+        cur.execute(
+            'SELECT id, event_type, actor, entity_type, entity_id, '
+            'details, created_at FROM order_audit_log '
+            'WHERE id > %s ORDER BY id',
+            (self._entries_before,)
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ---- THE TEST HARNESS ----
+
+class OrderTestHarness:
+    """Unified fixture that prepares environment, captures state,
+    executes the method under test, and asserts determinism.
+    
+    Usage:
+        with OrderTestHarness(session) as harness:
+            result = harness.svc.CreateOrder(...)
+            harness.assert_db_snapshot()
+            harness.assert_emails(...)
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.db_snap = DatabaseSnapshot(session.connection)
+        self.email_cap = FakeSmtpTransport()
+        self.audit_cap = AuditLogCapture(session.audit_repo)
+        self._pre: dict = {}
+
+    def __enter__(self):
+        self._seed_test_data()
+        self._pre = self.db_snap.take()
+        self.audit_cap.mark_before()
+        return self
+
+    def __exit__(self, *exc):
+        pass  # rollback handled elsewhere
+
+    def _seed_test_data(self):
+        """Insert predictable products/users that every test needs."""
+        cur = self.session.connection.cursor()
+        # One active product
+
+...[truncated]
+---[Response E]:
+There's no OrderService in this repo — this is a skills/benchmarks knowledge base. So your request is a standalone analysis exercise. Here's the full campaign.
+
+---
+
+## Refactoring Campaign: 1,400-Line OrderService → Module Boundaries
+
+### Phase 0: Baseline
+
+Before touching a single line, capture what exists. Run `git stash` + `git status` baseline so you can diff every commit afterward. If the project already has CI, run it green once and note the passing state as "baseline commit."
+
+### Phase 1: Characterization / Golden-Master Tests (3–5 shippable commits)
+
+**Goal:** Cover the public API so that when each subsequent change lands, you have an oracle telling you if behavior regressed. You don't need unit-perfect tests — you need *executable specifications* of current behavior.
+
+#### What to test first (in priority order):
+
+1. **The main entry methods** — whatever the public surface area is (e.g., `placeOrder()`, `cancelOrder()`, `updatePrice()`). These are the only methods callers outside the class touch, so they're the cheapest regression net with the highest ROI.
+2. **Validation-only paths** — inputs that get rejected today should keep getting rejected. A few bad-input calls against the same entry points catch regressions in guard logic.
+3. **Pricing/tax edge cases** — the methods most likely to be subtly altered during extraction (rounding, currency conversion, tax exemption thresholds). Pick 3–5 inputs with known expected outputs from production data or sample orders.
+
+#### How to characterize side effects without modifying production behavior:
+
+**SQL side effects — snapshot approach:**
+
+- Wrap every entry-point call in a real or integration transaction. Use an in-memory database (H2, SQLite, or PostgreSQL Docker container depending on the stack) seeded with production-equivalent fixtures.
+- After calling `placeOrder(order)`, extract the resulting DB state into a golden struct: all rows in `orders`, `order_items`, `inventory_adjustments`, `audit_log` affected by that call. Serialize to JSON/YAML. Store as a test resource file (`tests/fixtures/golden/place_order_1.golden.json`).
+- On the next run, re-execute the same call, query the same tables, compare golden vs actual. Any row count mismatch, field drift, or missing foreign key is a failure.
+- For SQL *query* correctness (not just mutations), snapshot the result sets of any read queries the method performs before the mutation. Price lookups, tax rate resolution, inventory checks — those matter because refactoring can silently change which indexes are hit or which columns are selected.
+- **Key insight:** Don't try to assert raw SQL strings. Assert the *resulting domain state*. That survives table renames, JOIN rewrites, ORM migrations.
+
+**Email side effects — interceptor approach:**
+
+- Do NOT send real emails during tests. Instead, intercept at the mail transport layer.
+- If using Java/Spring: wrap the `JavaMailSender` in a test double that captures outgoing `MimeMessage`s into a thread-local list. Assert headers, recipients, subject templates, body placeholders.
+- If using Node/NestJS: replace the email service with a spy via DI. Capture call args. Compare captured payloads against golden email templates (store the expected template + interpolated variables in a fixture).
+- If there's no injection point: add a transient test hook — e.g., set an env var `EMAIL_LOG_DIR=/tmp/test-emails` that the production email code respects when present (or use an AOP/aspect in testing config). Even better: if the email sender is a constructor parameter (even if injected via framework), swap it in tests with zero code changes.
+- **Golden email format:** `{to: string[], subject: string, bodyTemplate: string, interpolationVariables: {orderId: "...", total: "..."}}`. Assert equality of this struct, not rendered HTML.
+
+**Fixture management pattern:**
+
+```
+tests/fixtures/
+  golden/
+    place_order_with_tax_exemption.golden.json
+    cancel_partial_shipment.golden.json
+    update_quantity_below_minimum.golden.json   # rejection case
+    reorder_fully_cancelled.golden.json           # idempotency
+  seeds/
+    basic_order_scenario.sql                      # shared seed fixtures
+    multi_item_inventory_scenario.sql
+```
+
+Each golden file contains: the input DTO, pre-condition DB seed hash, expected post-state, and expected email payload(s). Tests compare current output against these files and fail fast with a unified diff.
+
+#### Commit hygiene per test addition:
+
+Every characterization test commit contains ONLY tests and fixtures — zero production code changes. This proves the test suite itself is the baseline oracle before you start extracting seams.
+
+---
+
+### Phase 2: Seam Extraction — Target Module Boundaries
+
+After the characterization suite passes, define where the monolith should fracture. Here are the natural module boundaries based on responsibility:
+
+| Current Role | Proposed Module | Rationale |
+|---|---|---|
+| Validation rules (input sanitization, business-rule checks) | `OrderValidator` / `validation` package | Pure functions, no I/O. Can be extracted first because it has zero dependencies and no side effects. |
+| Pricing calculation (line item math, discounts, promotions) | `PricingEngine` | Self-contained arithmetic. No persistence, no networking. Replaceable formula logic. |
+| Tax computation (jurisdiction lookup, exemption handling) | `TaxCalculator` | Deterministic given jurisdiction + items. Domain-specific but isolated. |
+| Email dispatch (notifications, confirmations) | `OrderNotifier` (interface-based) | I/O boundary. Needs a port/adapter shape from day one. |
+| Audit logging | `AuditLogger` (interface-based) | Write-side effect. Simple append operation. |
+| Persistence (SQL operations, transactions) | `OrderRepository` (interface + impl) | All direct SQL goes here. Once this interface is defined, the rest of OrderService becomes orchestrator. |
+
+#### Seam extraction order — and why:
+
+**Step 1: Extract `OrderValidator` (pure, no-risk)**
+
+- Grep for validation logic (`throw new ValidationError`, `if (!valid)...`) scattered through OrderService methods.
+- Pull each validation check into dedicated validator methods in a new class. Parameterize with input DTO, return structured error collection.
+- Inject into OrderService via constructor (add a new ctor param, wire up in DI container / factory).
+- **Why first:** Zero side effects. You can refactor validators test-by-test within the characterization suite. Every validation path stays covered; you're moving code out, not changing behavior.
+
+**Step 2: Extract `PricingEngine` and `TaxCalculator` (deterministic, high-value)**
+
+- These are the two heaviest computation domains in the class. They share no I/O — they operate on in-memory data.
+- Create interfaces now (`IPricingEngine`, `ITaxCalculator`) even if the first implementation lives inside the old class. Pass OrderService's own results through them to prove equivalence via characterization tests.
+- Swap in the extracted implementations method-by-method. Each pricing/tax call site becomes `pricingEngine.calculate(item)` instead of inline math.
+- **Why second:** High complexity density, pure computation = high confidence refactor. Characterization tests validate every price/tax combination. This alone removes ~300 lines from OrderService.
+
+**Step 3: Extract `OrderRepository` (the critical seam — persists everything)**
+
+- This is the hardest and most important extraction. Every direct SQL statement gets pulled into repository methods.
+- Define the interface first (`IOrderRepository`): `save(Order)`, `findById(id)`, `findOpenByCustomer(customerId)`, `persistAudit(AuditEntry)`, `adjustInventory(itemId, qty)`.
+- Create a migration adapter: the new repository's first implementation wraps the existing SQL in methods. But here's the key — **define the interface before replacing any SQL calls**. Have OrderService call `repository.save(order)` instead of executing SQL directly. Then implement `save` with the existing SQL behind the interface.
+- **Why third:** Repository is the I/O bottleneck. It touches both DB and often coordinates with other collaborators (inventory, audit). You need the validation and pricing layers already stable so you can trust the in-order data flowing into persistence. Also, repository extraction forces you to confront transaction boundaries explicitly — something buried in a 1,400-line class.
+
+**Step 4: Extract `OrderNotifier` (email, notifications)**
+
+- Interface: `INotifier.sendOrderConfirmation(Order)`, `.sendCancellationNotice(Order)`, etc.
+- Production impl wires up to SMTP. Test impl captures sent messages (as characterized in Phase 1).
+- **Why fourth:** Notifier depends on the order being fully formed (priced, taxed, validated, persisted). It's the last step in the orchestration chain, so it makes sense to extract last. Email template logic is messy and low-confidence — best to deal with after the core flow is clean.
+
+**Step 5: Extract `AuditLogger` (append-only side channel)**
+
+- Interface: `IAuditLogger.log(AuditEvent)`. Simplest collaborator — one method signature.
+- **Why fifth:** Minimal complexity, purely additive. Doesn't affect order semantics. Safe cleanup pass.
+
+#### Visual seam architecture:
+
+```
+                    ┌──────────────┐
+                    │  OrderFacade │ ← new thin coordinator (replaces OrderService)
+                    └──────┬───────┘
+             ┌─────────────┼─────────────┬──────────────┬──────────┐
+             ▼             ▼             ▼              ▼          ▼
+        OrderValidator PricingEngine TaxCalculator  Notifier   Repository
+                                    ^                 ^           ^
+                              (pure math)     (SMTP adapter) (SQL adapter)
+```
+
+The old `OrderService` becomes `OrderFacade` — a 80-line orchestrator that composes the five collaborators and calls them in sequence. This facade IS the replacement for the existing public API. Zero caller changes.
+
+---
+
+### Phas
+...[truncated]
+
+---
+
+Score each response (A, B, C, D, E) on these 7 criteria (1-5 each):
+correctness, completeness, maintainability, architecture, security, reasoning_quality, instruction_adherence
+
+Also determine the overall ranking from best to worst and write a pairwise comparison explaining why responses differ.
+
+Respond with a single ```json ... ``` block following this exact structure:
+{
+  "scores": {
+    "A": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "B": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "C": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "D": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."},
+    "E": {"correctness":N,"completeness":N,"maintainability":N,"architecture":N,"security":N,"reasoning_quality":N,"instruction_adherence":N,"justification":"..."}
+  },
+  "ranking": ["A", "B", "C", "D", "E"],
+  "pairwise_analysis": "2-3 sentence comparison explaining key quality differences"
+}

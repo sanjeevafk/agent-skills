@@ -1,0 +1,485 @@
+[exit=0 latency=48.26s]
+Here's the complete zero-downtime migration plan for renaming `users.email` → `users.primary_email` on 120M rows with 8 mixed-version replicas.
+
+---
+
+## Architecture Assumptions
+
+- **Single shared database** behind a connection pooler (PgBouncer recommended). All 8 replicas share the same catalog.
+- **"Replicas" = app instances**, not PostgreSQL standby nodes. Each runs its own code version.
+- **ORM**: Pattern works identically regardless of ORM — you update both columns at the write layer.
+- **Backfill source-of-truth**: `email` already exists and is populated; `primary_email` starts empty.
+
+---
+
+## Pre-Migration Readiness Checklist
+
+| Item | Status |
+|------|--------|
+| Application updated to dual-write: insert/update/write to both `email` AND `primary_email` | [ ] |
+| Application updated to read-first-from `primary_email`, fallback to `email` | [ ] |
+| Migration 001 (add column), 002 (index + backfill), 003 (drop old column) written and reviewed | [ ] |
+| Backfill progress table created (`backfill_state`) | [ ] |
+| Datadog/Grafana dashboard: `primary_email` null % by hour, write latency p99, statement timeout errors | [ ] |
+| PgBouncer pool mode: `transaction` (not `session`) — allows safe reconnection mid-batch | [ ] |
+| `statement_timeout` set to 30s on app pool connections (lower than default 5min) | [ ] |
+| `work_mem` ≥ 64MB on production cluster (speeds up the `LIMIT/OFFSET` sort in backfill) | [ ] |
+
+---
+
+## Complete DDL File
+
+Save this as `migrations/0047_add_primary_email.sql`:
+
+```sql
+-- ============================================================
+-- Migration 0047: Rename users.email → users.primary_email
+-- Zero-downtime, expand-contract pattern
+-- Target: ~120M rows, live traffic, mixed-version replicas
+-- Estimated wall-clock time: 2-6 hours for backfill (see timing below)
+-- ============================================================
+
+BEGIN;
+
+-- Step 1: Add nullable column. Instant — no rewrite, no lock.
+-- Duration: < 100ms regardless of row count.
+ALTER TABLE users ADD COLUMN primary_email TEXT;
+
+COMMIT;
+```
+
+Then save this as `migrations/0048_create_primary_email_index_and_backfill.sql`:
+
+```sql
+-- ============================================================
+-- Migration 0048: Create index on primary_email (CONCURRENTLY)
+-- Run ONLY after ALL 8 replicas have deployed dual-write code
+-- ============================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_primary_email
+    ON users (primary_email)
+    WHERE primary_email IS NOT NULL;
+
+-- Note: CONCURRENTLY cannot run inside a transaction.
+-- Most migration tools (golang-migrate, kysely-ctl) will split
+-- the previous COMMIT/BEGIN boundary. Verify your tool supports
+-- this, or run the index creation manually after migrate deploy.
+```
+
+Then save this as `migrations/0049_drop_old_email_column.sql`:
+
+```sql
+-- ============================================================
+-- Migration 0049: Drop old users.email column
+-- Run ONLY after ALL 8 replicas confirmed reading primary_email
+-- ============================================================
+
+BEGIN;
+
+-- Optional: add a comment documenting why it was dropped
+COMMENT ON COLUMN users.email IS 'DEPRECATED: replaced by primary_email in migration 0047';
+
+-- Drop the old column. Safe now — app code no longer references it.
+ALTER TABLE users DROP COLUMN email;
+
+COMMIT;
+
+-- After deployment, optionally remove the deprecated index
+-- DROP INDEX CONCURRENTLY IF EXISTS idx_users_email;
+```
+
+---
+
+## Phase-by-Phase Timeline & Sequence
+
+### Phase 0 — Deploy Code (Day 1)
+
+**What changes:** Application now writes to BOTH columns on INSERT/UPDATE, reads from `primary_email` first with `COALESCE(primary_email, email)` fallback.
+
+**Deployment:** Push to all 8 replicas simultaneously or stagger A/B — doesn't matter yet because `primary_email` is NULL and unused by any version.
+
+**DDL:** Apply `0047_add_primary_email.sql`.
+
+```
+Command:
+  npx prisma migrate dev --name add_primary_email
+  # or for production:
+  npx prisma migrate deploy
+
+Or with golang-migrate:
+  migrate -path migrations -database "$DATABASE_URL" up 1
+```
+
+**Impact:**
+- `ALTER TABLE ... ADD COLUMN primary_email TEXT` — **instant**, acquires only a `ACCESS EXCLUSIVE` lock for < 1 second on the table catalog. No row rewrite. No blocking of SELECT/INSERT/UPDATE/DELETE.
+- Old replicas (pre-code-deploy) ignore the column — they never read or write it. New replicas populate it on every write.
+
+**Rollback path:**
+- **Code rollback:** Just redeploy old binary. No data impact — old code simply ignores `primary_email`.
+- **DDL rollback:** Not needed. Adding a nullable column has zero downside. Keep it.
+
+---
+
+### Phase 1 — Backfill (Day 2–3, estimated)
+
+**Prerequisite:** First instance of v2 (dual-write) code is live. New writes populate `primary_email` from that moment forward.
+
+**Question:** How many rows need backfill?
+
+```sql
+-- Check remaining work BEFORE starting
+SELECT
+  COUNT(*) AS total_rows,
+  COUNT(primary_email) AS has_primary_email,
+  COUNT(*) - COUNT(primary_email) AS still_null,
+  ROUND(100.0 * COUNT(primary_email) / COUNT(*), 2) AS pct_complete
+FROM users;
+
+-- Expected result on day 2: most rows still null (~120M),
+-- plus however many were written after v2 deployed.
+```
+
+#### Backfill Implementation
+
+Do NOT run the backfill via a migration tool that wraps it in a transaction with auto-timeout. Write it as a standalone script or stored procedure with explicit batching:
+
+```sql
+-- Run this as a SEPARATE session, NOT inside a migration file.
+-- Migration tools wrap in BEGIN/COMMIT and may hit statement_timeout.
+-- Execute with: psql -f scripts/backfill_primary_email.sql
+
+-- Configure session-level timeouts
+SET statement_timeout = '25s';       -- Kill individual batches at 25s (buffer under 30s DB limit)
+SET lock_timeout = '5s';             -- Fail fast if we can't get a row lock
+SET idle_in_transaction_session_timeout = '0';  -- Disable idle tx timeout (we commit frequently)
+
+DO $$
+DECLARE
+  batch_size     INT := 5000;
+  rows_updated   INT;
+  offset_val     BIGINT := 0;
+  total_rows     BIGINT;
+  started_at     TIMESTAMPTZ := clock_timestamp();
+  last_commit    TIMESTAMPTZ := clock_timestamp();
+  elapsed_s      FLOAT;
+  max_batch_s    FLOAT := 22;         -- Start slowing down when batch approaches this
+  throughput_warn_thresh INT := 500;   -- rows/sec — alert if we drop below this
+BEGIN
+  -- Get approximate total for progress reporting
+  GET DIAGNOSTICS total_rows = ROW_COUNT;
+  EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', 'users')
+    INTO total_rows;
+
+  RAISE NOTICE 'Starting primary_email backfill for ~% rows', total_rows;
+
+  LOOP
+    -- Update only rows where primary_email IS NULL, ordered by id for stability.
+    -- Using a subquery with LIMIT ensures we only touch batch_size rows.
+    UPDATE users u
+    SET primary_email = us.email
+    FROM (
+      SELECT id, email
+      FROM users
+      WHERE primary_email IS NULL
+      ORDER BY id
+      LIMIT $1
+    ) us
+    WHERE u.id = us.id;
+
+    GET DIAGNOSTICS rows_updated = ROW_COUNT;
+
+    EXIT WHEN rows_updated = 0;
+
+    -- Commit immediately — releases row locks, truncates WAL segment buffer
+    COMMIT;
+
+    -- Progress logging
+    elapsed_s := EXTRACT(EPOCH FROM (clock_timestamp() - started_at));
+    IF elapsed_s > 0 THEN
+      RAISE NOTICE 'Progress: updated %, %.1f rows/sec, elapsed %.1fs, %.1f%% done',
+        offset_val + rows_updated,
+        (offset_val + rows_updated) / elapsed_s,
+        elapsed_s,
+        100.0 * (offset_val + rows_updated) / GREATEST(total_rows, 1);
+    END IF;
+
+    -- Rate limiting: if we're close to statement_timeout, throttle
+    elapsed_s := EXTRACT(EPOCH FROM (clock_timestamp() - last_commit));
+    IF elapsed_s > max_batch_s THEN
+      RAISE NOTICE 'Throttling: batch took %.1fs (threshold %.1fs), sleeping 2s',
+        elapsed_s, max_batch_s;
+      PERFORM pg_sleep(2);
+    END IF;
+
+    last_commit := clock_timestamp();
+    offset_val := offset_val + rows_updated;
+
+    -- Safety valve: stop if pg_isready returns false (DB may be restarting)
+    -- This requires wrapping in a retryable outer loop in practice.
+  END LOOP;
+
+  RAISE NOTICE 'Backfill complete. Total rows processed: %', offset_val;
+END $$;
+
+-- Reset statement_timeout to default after completion
+SET statement_timeout = DEFAULT;
+```
+
+**Why this pattern:**
+
+| Decision | Rationale |
+|----------|-----------|
+| `batch_size = 5000` | Sweet spot for ~10-25ms per batch on typical SSD. Small enough to never hit statement_timeout, large enough for throughput. |
+| `ORDER BY id LIMIT $1` (subquery) | Deterministic, avoids re-processing rows missed due to concurrent inserts. Uses `id` PK — fastest access path. |
+| Separate `COMMIT` after each batch | Releases row locks immediately. Prevents WAL accumulation. Guarantees that `statement_timeout` kills only the current batch, not the whole migration. |
+| `statement_timeout = 25s` in-session | Under-cut the server-level 30s default. If a batch hits the timeout, PostgreSQL aborts it cleanly and we catch it in the next loop iteration (rows_updated = 0 for that batch range, but other rows outside that range were updated — handled correctly because we check rows_updated each iteration). |
+| `lock_timeout = 5s` | If another long-running transaction holds a row lock on our batch range, fail quickly rather than spinning. |
+| Throttle at 22s/batch | Early warning: if a 5K batch takes 22+ seconds, something is wrong (IO saturation, blocking lock, checkpoint storm). Sleep to reduce pressure. |
+
+**Expected timing:**
+
+| Rows | Batch size | Est. ms/batch | Batches | Wall time |
+|------|-----------|---------------|---------|-----------|
+| 120M | 5,000 | 15ms | 24,000 | ~6 minutes* |
+| 120M | 5,000 | 50ms (worst case) | 24,000 | ~20 minutes* |
+
+*\*These estimates assume a healthy SSD-backed Postgres with adequate `maintenance_work_mem` and `wal_buffers`. In practice, accounting for checkpoints, autovacuum overhead, replication lag, and general system load, budget **2–6 hours** for a 120M-row table. Monitor the NOTICE output.*
+
+**Verify backfill before proceeding:**
+
+```sql
+-- Must return 0 rows
+SELECT COUNT(*) AS remaining_nulls
+FROM users
+WHERE primary_email IS NULL;
+
+-- Must match
+SELECT
+  (SELECT COUNT(*) FROM users) AS total,
+  (SELECT COUNT(*) FROM users WHERE primary_email IS NOT NULL) AS with_primary;
+
+-- Spot-check consistency (should be 0 mismatches)
+SELECT COUNT(*) AS mismatches
+FROM users
+WHERE email IS NOT NULL
+  AND primary_email IS NOT NULL
+  AND email != primary_email;
+```
+
+**Rollback path (if backfill fails or causes issues):**
+
+- **Stop the script.** Delete or comment out the batch loop.
+- **No harm done.** Any rows already backfilled stay backfilled. Rows still null will be picked up by dual-write going forward.
+- **Re-run later** with a smaller batch_size (e.g., 1,000) if IO pressure was the issue.
+- **No code rollback needed** — old replicas already ignored `primary_email`; new ones write to it on every mutation.
+
+---
+
+### Phase 2 — Index Build (runs concurrently with backfill or after)
+
+The CONCURRENTLY index created in Migration 0048 builds alongside normal operations. It does NOT block writes or reads.
+
+```sql
+-- Run after backfill reaches >95% completion, or simply after all code is deployed
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_primary_email
+    ON users (primary_email)
+    WHERE primary_email IS NOT NULL;
+```
+
+**Lock behavior:**
+- `CREATE INDEX CONCURRENTLY` acquires `ACCESS SHARE` lock (read-only, non-blocking)
+- Scans the table twice internally (first build, then catch-up)
+- Cannot run inside a transaction block (hence it's in a separate migration file)
+- May take **several minutes** on 120M rows — that's fine, it doesn't block anything
+
+**If interrupted:** CONCURRENTLY leaves a partially built index marked invalid. Fix:
+
+```sql
+-- Check for invalid indexes
+SELECT indexrelid::regclass AS index_name, indisvalid
+FROM pg_index
+WHERE indrelid = 'users'::regclass
+  AND NOT indisvalid;
+
+-- Either rebuild or drop and recreate
+DROP INDEX CONCURRENTLY IF EXISTS idx_users_primary_email;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_primary_email
+    ON users (primary_email) WHERE primary_email IS NOT NULL;
+```
+
+**Rollback path:** Dropping the index is instantaneous — no data impact, no risk.
+
+---
+
+### Phase 3 — Flip Reads (Day 4+, after ALL 8 replicas at v2+)
+
+**Prerequisite:** Confirm all 8 app instances are running the version that reads `primary_email` first.
+
+```bash
+# Verification: check process args or health endpoint version on all replicas
+kubectl rollout status daemonset/app-replica  # or equivalent
+# All 8 should report READY with correct image tag
+```
+
+**At this point:**
+- All replicas write to both columns (no data divergence risk)
+- All replicas read from `primary_email` (coordinated switch)
+- Backfill is complete (verified above)
+- Index is valid and usable
+
+**Deploy:** Upgrade remaining replicas to v2. No DDL change needed — just the code change is already live.
+
+**Rollback path (emergency):**
+- Revert all 8 replicas to old code within seconds. Old code falls back to `COALESCE(primary_email, email)` — which always returns `primary_email` since it's fully populated. Data integrity preserved.
+- **Critical:** Coordinate the revert across ALL replicas simultaneously. If one replica reads from `email` during the revert window, it gets the correct value anyway (because `primary_email` = `email` for all historically-populated rows). No inconsistency possible.
+
+---
+
+### Phase 4 — Drop Old Column (Day 7+, stable post-flip)
+
+Only proceed after 72+ hours of clean operation reading from `primary_email`.
+
+```sql
+ALTER TABLE users DROP COLUMN email;
+```
+
+**Lock behavior:**
+- `ALTER TABLE ... DROP COLUMN` acquires `ACCESS EXCLUSIVE` lock briefly (< 1 second)
+- Does NOT scan or rewrite rows — just removes the column metadata
+- Does NOT cascade to indexes on that column (those must be dropped separately)
+- This is the **only** statement in this entire migration that acquires a short blocking lock, and it blocks for microseconds
+
+**Rollback path:**
+
+There is NO automatic rollback. You must re-add the column and backfill any rows that were written exclusively to `primary_email` during the period when old replicas were offline (if any):
+
+```sql
+-- EMERGENCY ROLLBACK: restore the email column
+ALTER TABLE users ADD COLUMN email TEXT GENERATED ALWAYS AS (primary_email) STORED;
+-- OR simpler:
+ALTER TABLE users ADD COLUMN email TEXT;
+UPDATE users SET email = primary_email WHERE email IS NULL;
+CREATE INDEX CONCURRENTLY idx_users_email ON users (email);
+-- Then immediately deploy old code version
+```
+
+Because `primary_email` = `email` for all historical rows, and all new writes during this window go to both, the rollback fill is trivially fast (just copy one column to the other).
+
+---
+
+## Lock Behavior Summary
+
+| Statement | Lock Type | Blocks Other Operations? | Duration | Risk |
+|-----------|-----------|------------------------|----------|------|
+| `ALTER TABLE ... ADD COLUMN primary_email TEXT` | ACCESS EXCLUSIVE (catalog) | Metadata only — no row-level blocking | < 100ms | None |
+| `CREATE INDEX CONCURRENTLY` | ACCESS SHARE (table) + internal locks on index relation | Reads: no. Writes: no. Only blocks another CONCURRENTLY on same index. | Minutes on 120M rows | Low — runs alongside traffic |
+| `UPDATE users SET primary_email = ...` (per batch) | Row Exclusive on matching rows | Other transactions touching same rows wait (but rows are small, contention negligible) | 10-50ms/batch | Negligible — targeted updates |
+| `ALTER TABLE ... DROP COLUMN email` | ACCESS EXCLUSIVE (brief) | Briefly blocks DDL on `users`. DML continues (old column data persists in WAL until GC). | < 1s | Low — acceptable during maintenance window |
+
+**No statement in this migration rewrites the table or holds a long-held lock.** That's the entire point of the expand-contract pattern.
+
+---
+
+## Statement Timeout & Long Transaction Strategy
+
+The three guards in place:
+
+1. **Session-level `statement_timeout = 25s`** on the backfill script. Individual UPDATE batches are killed if they exceed 25s. Because we commit after every batch, the killed batch is partially rolled back (safe), and the loop continues from the next offset.
+
+2. **`COMMIT` after every batch** prevents unbounded transaction growth. No WAL accumulation, no XID wraparound risk, no long-held MVCC visibility intervals.
+
+3. **`lock_timeout = 5s`** ensures we don't block indefinitely if autovacuum or another long-running query pins a row we need. We fail fast, the loop retries on the next iteration (different offset range), and Autovacuum eventually catches up.
+
+**Additional safety:** If the backfill script crashes (OOM, SIGKILL, network partition to DB), simply re-run it. The WHERE clause `primary_email IS NULL` ensures idempotency — already-backfilled rows are skipped.
+
+---
+
+## Monitoring Queries (Dashboards)
+
+Set up alerts on these:
+
+```sql
+-- Real-time backfill progress (run every 15s from monitoring agent)
+SELECT
+  COUNT(*) AS total,
+  COUNT(primary_email) AS filled,
+  COUNT(*) - COUNT(primary_email) AS remaining,
+  ROUND(100.0 * COUNT(primary_email) / GREATEST(COUNT(*), 1), 2) AS pct
+FROM users;
+
+-- Alert: if pct_filled stalls for > 5 minutes
+-- Alert: if rows_updated/batch drops below 100 (throughput crisis)
+
+-- Concurrent long-running queries on users table (should be 0 during backfill)
+SELECT pid, now() - pg_stat_activity.query_start AS duration, query, state
+FROM pg_stat_activity
+WHERE query LIKE '%users%'
+  AND state != 'idle'
+  AND NOW() - pg_stat_activity.query_start > INTERVAL '30 seconds'
+ORDER BY duration DESC;
+
+-- Check for invalid indexes
+SELECT indexrelid::regclass AS index_name, indisvalid
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+WHERE c.relname = 'users' AND NOT indisvalid;
+
+-- Table bloat during migration (should stay low)
+SELECT
+  n_live_tup,
+  n_dead_tup,
+  CASE WHEN n_live_tup > 0 THEN round(100.0 * n_dead_tup / n_live_tup, 2) ELSE 0 END AS dead_pct
+FROM pg_stat_user_tables
+WHERE relname = 'users';
+```
+
+---
+
+## End-to-End Deployment Order
+
+```
+Hour 0:  Deploy dual-write code to ALL 8 replicas
+          Apply migration 0047 (ADD COLUMN)
+
+Hour 0.5: Verify writes flowing to primary_email (check recent inserts)
+          Start backfill script in background
+
+Hour 2-6: Monitor backfill progress, throughput, row locks
+          Apply CONCURRENTLY index migration 0048 (can run anytime)
+
+Hour 6+:  Verify backfill complete (0 nulls remaining)
+          Verify index valid (NOT indisvalid = 0)
+
+T+1d:    Confirm all 8 replicas running v2 (version check)
+          Switch all reads to primary_email (already coded — just ensure
+          no stale processes running)
+
+T+3d:    Verify zero error rate, zero fallback reads to email
+
+T+7d:    Deploy migration 0049 (DROP COLUMN email)
+          Observe < 1s brief DDL lock
+          Clean up: DROP INDEX CONCURRENTLY idx_users_email
+```
+
+---
+
+## What Goes Wrong & Recovery
+
+| Failure | Detection | Recovery |
+|---------|-----------|----------|
+| Backfill script crashes | Process exit, monitoring alert | Re-run script — idempotent, picks up where left off |
+| Single batch hits statement_timeout | Notice log, batch exits | Normal — committed rows stay, loop continues with next offset |
+| Autovacuum slows backfill (dead tuples pile up) | `n_dead_tup` rises above 10% of `n_live_tun` | Increase `autovacuum_vacuum_scale_factor` temporarily; backfill self-throttles |
+| CONCURRENTLY index build interrupted | `indisvalid = false` in pg_index | Drop and re-create. Takes ~same duration, no data impact |
+| One replica doesn't receive code upgrade | Health check / version endpoint | Rolling restart of that instance. Before it comes up, all reads go to `primary_email` — this replica falls back to `email` COALESCE, which always returns the correct value |
+| Need to drop column but old replicas still active | Application errors on missing `email` column | Stop immediately. Don't drop. Wait for all replicas to come online at v2. The column addition is reversible only by dropping — delay the drop until you're 100% sure |
+
+---
+
+## Key Takeaways
+
+1. **Adding the column is free** — instant, no lock, no risk. Do it first.
+2. **Backfill is the only expensive operation** — do it in bounded batches with `COMMIT` after each batch. Use `statement_timeout` as a hard upper bound per batch. Idempotent by design.
+3. **CONCURRENTLY index never blocks traffic** — schedule it whenever, even during peak hours.
+4. **The drop is the only risky DDL** — but it's a metadata-only operation taking < 1s. Delay it until you're confident all replicas are on new code.
+5. **Rollback is always possible** at every stage — either by reverting code (graceful degradation) or re-applying the inverse migration (emergency fix).

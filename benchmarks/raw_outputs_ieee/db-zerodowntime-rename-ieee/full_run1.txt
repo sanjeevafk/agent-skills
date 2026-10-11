@@ -1,0 +1,692 @@
+[exit=0 latency=40.14s]
+# Zero-Downtime Migration: `users.email` → `users.primary_email` (120M rows, 8 replicas)
+
+## Risk Assessment
+
+| Factor | Impact | Mitigation |
+|--------|--------|------------|
+| 120M rows | Full table rewrites will lock and timeout | Never touch existing column; expand-contract only |
+| 8 replicas, mixed versions | Cannot deploy all new code at once | Dual-write triggers handle version skew |
+| Live traffic | Write amplification during backfill | Batch size tuned to avoid replication lag |
+| Column rename (no-op in theory) | NOT possible without rewrite if NOT NULL/unique/index constraints exist | Treat as add+backfill+drop, never direct RENAME |
+
+---
+
+## Phase 1 — EXPAND (Week 1, no downtime)
+
+### 1a. Add `primary_email` (nullable), index, and trigger
+
+```sql
+-- migrations/YYYYMMDD_001_add_primary_email.sql
+-- Prisma/Drizzle generate DDL only; we write raw SQL via custom migration hook.
+
+BEGIN;
+
+-- 1. Add nullable column — instant, no lock, no rewrite (Postgres ≥10)
+ALTER TABLE users ADD COLUMN primary_email TEXT;
+
+-- 2. Unique constraint must allow NULLs (multiple NULLs are allowed per unique)
+--    We enforce uniqueness only when non-NULL later via partial unique index.
+CREATE UNIQUE INDEX CONCURRENTLY idx_users_primary_email_partial
+  ON users (primary_email) WHERE primary_email IS NOT NULL;
+
+-- Note: CREATE INDEX CONCURRENTLY CANNOT run inside a transaction block.
+-- For production safety, execute WITHOUT BEGIN/COMMIT:
+--   \ir migrations/YYYYMMDD_001a_primary_email_index.sql
+-- See file below for the separate index creation.
+
+COMMIT;
+```
+
+For concurrent index (separate from above since CONCURRENTLY forbids transactions):
+
+```sql
+-- migrations/YYYYMMDD_001b_primary_email_concurrent_index.sql
+-- Run OUTSIDE any transaction:
+--   psql -f migrations/YYYYMMDD_001b_primary_email_concurrent_index.sql
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_users_primary_email_partial
+  ON users (primary_email) WHERE primary_email IS NOT NULL;
+```
+
+**Lock behavior:** `ALTER TABLE ... ADD COLUMN` takes an `ACCESS EXCLUSIVE` lock that is released immediately — effectively no wait on large tables. No row-level locks or scans occur.
+
+**Index rebuild:** Existing `UNIQUE INDEX` on `email` is unaffected. We do NOT drop it yet. The new partial unique index is built concurrently without blocking writes.
+
+### 1b. Trigger for dual-write
+
+```sql
+-- migrations/YYYYMMDD_001c_dual_write_trigger.sql
+
+-- Remove existing trigger if it exists (idempotent)
+DROP TRIGGER IF EXISTS trg_users_sync_primary_email ON users;
+
+-- BEFORE UPDATE/INSERT trigger — copies email → primary_email
+-- when primary_email is NULL and email changes.
+CREATE OR REPLACE FUNCTION fn_sync_primary_email()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Only copy when:
+  --   • primary_email is currently NULL (not yet backfilled or newly inserted)
+  --   • email has a value
+  IF NEW.primary_email IS NULL AND NEW.email IS NOT NULL THEN
+    NEW.primary_email := NEW.email;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_users_sync_primary_email
+  BEFORE INSERT OR UPDATE OF email ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION fn_sync_primary_email();
+```
+
+**Why trigger instead of ORM events:** With 8 replicas running mixed versions of application code, some replicas won't have the dual-write logic deployed yet. The database trigger ensures every write — regardless of which replica issues it — propagates to `primary_email`. This is the single source of truth for data consistency.
+
+### 1c. Application deployment (mixed-version tolerant)
+
+Update the application model/schema layer so all subsequent writes set both columns:
+
+**Prisma example:**
+```typescript
+// Before deploying: ensure ALL replicas can handle primary_email field
+// Even older code that doesn't set primary_email is safe because the
+// trigger handles it automatically.
+```
+
+**Django example:**
+```python
+# apps/accounts/models.py
+class User(AbstractUser):
+    # New field, always set alongside email on write
+    primary_email = models.EmailField(null=True, blank=True, db_column="primary_email")
+    
+    def save(self, *args, **kwargs):
+        # If primary_email is None but email is set, use email
+        if not self.primary_email and self.email:
+            self.primary_email = self.email
+        super().save(*args, **kwargs)
+```
+
+Deploy all 8 replicas now. The trigger provides a safety net for any writes from undeployed code paths, so you can roll out at your own pace.
+
+### Rollback from Phase 1
+
+```sql
+-- If something breaks before backfill, revert cleanly:
+DROP TRIGGER IF EXISTS trg_users_sync_primary_email ON users;
+DROP FUNCTION IF EXISTS fn_sync_primary_email() CASCADE;
+ALTER TABLE users DROP COLUMN IF EXISTS primary_email;
+DROP INDEX IF EXISTS idx_users_primary_email_partial;
+```
+
+No data lost. No old column touched. Safe to retry from 1a.
+
+---
+
+## Phase 2 — BACKFILL (Week 2, bounded batches with progress tracking)
+
+### 2a. Progress tracking table
+
+```sql
+-- migrations/YYYYMMDD_002_backfill_progress_tracking.sql
+
+CREATE TABLE IF NOT EXISTS migration_backfill_progress (
+  id          SERIAL PRIMARY KEY,
+  operation   TEXT    NOT NULL,  -- 'email_to_primary'
+  last_id     BIGINT  NOT NULL DEFAULT 0,
+  rows_synced BIGINT  NOT NULL DEFAULT 0,
+  started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  status      TEXT    NOT NULL DEFAULT 'running',  -- running|paused|completed|failed
+  error       TEXT
+);
+
+INSERT INTO migration_backfill_progress (operation, last_id, rows_synced)
+VALUES ('email_to_primary', 0, 0)
+ON CONFLICT (operation) DO NOTHING;
+```
+
+### 2b. Batch backfill script
+
+```sql
+-- scripts/backfill_primary_email.sql
+-- Run as: psql -v batch_size=5000 -v target_total=120000000 backfill_primary_email.sql
+
+DO $$
+DECLARE
+  batch_size CONSTANT INT := CURRENT_SETTING('app.batch_size')::INT;
+  rows_updated INT;
+  total_rows   BIGINT;
+  last_id      BIGINT := COALESCE(
+    (SELECT last_id FROM migration_backfill_progress WHERE operation = 'email_to_primary'),
+    0
+  );
+  target_total BIGINT := CASE WHEN CURRENT_SETTING('app.target_total') != ''
+                               THEN CURRENT_SETTING('app.target_total')::BIGINT
+                               ELSE (SELECT COUNT(*) FROM users WHERE primary_email IS NULL)
+                          END;
+  checkpoint_interval INT := 10;  -- log every N batches
+  batch_count INT := 0;
+BEGIN
+  SELECT COUNT(*) INTO total_rows FROM users WHERE primary_email IS NULL;
+  RAISE NOTICE 'Total rows needing backfill: %', total_rows;
+
+  LOOP
+    -- SKIP LOCKED + LIMIT approach: acquire exactly batch_size unprocessed rows
+    WITH candidate_ids AS (
+      SELECT id FROM users
+      WHERE email IS NOT NULL
+        AND primary_email IS NULL
+        AND id > last_id
+      ORDER BY id
+      LIMIT batch_size
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE users u
+    SET primary_email = c.id::TEXT || '_placeholder'  -- intentional placeholder pattern
+    FROM candidate_ids c
+    WHERE u.id = c.id;
+    
+    -- Actual update using the email value:
+    UPDATE users u
+    SET primary_email = (
+      SELECT email FROM users sub WHERE sub.id = u.id LIMIT 1
+    )
+    WHERE u.id IN (
+      SELECT c.id FROM candidate_ids c
+    );
+
+    GET DIAGNOSTICS rows_updated = ROW_COUNT;
+    batch_count := batch_count + 1;
+
+    IF rows_updated = 0 THEN
+      -- No more rows with id > last_id; wrap around to beginning
+      IF last_id = 0 THEN
+        EXIT;  -- Nothing to process at all
+      ELSE
+        -- Reset and restart from top
+        last_id := 0;
+        CONTINUE;
+      END IF;
+    END IF;
+
+    -- Update progress (use advisory lock to avoid contention)
+    PERFORM pg_advisory_xact_lock(hashtext('backfill_progress'));
+    UPDATE migration_backfill_progress
+    SET last_id = (SELECT MAX(id) FROM users WHERE primary_email IS NOT NULL),
+        rows_synced = rows_synced + rows_updated,
+        updated_at = NOW()
+    WHERE operation = 'email_to_primary';
+
+    IF batch_count % checkpoint_interval = 0 THEN
+      RAISE NOTICE 'Batch %: synced %, last_id = %, progress ≈ %%',
+        batch_count, rows_synced, last_id,
+        ROUND((rows_synced::NUMERIC / target_total) * 100, 2);
+      
+      -- Check for replication lag pause signal
+      IF EXISTS (SELECT 1 FROM migration_backfill_progress 
+                 WHERE operation = 'email_to_primary' AND status = 'paused') THEN
+        RAISE NOTICE 'Backfill paused by operator. Sleeping 60s...';
+        PERFORM pg_sleep(60);
+      END IF;
+    END IF;
+
+    last_id := last_id + batch_size;
+
+    -- Safety: sleep briefly between batches to reduce replication pressure
+    -- Adjust based on monitoring: increase if replication_lag > threshold
+    PERFORM pg_sleep(0.05);  -- 50ms between batches
+    
+  END LOOP;
+
+  -- Mark complete
+  UPDATE migration_backfill_progress
+  SET status = 'completed',
+      rows_synced = (SELECT COUNT(*) FROM users WHERE primary_email IS NOT NULL),
+      updated_at = NOW()
+  WHERE operation = 'email_to_primary';
+
+  RAISE NOTICE 'Backfill complete. Total synced: %', rows_synced;
+END $$;
+```
+
+I realize the above has a subtle issue — let me correct the backfill to be cleaner and more correct:
+
+```sql
+-- scripts/backfill_primary_email_clean.sql
+-- Safer batch backfill using CTES and explicit batching by ID range
+
+DO $$
+DECLARE
+  min_id BIGINT := (SELECT MIN(id) FROM users);
+  max_id BIGINT := (SELECT MAX(id) FROM users);
+  batch_size INT := 5000;
+  current_id BIGINT := min_id;
+  rows_updated INT;
+  batch_count INT := 0;
+  checkpoint_interval INT := 20;
+BEGIN
+  WHILE current_id <= max_id LOOP
+    UPDATE users
+    SET primary_email = email
+    WHERE id BETWEEN current_id AND current_id + batch_size - 1
+      AND primary_email IS NULL
+      AND email IS NOT NULL;
+    
+    GET DIAGNOSTICS rows_updated = ROW_COUNT;
+    batch_count := batch_count + 1;
+
+    -- Update progress atomically
+    PERFORM pg_try_advisory_xact_lock(hashtext('backfill_progress'));
+    UPDATE migration_backfill_progress
+    SET last_id = current_id,
+        rows_synced = rows_synced + rows_updated,
+        updated_at = NOW()
+    WHERE operation = 'email_to_primary';
+
+    IF batch_count % checkpoint_interval = 0 THEN
+      SELECT COUNT(*) INTO rows_updated
+      FROM users WHERE primary_email IS NOT NULL;
+      RAISE NOTICE 'Batch %: synced %, up to id %, overall progress: %%',
+        batch_count, rows_updated, current_id,
+        ROUND((rows_updated::NUMERIC / (SELECT COUNT(*) FROM users)) * 100, 4);
+      
+      IF EXISTS (SELECT 1 FROM migration_backfill_progress 
+                 WHERE operation = 'email_to_primary' AND status = 'paused') THEN
+        RAISE NOTICE 'Backfill paused. Waiting 60s...';
+        PERFORM pg_sleep(60);
+      END IF;
+    END IF;
+
+    -- Throttle to minimize replication impact
+    PERFORM pg_sleep(0.02);  -- 20ms
+
+    current_id := current_id + batch_size + 1;
+  END LOOP;
+
+  UPDATE migration_backfill_progress
+  SET status = 'completed',
+      rows_synced = (SELECT COUNT(*) FROM users WHERE primary_email IS NOT NULL),
+      updated_at = NOW()
+  WHERE operation = 'email_to_primary';
+
+  RAISE NOTICE 'Backfill finished.';
+END $$;
+```
+
+**Key decisions:**
+
+| Parameter | Value | Reasoning |
+|-----------|-------|-----------|
+| Batch size | 5K rows | Balance between speed (fewer round-trips) and replication lag risk |
+| Sleep between batches | 20ms | Prevents IOPS saturation on replicated storage |
+| `pg_try_advisory_xact_lock` | Yes | Avoid blocking other backfill workers if you parallelize |
+| `BETWEEN id AND id+N` | Sequential scan | Leverages PK index order, minimal buffer cache churn |
+
+**Timeout safety:** Each batch affects at most 5K rows. Even with statement_timeout set to 30s (default), each batch completes in milliseconds. No long-running transaction spans multiple batches because the entire thing runs in one PL/pgSQL function with automatic commit after each statement (within a DO block).
+
+Wait — actually there's an important correction: **PL/pgSQL `DO` blocks run inside a single transaction**. The UPDATE within a loop does NOT auto-commit. Let me fix this:
+
+```sql
+-- CORRECT: Run outside a transaction, use individual COMMITs via a function
+-- Since we need per-statement commits, we MUST either:
+--   A) Call a VOLATILE function repeatedly from a simple UPDATE loop, or
+--   B) Use COPY programmatically (preferred for 120M rows)
+
+-- Best approach: Python/Rust driver for true per-batch commits
+-- Here's the corrected SQL-only approach using a helper function:
+
+CREATE OR REPLACE FUNCTION fn_batch_backfill(start_id BIGINT, end_id BIGINT)
+RETURNS INTEGER AS $$
+DECLARE
+  count INTEGER;
+BEGIN
+  UPDATE users
+  SET primary_email = email
+  WHERE id BETWEEN $1 AND $2
+    AND primary_email IS NULL
+    AND email IS NOT NULL;
+  
+  GET DIAGNOTS count = ROW_COUNT;
+  
+  -- Update progress
+  PERFORM pg_try_advisory_xact_lock(hashtext('backfill_progress'));
+  UPDATE migration_backfill_progress
+  SET last_id = $2,
+      rows_synced = rows_synced + count,
+      updated_at = NOW()
+  WHERE operation = 'email_to_primary';
+  
+  RETURN count;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+```
+
+Then call iteratively from a client (Python example preferred for 120M rows):
+
+```python
+# scripts/backfill_primary_email.py
+import psycopg2
+import time
+import logging
+
+BATCH_SIZE = 5000
+SLEEP_BETWEEN_BATCHES = 0.02  # 20ms
+CHECKPOINT_INTERVAL = 20
+
+def main():
+    conn = psycopg2.connect(
+        "postgresql://migrations_user:mig_pass@db-host:5432/app?sslmode=require"
+    )
+    conn.autocommit = True  # Critical: each call to fn_batch_backfill commits
+    
+    cur = conn.cursor()
+    
+    cur.execute("SELECT MIN(id), MAX(id) FROM users")
+    min_id, max_id = cur.fetchone()
+    
+    current_id = min_id
+    batch_count = 0
+    total_synced = 0
+    
+    while current_id <= max_id:
+        result = cur.execute(
+            "SELECT fn_batch_backfill(%s, %s)",
+            (current_id, current_id + BATCH_SIZE - 1)
+        ).fetchone()[0]
+        
+        total_synced += result
+        batch_count += 1
+        
+        if batch_count % CHECKPOINT_INTERVAL == 0:
+            progress_pct = (total_synced / 120_000_000) * 100
+            logging.info(
+                "Batch %d: synced %d (total %d), progress %.4f%%",
+                batch_count, result, total_synced, progress_pct
+            )
+            
+            # Check for pause signal
+            cur.execute(
+                "SELECT status FROM migration_backfill_progress "
+                "WHERE operation = 'email_to_primary'"
+            )
+            if cur.fetchone()[0] == "paused":
+                logging.warning("Backfill paused by operator. Sleeping 60s...")
+                time.sleep(60)
+        
+        time.sleep(SLEEP_BETWEEN_BATCHES)
+        current_id += BATCH_SIZE + 1
+    
+    cur.execute(
+        "UPDATE migration_backfill_progress SET status = 'completed', "
+        "updated_at = NOW() WHERE operation = 'email_to_primary'"
+    )
+    conn.close()
+    
+    print(f"Backfill complete. Total synced: {total_synced}")
+
+if __name__ == "__main__":
+    main()
+```
+
+### 2c. Verification step (after backfill completes)
+
+```sql
+-- migrations/YYYYMMDD_003_verify_consistency.sql
+
+-- 1. Count mismatched rows (should be ~0)
+SELECT
+  (SELECT COUNT(*) FROM users WHERE email IS NOT NULL AND primary_email IS DISTINCT FROM email) AS mismatches,
+  (SELECT COUNT(*) FROM users WHERE email IS NULL AND primary_email IS NOT NULL) AS extra_primaries,
+  (SELECT COUNT(*) FROM users WHERE primary_email IS NULL AND email IS NOT NULL) AS missing_primaries,
+  (SELECT COUNT(*) FROM users WHERE primary_email IS NOT NULL)::FLOAT / NULLIF((SELECT COUNT(*) FROM users), 0) AS coverage_ratio;
+
+-- 2. Sample random rows for manual inspection
+SELECT id, email, primary_email,
+       CASE WHEN email IS NOT NULL AND primary_email = email THEN 'MATCH'
+            WHEN email IS NULL AND primary_email IS NULL THEN 'BOTH_NULL'
+            ELSE 'MISMATCH'
+       END AS check_result
+FROM users
+WHERE id IN (
+  SELECT id FROM users ORDER BY RANDOM() LIMIT 100
+);
+
+-- 3. Verify unique constraint works (should raise duplicate key if broken)
+DO $$
+BEGIN
+  -- Try inserting a duplicate primary_email where both are set — should fail
+  -- This confirms the partial unique index is functional
+  INSERT INTO users (email, primary_email) VALUES ('verify_test@example.com', 'verify_test@example.com');
+  RAISE EXCEPTION 'Unique constraint violated as expected (good)';
+EXCEPTION WHEN unique_violation THEN
+  -- Expected — the constraint is working
+END;
+$$;
+```
+
+### 2d. Rollback from Phase 2
+
+```sql
+-- Abort the backfill script if still running
+-- Set pause signal:
+UPDATE migration_backfill_progress
+SET status = 'paused', error = 'rollback_initiated', updated_at = NOW()
+WHERE operation = 'email_to_primary';
+
+-- After backfill stops (it will finish current batch due to autocommit):
+-- Drop the trigger (stop further writes to primary_email)
+DROP TRIGGER IF EXISTS trg_users_sync_primary_email ON users;
+DROP FUNCTION IF EXISTS fn_sync_primary_email() CASCADE;
+
+-- Revert trigger-based dual-write
+DELETE FROM users WHERE primary_email IS NOT NULL;  -- Clear backfilled data
+-- OR keep it if consistent — the trigger is what matters
+
+-- Application: revert code to remove primary_email from schema/config
+-- Older codebase that doesn't reference primary_email works fine even if
+-- the column exists and has data.
+```
+
+Because the trigger syncs email→primary_email, stopping the trigger and reverting application code is sufficient rollback. No data corruption possible.
+
+---
+
+## Phase 3 — CONTRACT (Week 3+, all replicas updated)
+
+### 3a. Read flip — change all application reads from `email` to `primary_email`
+
+Deploy updated application code across all 8 replicas. At this point:
+- All replicas read `primary_email`
+- All replicas also write `primary_email` (via both ORM/model logic AND the trigger)
+- The old `email` column still holds the canonical data
+- Both columns should be identical for all 120M rows (verified in Phase 2)
+
+```typescript
+// Prisma schema change — deploy first
+model User {
+  // ...
+  email     String @unique @map("email")           // kept temporarily
+  primaryEmail String? @unique @map("primary_email") // new source of truth
+}
+```
+
+### 3b. Make `primary_email` NOT NULL and add full unique constraint
+
+```sql
+-- migrations/YYYYMMDD_005_make_primary_not_null.sql
+
+BEGIN;
+
+-- 1. First verify no gaps exist (should return 0)
+DO $$
+DECLARE orphan_count INT;
+BEGIN
+  SELECT COUNT(*) INTO orphan_count
+  FROM users WHERE primary_email IS NULL;
+  
+  IF orphan_count > 0 THEN
+    RAISE EXCEPTION 'ABORTING: % rows have NULL primary_email. Must be 0 before proceeding.', orphan_count;
+  END IF;
+END $$;
+
+-- 2. Now make it NOT NULL — instant, no rewrite (Postgres 11+, already has values)
+ALTER TABLE users ALTER COLUMN primary_email SET NOT NULL;
+
+-- 3. Replace the partial unique index with a full unique index
+DROP INDEX CONCURRENTLY idx_users_primary_email_partial;
+CREATE UNIQUE INDEX CONCURRENTLY idx_users_primary_email_full ON users (primary_email);
+
+COMMIT;
+```
+
+**Lock behavior:**
+- `ALTER COLUMN SET NOT NULL`: Takes `SHARE ROW EXCLUSIVE` lock (very brief, <1s). Does NOT scan the table in Postgres 11+ when all rows already satisfy the constraint.
+- `DROP INDEX CONCURRENTLY`: Non-blocking, runs in background.
+- `CREATE INDEX CONCURRENTLY`: Non-blocking, builds in background (~minutes on 120M rows, estimated).
+
+### 3c. Final contract — remove old `email` column
+
+Only after verifying all replicas are on the new code and `primary_email` passes all checks:
+
+```sql
+-- migrations/YYYYMMDD_006_drop_email_column.sql
+
+BEGIN;
+
+-- 1. Pre-flight: verify zero references to email remain
+-- (Run this in application logs too — should show no fallback reads)
+DO $$
+DECLARE email_with_different_value INT;
+BEGIN
+  SELECT COUNT(*) INTO email_with_different_value
+  FROM users WHERE email IS DISTINCT FROM primary_email;
+  
+  IF email_with_different_value > 0 THEN
+    RAISE EXCEPTION 'ABORTING: % rows have email ≠ primary_email. Investigate before dropping.', email_with_different_value;
+  END IF;
+END $$;
+
+-- 2. Remove the trigger (no longer needed)
+DROP TRIGGER IF EXISTS trg_users_sync_primary_email ON users;
+DROP FUNCTION IF EXISTS fn_sync_primary_email() CASCADE;
+
+-- 3. Drop the old index
+DROP INDEX CONCURRENTLY IF EXISTS idx_users_email_unique;
+
+-- 4. Drop the old column — takes ACCESS EXCLUSIVE lock, but only metadata update
+--    on large tables in Postgres. Fast.
+ALTER TABLE users DROP COLUMN email;
+
+-- 5. Rename primary_email to email semantically (optional but clean)
+--    If you want to keep the column name "email" for app compatibility:
+ALTER TABLE users RENAME COLUMN primary_email TO email;
+DROP INDEX idx_users_primary_email_full;
+CREATE UNIQUE INDEX CONCURRENTLY idx_users_email ON users (email);
+
+-- Clean up migration tracking
+DELETE FROM migration_backfill_progress WHERE operation = 'email_to_primary';
+
+COMMIT;
+```
+
+**Important timing:** Step 4 (`DROP COLUMN`) acquires an `ACCESS EXCLUSIVE` lock on the `users` table. On a busy system with 120M rows, this takes ~seconds, not minutes (PostgreSQL 9.2+ only updates catalog metadata for DROP COLUMN unless default/constraint removal requires rewriting). Expect <5 seconds of write serialization under normal load.
+
+**If the lock duration concerns you**, do this during a low-traffic window or use partition switching tricks if the table is partitioned.
+
+### Rollback from Phase 3
+
+```sql
+-- If dropped email and need to revert:
+-- 1. Quick rollback — just stop traffic, run a restore from backup of the pre-migration state
+ALTER TABLE users ADD COLUMN email TEXT;
+ALTER TABLE users RENAME COLUMN email TO primary_email;
+-- Restore trigger
+-- Re-deploy old application code
+-- Point traffic back
+
+-- Better rollback path: Don't DROP email until you've confirmed 30 days of stability
+-- Keep both columns for an extended period (the "safe buffer")
+```
+
+**Recommended conservative rollback:** Instead of dropping `email` in 3c, rename it to `legacy_email`:
+
+```sql
+ALTER TABLE users RENAME COLUMN email TO legacy_email;
+-- This avoids the DDL complexity and allows infinite rollback
+-- Old column stays, taking no practical storage overhead (Postgres uses copy-on-write)
+```
+
+---
+
+## Lock Behavior Reference Table
+
+| Statement | Lock Type | Duration | Blocks Writes? | Safe on 120M rows? |
+|-----------|-----------|----------|----------------|-------------------|
+| `ADD COLUMN` (nullable) | `ACCESS EXCLUSIVE` (instant) | <1ms | No | ✅ Instant |
+| `ADD COLUMN` NOT NULL w/default | `ACCESS EXCLUSIVE` (instant) | <1ms* | No* | ✅ PG11+ |
+| `ADD COLUMN` NOT NULL w/o default | `ACCESS EXCLUSIVE` | Minutes-hours | **Yes** | ❌ Rewrite |
+| `CREATE INDEX CONCURRENTLY` | `ROW SHARE` (background) | Minutes | No | ✅ |
+| `DROP INDEX CONCURRENTLY` | `ROW SHARE` (background) | Minutes | No | ✅ |
+| `ALTER COLUMN SET NOT NULL` | `SHARE ROW EXCLUSIVE` | <1s | Brief spike | ✅ PG11+ |
+| `RENAME COLUMN` | `ACCESS EXCLUSIVE` | <1ms | Brief spike | ✅ |
+| `DROP COLUMN` | `ACCESS EXCLUSIVE` | <5s | Brief spike | ⚠️ Schedule off-peak |
+| Manual `UPDATE all rows` | Row-level | Minutes-hours | **Yes** | ❌ Never |
+
+*\*With default, no rewrite occurs in PG11+.*
+
+---
+
+## Index Strategy Summary
+
+```
+Before:                        During:                      After:
+
+users.email ───┐               users.email ───┐               users.email ───┐
+  (unique)     ├─ active reads/writes          (deprecated)   │
+users.primary_email ──┘               users.primary_email ───────┘
+  (partial unique)                    (full unique)
+                                      (CONCURRENTLY built)
+```
+
+Keep the old `email` index until final contract phase. Build the new index concurrently. Swap them atomically on deploy.
+
+---
+
+## Complete Timeline
+
+```
+Day  1: Deploy migration 001 (add column + concurrent index + trigger)
+Day  1: Deploy app v2 (dual-write in ORM/model layer) [deploy 8 replicas over hours]
+Day  2: Start backfill script (monitors: CPU, IOPS, replication lag, p99 latency)
+Day  3: Backfill continues (estimated: ~120M rows × 20ms sleep ÷ 5K batches ≈ several hours)
+Day  4: Verify consistency (all three checks pass: 0 mismatches, 100% coverage, unique index ok)
+Day  5: Deploy app v3 (read from primary_email only) [deploy 8 replicas]
+Day  7: Deploy migration 005 (NOT NULL constraint + full unique index)
+Day 14: Deploy migration 006 (rename/replace email column) — optional, schedule maintenance window
+Day 30: Cleanup — remove trigger, confirm no anomalies, archive migration files
+```
+
+---
+
+## Operational Monitoring Checklist
+
+During backfill, monitor continuously:
+
+1. **Replication lag** — `pg_stat_replication` streaming lag > 1GB → pause backfill
+2. **Table bloat** — `pg_stat_user_tables` n_dead_tup increasing rapidly → vacuum may be needed
+3. **p99 write latency** — spikes > 2× baseline → reduce batch frequency
+4. **CPU/IOPS** — sustained > 80% → throttle backfill
+5. **Connection pool** — backfill connections shouldn't saturate the pool
+6. **Disk space** — concurrent index building temporarily increases WAL and index size
+
+Pause/resume control:
+```sql
+-- Pause:
+UPDATE migration_backfill_progress SET status = 'paused' WHERE operation = 'email_to_primary';
+
+-- Resume:
+UPDATE migration_backfill_progress SET status = 'running', updated_at = NOW() WHERE operation = 'email_to_primary';
+```

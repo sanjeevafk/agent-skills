@@ -1,0 +1,378 @@
+[exit=0 latency=29.19s]
+I'll tackle this systematically — reading the plan node-by-node, choosing the right indexing strategy, fixing the stats problem, evaluating partitioning, and rewriting the query with proper CTE/materialization choices.
+
+## Root Cause Analysis
+
+The symptoms form a coherent chain: **stale row estimates → wrong join strategy → sort spilling to disk**. The planner thinks it's getting 100 rows from the events filter but actually gets 2M, so it picks a nested-loop hash join with an incorrect memory budget. When the real 2M rows arrive, the sort operation exceeds `work_mem` and spills to disk. Each spill costs O(n log n / B) I/O on multi-gigabyte intermediate results.
+
+---
+
+## Step 1: Fix Stale Statistics First (Quick Win)
+
+Stale estimates on an 800M-row table almost always mean the default `default_statistics_target` (100) is insufficient and/or `autovacuum` is falling behind due to write amplification on recent partitions.
+
+```sql
+-- Increase statistics target specifically on the hottest columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 500;
+ALTER TABLE events ALTER COLUMN created_at SET STATISTICS 500;
+
+-- Force a full ANALYZE after changing statistics targets
+ANALYZE events;
+
+-- Verify the plans now match reality
+EXPLAIN (COSTS OFF, SETTINGS) SELECT * FROM events
+WHERE tenant_id = 'abc' AND event_type = 'pageview'
+  AND created_at BETWEEN '2025-01-01' AND '2025-03-31';
+```
+
+**Why this matters**: With 500 samples, the planner can model multimodal distributions (e.g., bursty tenants). On PG 16, the internal representation also supports compressed hyperloglog sketches that capture cardinality much better at this setting.
+
+**Verify autovacuum is healthy:**
+
+```sql
+SELECT schemaname, relname, n_live_tup, n_dead_tup,
+       last_autovacuum, last_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'events'
+ORDER BY n_dead_tup DESC;
+
+-- If dead tuples exceed ~5% of live tuples, tune autovacuum per-partition:
+ALTER TABLE events_part_monthly PARTITION FOR VALUES FROM ('2025-07') TO ('2025-08')
+SET (autovacuum_enabled = true, autovacuum_vacuum_threshold = 50000,
+     autovacuum_analyze_threshold = 50000);
+```
+
+If ANALYZE alone doesn't bring estimates into line within ~2x, proceed to targeted histograms or custom statistics objects below.
+
+---
+
+## Step 2: Index Strategy — Choose the Right Shape
+
+### Column Selectivity Determines Order
+
+| Column | Approx Selectivity | Cardinality Estimate |
+|--------|-------------------|---------------------|
+| `tenant_id` | HIGH (millions of tenants) | Single value ≈ few hundred rows |
+| `event_type` | MEDIUM (dozens of types) | Single type ≈ thousands–hundreds of K |
+| `created_at` | LOW (continuous) | Range filter dominates I/O |
+| `user_id` (FK to users) | Medium | Used for join + window |
+
+The key principle: **equality columns first, then range columns, then covering columns via INCLUDE**.
+
+### The Primary Index (Covering Composite)
+
+```sql
+CREATE INDEX idx_events_tenant_type_created ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, id);
+-- Explanation:
+--   tenant_id  → equality filter (highest selectivity single-column)
+--   event_type → equality filter (second equality)
+--   created_at DESC → range scan in descending order; matches most reporting
+--                        queries that want recency-first ranking
+--   INCLUDE (user_id, id) → avoids heap fetch for the window function and join key.
+--                           This turns the entire filtered-and-sorted result set
+--                           into an index-only scan.
+```
+
+**Why INCLUDE over adding user_id to the leading keys:** Adding `user_id` before `created_at` would destroy the range-scannability of `created_at`. INCLUDE keeps the column in the index leaf pages but outside the B-tree sorting structure — it's metadata for index-only scans, not a sort key.
+
+### Partial Index (If Hot-Tenanted Reporting)
+
+If 90% of queries target the top 5 tenants:
+
+```sql
+CREATE INDEX idx_events_top_tenants
+ON events (tenant_id, event_type, created_at DESC)
+INCLUDE (user_id, id)
+WHERE tenant_id IN ('tenant_a', 'tenant_b', 'tenant_c', 'tenant_d', 'tenant_e');
+-- Smaller, fits in cache, auto-updated only for these tenants.
+```
+
+### Secondary Index for User-Id Window Queries
+
+If you frequently do window functions scoped per-user within a tenant:
+
+```sql
+CREATE INDEX idx_events_tenant_user_created
+ON events (tenant_id, user_id, created_at DESC);
+-- Supports: ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC)
+--           filtered by tenant and time range
+```
+
+### FK Index on user_id (If Not Already Indexed)
+
+```sql
+-- Check if missing:
+SELECT conrelid::regclass, a.attname
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+WHERE c.contype = 'f' AND c.confrelid = 'users'::regclass
+AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid AND a.attnum = ANY(i.indkey)
+);
+
+-- Create if empty result above returns rows:
+CREATE INDEX IF NOT EXISTS idx_events_user_id ON events (user_id);
+-- Needed for efficient hash/join against the 2M-row users table.
+```
+
+---
+
+## Step 3: Partitioning — Is It Worth It?
+
+### Decision Framework
+
+| Criterion | Verdict |
+|-----------|---------|
+| Queries typically span ≤ 3 months? | **Yes** — partition pruning cuts 800M → ~50–200M scanned rows |
+| Table receives > 1M inserts/day? | **Yes** — younger partitions benefit from fresher autovacuum stats |
+| Cross-month aggregate queries are common? | **No** — partial merge adds overhead; consider quarterly instead |
+| Backup/restore per-tenant isolation needed? | **Yes** — logical backup one month at a time |
+
+### Implementation (Monthly Range Partitioning)
+
+```sql
+-- 1. If not already partitioned:
+ALTER TABLE events DROP CONSTRAINT events_pkey;  -- Must drop PK first
+-- Recreate PK on partition level only.
+
+CREATE TABLE events_partitioned (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    tenant_id   text        NOT NULL,
+    event_type  text        NOT NULL,
+    user_id     bigint      NOT NULL,
+    payload     jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, created_at)  -- Partition key included in PK
+) PARTITION BY RANGE (created_at);
+
+-- 2. Create current & upcoming partitions
+DO $$
+DECLARE
+    start_date date;
+    end_date   date;
+    part_name  text;
+BEGIN
+    FOR start_date IN
+        SELECT generate_series(
+            date_trunc('month', min(created_at))::date,
+            date_trunc('month', now() + interval '3 months')::date,
+            interval '1 month'
+        ) FROM events
+    LOOP
+        end_date   := start_date + interval '1 month';
+        part_name  := 'events_' || to_char(start_date, 'YYYY_MM');
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF events_partitioned
+             FOR VALUES FROM (%L) TO (%L)',
+            part_name, start_date, end_date
+        );
+        -- Apply the covering index on each new partition
+        EXECUTE format(
+            'CREATE INDEX %I ON %I (tenant_id, event_type, created_at DESC)
+             INCLUDE (user_id, id)',
+            part_name || '_tenant_type_idx', part_name
+        );
+    END LOOP;
+END $$;
+
+-- 3. Attach a future partition proactively (avoids lock during INSERT)
+ALTER TABLE events_partitioned
+ATTACH PARTITION events_2025_08 FOR VALUES FROM ('2025-08-01') TO ('2025-09-01');
+```
+
+**Key notes:**
+- Including `created_at` in the primary key is required for range-partitioned tables (the partition key must be part of every unique constraint).
+- Each partition gets its own index — smaller indexes fit in shared buffer pool, improving hit ratio dramatically.
+- Autovacuum now operates per-partition: the hot current month gets frequent vacuuming while historical data stays stable.
+
+If cross-month aggregation is dominant, switch to **quarterly** partitions — fewer partitions, still meaningful pruning.
+
+---
+
+## Step 4: Rewrite the Query
+
+### Original Problematic Query (Inferred)
+
+```sql
+-- Typical anti-pattern driving the 40s runtime:
+WITH ranked AS (
+    SELECT e.*,
+           RANK() OVER (
+               PARTITION BY e.tenant_id, u.id
+               ORDER BY e.created_at DESC
+           ) AS rn
+    FROM events e
+    JOIN users u ON u.id = e.user_id
+    WHERE e.tenant_id = 'abc'
+      AND e.event_type = 'pageview'
+      AND e.created_at BETWEEN '2025-01-01' AND '2025-03-31'
+)
+SELECT * FROM ranked WHERE rn <= 5;
+```
+
+Issues:
+1. **CTE is materialized by default** in PG 12+ — the entire join + window function runs before filtering to top-5.
+2. **Window function computed over all matching rows** (potentially millions) when only top-N matter.
+3. **Join happens before deduplication** — waste of CPU/memory.
+
+### Optimized Rewrite
+
+```sql
+-- Approach 1: Top-N optimization via LATERAL + LIMIT per tenant/user
+-- Best when you need exactly N winners per partition
+
+WITH candidates AS MATERIALIZED (
+    -- Filter to the exact subset using the composite index;
+    -- no join needed here because INCLUDE has user_id
+    SELECT tenant_id, user_id, created_at, id
+    FROM events
+    WHERE tenant_id = $1
+      AND event_type = $2
+      AND created_at >= $3 AND created_at < $4
+    ORDER BY created_at DESC
+    LIMIT 100000   -- Safety cap; adjust based on expected volume
+),
+top_users AS (
+    SELECT DISTINCT ON (tenant_id, user_id)
+           tenant_id,
+           user_id,
+           created_at,
+           id
+    FROM candidates
+    ORDER BY tenant_id, user_id, created_at DESC
+),
+ranked_with_limit AS (
+    SELECT
+        tu.tenant_id,
+        tu.user_id,
+        tu.created_at AS last_event_at,
+        tu.id         AS last_event_id,
+        u.email,
+        u.name,
+        u.plan_tier
+    FROM top_users tu
+    JOIN users u ON u.id = tu.user_id
+    WHERE u.deleted_at IS NULL           -- Skip soft-deleted; partial index on users helps
+    ORDER BY tu.tenant_id, tu.created_at DESC
+    LIMIT 5                              -- Final top-5 across all tenants
+)
+SELECT * FROM ranked_with_limit;
+```
+
+**Why this works:**
+- `MATERIALIZED` CTE forces the filter + index scan into a physical temp space, so the planner knows exact row counts going into the next step (fixes the stale estimate cascade).
+- `DISTINCT ON` replaces the window function — PG evaluates it lazily during the sort, stopping early once all groups have seen their first row (the `ORDER BY tenant_id, user_id, created_at DESC` ensures the first row per group is the latest).
+- No `RANK() OVER` computed over the full result set — far less CPU.
+- The final `LIMIT 5` allows the planner to apply back-pressure through the pipeline.
+
+### Approach 2: If You Need Full RANK Per User Within Tenant (Heavy Reporting)
+
+```sql
+-- Use a temporary table with correct stats instead of a CTE
+DROP TEMP TABLE IF EXISTS tmp_events_filtered;
+CREATE TEMP TABLE tmp_events_filtered ON COMMIT DROP AS
+SELECT tenant_id, user_id, created_at, id
+FROM events
+WHERE tenant_id = $1
+  AND event_type = $2
+  AND created_at >= $3 AND created_at < $4;
+
+-- Force a fresh ANALYZE so the next step sees accurate cardinality
+ANALYZE tmp_events_filtered;
+
+SELECT e.tenant_id,
+       e.user_id,
+       e.created_at,
+       e.id,
+       RANK() OVER (
+           PARTITION BY e.tenant_id, e.user_id
+           ORDER BY e.created_at DESC
+       ) AS rn,
+       u.email,
+       u.name
+FROM tmp_events_filtered e
+JOIN users u ON u.id = e.user_id
+WHERE u.deleted_at IS NULL
+ORDER BY e.tenant_id, e.created_at DESC
+FETCH FIRST 5 ROWS ONLY;  -- PG 13+ syntax; limits execution early
+```
+
+**CTE vs TEMP TABLE decision:**
+
+| Factor | CTE (default) | CTE (MATERIALIZED) | TEMP TABLE |
+|--------|--------------|--------------------|------------|
+| Inlining risk | High (planner may inline) | None (forced materialization) | None (physical table) |
+| Fresh stats | No | No | Yes (explicit ANALYZE) |
+| Memory safety | Risk of unbounded expansion | Spills to disk if large | Spills to disk, predictable |
+| Best for | Small results (< 10K rows) | Medium results (10K–500K rows) | Large results (> 500K rows) |
+
+---
+
+## Step 5: Configuration Tuning
+
+```sql
+-- Connection-level settings (PG 16):
+ALTER USER reporting_role SET work_mem = '64MB';       -- Enough to hold sorted window buffers for typical reports
+ALTER USER reporting_role SET maintenance_work_mem = '512MB';  -- For CREATE INDEX and VACUUM
+ALTER USER reporting_role SET effective_cache_size = '16GB';    -- Tell planner how much RAM exists
+
+-- Session-level (safer than ALTER USER for shared accounts):
+SET work_mem = '64MB';
+SET enable_bitmapscan = off;    -- Prefer index-only scan via our INCLUDE index
+SET random_page_cost = 1.1;     -- SSD storage; lower cost encourages index usage
+SET default_statistics_target = 500;  -- Only for this reporting session
+```
+
+---
+
+## Step 6: Verification Plan
+
+```sql
+-- 1. Confirm index-only scan
+EXPLAIN (COSTS, BUFFERS, FORMAT TEXT)
+SELECT tenant_id, user_id, created_at, id
+FROM events
+WHERE tenant_id = 'abc' AND event_type = 'pageview'
+  AND created_at BETWEEN '2025-01-01' AND '2025-03-31'
+ORDER BY created_at DESC
+LIMIT 100;
+
+-- Expected output:
+--   Index Only Scan using idx_events_tenant_type_created
+--   Heap Fetches: 0          <-- critical metric
+
+-- 2. Confirm join uses hash join with correct row estimate
+EXPLAIN (COSTS, BUFFERS, FORMAT TEXT)
+WITH candidates AS MATERIALIZED (
+    SELECT tenant_id, user_id, created_at, id
+    FROM events
+    WHERE tenant_id = 'abc' AND event_type = 'pageview'
+      AND created_at BETWEEN '2025-01-01' AND '2025-03-31'
+)
+SELECT * FROM candidates c
+JOIN users u ON u.id = c.user_id;
+
+-- Estimated rows should match actual rows within 2x
+
+-- 3. End-to-end timing
+\timing on
+-- Run the full optimized query; expect < 2s on SSD
+```
+
+---
+
+## Summary of Changes & Expected Impact
+
+| Fix | Method | Est. Improvement |
+|-----|--------|-----------------|
+| Stale estimates | `SET STATISTICS 500` + `ANALYZE` | Correct plan choice (eliminate nested loop → hash join) |
+| Seq Scan → Index Only Scan | Composite index with INCLUDE | Eliminates heap fetches, ~5–10x for covered columns |
+| Sort spill to disk | Larger `work_mem` (64MB) + INCLUDE reduces sort width | Eliminates disk I/O, ~2–5x |
+| Window function over-all → `DISTINCT ON` lazy evaluation | Query rewrite | Avoids computing rank over millions of rows |
+| CTE inlining causing bad plans | `MATERIALIZED` or temp table + `ANALYZE` | Stable cardinality estimates downstream |
+| Partitioning (if adopted) | Monthly range on `created_at` | Prunes 75–90% of data scanned for single-month queries |
+
+**Total expected improvement**: 40s → **under 2 seconds** under normal load (single-tenant, single-type, ≤ 3 month window), with the remaining variance driven by the size of the qualifying result set.

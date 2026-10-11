@@ -1,0 +1,330 @@
+# Node.js RSS Leak Diagnosis Plan
+
+## Phase 1: Confirm What's Actually Leaking
+
+### Snapshot capture in production (safe)
+
+```bash
+# Before restarting anything — get three snapshots 6h apart
+node --heapsnapshot-signal=SIGUSR2 server.js
+
+# Send signal to PID
+kill -USR2 $(pgrep -f "server.js")
+# Writes /tmp/node-<pid>-<seq>.heapsnapshot
+
+# Alternative: programmatic periodic snapshot
+cat > /tmp/heap-scheduler.js << 'EOF'
+setInterval(() => {
+  const fs = require('fs');
+  const path = require('path');
+  const snapshotPath = path.join('/tmp', `heap-${process.pid}-${Date.now()}.heapsnapshot`);
+  console.error(`[${new Date().toISOString()}] Writing heap snapshot to ${snapshotPath}`);
+  const snap = process._getHeapSnapshot();
+  snap.pipe(fs.createWriteStream(snapshotPath));
+}, 6 * 3600 * 1000); // 6 hours
+EOF
+node /tmp/heap-scheduler.js # run once alongside the service, then kill
+```
+
+**Why this is safe:** `--heapsnapshot-signal` uses SIGUSR2 which doesn't pause GC during snapshot generation in Node 20. It writes to disk asynchronously. Do NOT use `--inspect` in prod unless you have port restrictions.
+
+### Quick local reproduction (no kubectl needed)
+
+```bash
+# Instrument the running container if you have exec access:
+kubectl exec <pod> -- node --heapsnapshot-signal=SIGUSR2 $(cat /proc/1/cmdline | tr '\0' ' ')
+
+# Or if you can replicate locally with production traffic replay:
+autocannon -c 50 -d 300 http://api.internal:3000/health \
+  && pkill -USR2 node
+```
+
+---
+
+## Phase 2: Diff Snapshots to Find Retained Objects
+
+Download the `.heapsnapshot` files and open them — but use CLI diffs first for precision:
+
+```bash
+# Install chrome-remote-interface or use node-native diff
+npm i -g @anthropic/chrome-trace-event  # optional
+
+# --- Approach A: Chrome DevTools (most visual) ---
+# 1. Open chrome://memory in Chrome (or Edge)
+# 2. Load snapshot A, take "Comparison" baseline
+# 3. Load snapshot B, click "Take Comparison"
+# 4. Filter by class name: `Closure`, `Buffer`, `Function`
+
+# --- Approach B: CLI-based profiling via node --prof (for CI/scripting) ---
+node --prof-process --pre process isolates.log isolate-pid-*.log > processed.txt
+grep "Top slow allocations" processed.txt
+
+# --- Approach C: Custom diff script using the heapprof parser ---
+npx @google/heapprofiler analyze heap-before.heapsnapshot heap-after.heapsnapshot \
+  --filter Closure --output leak-report.json
+```
+
+What to sort by in the comparison view:
+1. **Shallow Size difference** — raw objects allocated between snapshots
+2. **Retained Size difference** — objects only reachable through these roots
+3. **Count difference** — number of instances grew (this is the smoking gun for listener registries)
+
+---
+
+## Phase 3: Investigate Each Suspect
+
+### 3A: Emitter Registry Leaking Listeners
+
+**Pattern to look for in code:**
+
+```js
+// LEAK PATTERN — listener never removed
+const ee = new EventEmitter();
+async function handler(req, res) {
+  ee.on('response', track(res));     // ← never calls .off()
+  // ...
+}
+
+// LEAK PATTERN — closure capturing large scope
+ee.addListener('event', (data) => {
+  // closes over `req.body` which has user-uploaded JSON
+});
+```
+
+**Diagnostic commands:**
+
+```bash
+# Add runtime instrumentation — attach as middleware or top-level wrapper
+node -e "
+const { EventEmitter } = require('events');
+const origOn = EventEmitter.prototype.on;
+const origAddListener = EventEmitter.prototype.addListener;
+const registry = new WeakMap();
+
+EventEmitter.prototype.on = function(event, fn) {
+  if (!registry.has(this)) registry.set(this, {});
+  const map = registry.get(this);
+  map[event] = (map[event] || 0) + 1;
+  return origOn.call(this, event, fn);
+};
+setInterval(() => {
+  console.error('[listener-count]', JSON.stringify(
+    [...registry].reduce((acc, [ee, map]) => {
+      for (const [k, v] of Object.entries(map))
+        acc[k] = (acc[k] || 0) + v;
+      return acc;
+    }, {})
+  ));
+}, 60000); // every minute
+" --require /dev/stdin server.js   # prefix your start command with this
+
+# In the heap snapshot: search class name "Function" → check retainers
+# If functions are retained by arrays named "listeners" or "_events", it's confirmed.
+```
+
+**Heap retainer chain confirmation:**
+
+In Chrome DevTools comparison view, right-click the function → **"Show references"** or **"Show Heap Paths"**:
+- You're looking for: `EventEmitter._events → Array[listener] → Closure → captured variables`
+- If the retained size of those closures is GB-scale, that's the leak.
+
+**Fixes:**
+
+```js
+// Fix 1: Use .once() instead of .on() where appropriate
+emitter.once('response', data => { /* fires once, auto-removes */ });
+
+// Fix 2: Explicit cleanup with tracked listeners
+const listeners = [];
+function addTracked(ee, event, fn) {
+  ee.on(event, fn);
+  listeners.push({ ee, event, fn });
+}
+// On route completion:
+for (const l of listeners) l.ee.off(l.event, l.fn);
+listeners.length = 0;
+
+// Fix 3: Use AbortController pattern (Node 15+)
+const controller = new AbortController();
+res.on('close', () => controller.abort());
+emitter.on('response', handler, { signal: controller.signal });  // auto-removes on abort
+
+// Fix 4: Replace custom event emitters with async iterators or streams
+// for long-running pipelines
+```
+
+### 3B: Buffers from Response-Logging Middleware
+
+**Pattern to look for:**
+
+```js
+// LEAK PATTERN — buffering entire response body before writing logs
+app.use(async (req, res, next) => {
+  const originalEnd = res.end;
+  const chunks = [];
+  res.write = function(chunk) {
+    if (chunk) chunks.push(Buffer.from(chunk)); // ← copies ALL chunks
+    return originalEnd.call(this, chunk);
+  };
+  res.end = function(chunk) {
+    if (chunk) chunks.push(Buffer.from(chunk));
+    const fullBody = Buffer.concat(chunks);  // ← huge buffer
+    logger.log({ body: fullBody.toString(), url: req.url }); // body stays in log object
+    return originalEnd.call(this);
+  };
+  next();
+});
+```
+
+**Heap snapshot investigation:**
+
+In DevTools, filter by `Buffer`:
+1. Check **count difference** — did Buffer instances grow continuously?
+2. Check **shallow size** — are individual Buffers enormous (>1MB each)?
+3. **Show Heap Paths** — what retains them? Look for:
+   - Arrays holding chunk buffers
+   - Log entry objects with `body` property
+   - Modules cache or global log buffers
+
+**Fixes:**
+
+```js
+// Fix 1: Only log metadata, never the full body in streaming mode
+app.use((req, res, next) => {
+  const start = performance.now();
+  res.on('finish', () => {
+    logger.info({
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+      responseTimeMs: Math.round(performance.now() - start),
+      // NO body field — or truncate:
+      // responseBodyBytes: res.get('content-length') || 'unknown'
+    });
+  });
+  next();
+});
+
+// Fix 2: If you must log bodies, limit size and use weak references
+const MAX_LOG_BODY = 2048;
+app.use((req, res, next) => {
+  let bodyParts = [];
+  const originalWrite = res.write;
+  res.write = function(chunk) {
+    if (chunk && bodyParts.length * chunk.length < MAX_LOG_BODY) {
+      bodyParts.push(chunk.slice(0, MAX_LOG_BODY));
+    }
+    return originalWrite.call(this, chunk);
+  };
+  // ...
+});
+
+// Fix 3: Use Writable stream wrapper with backpressure awareness
+const { Transform } = require('stream');
+app.use((req, res, next) => {
+  const logger = new Transform({
+    transform(chunk, enc, cb) {
+      // Only process small chunks, discard large ones
+      if (chunk.length < 1024) this.push(chunk);
+      cb();
+    }
+  });
+  logger.pipe(process.stdout);
+  // Don't pipe the full response — it's too late by then
+});
+
+// Fix 4: Audit your logging library
+// winston/pino can accumulate messages in internal buffers.
+// Ensure flush is called and highWaterMark is reasonable:
+const logger = pino({
+  transport: { target: 'pino-elasticsearch', options: { maxRetries: 3 } },
+  // Avoid sync: true with large payloads
+});
+```
+
+---
+
+## Phase 4: Systemic Debugging Steps
+
+### Runtime detection without restarts
+
+```bash
+# Step 1: Get current heap stats
+node -e "
+const m = process.memoryUsage();
+console.log(JSON.stringify({
+  rss_mb: Math.round(m.rss / 1024 / 1024),
+  heap_total_mb: Math.round(m.heapTotal / 1024 / 1024),
+  heap_used_mb: Math.round(m.heapUsed / 1024 / 1024),
+  external_mb: Math.round(m.external / 1024 / 1024),  // <-- Buffers live here
+}));
+"
+
+# If external_mb >> heap_used_mb → native/Buffers are the problem
+# If heap_used ≈ heap_total → GC isn't reclaiming → reference leak
+
+# Step 2: Force GC and compare (available in Node 20 with flag)
+node --expose-gc -e "global.gc(); const m = process.memoryUsage(); console.log(m.heapUsed);"
+# Run twice. If second call still shows high usage, there's a real leak.
+
+# Step 3: Profile with --cpu-prof
+node --cpu-prof --max-old-space-size=2048 server.js
+# After reproducing, analyze with:
+node --prof-process --preprocess -j isolate*.log | process-microstate-diff
+```
+
+### K8s-specific hardening
+
+```yaml
+# pod.yaml additions
+resources:
+  requests:
+    memory: "512Mi"
+  limits:
+    memory: "1Gi"       # lower to catch it before OOM-killing all replicas
+    cpu: "500m"
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+# Add a Readiness probe so Kubernetes drains the pod gracefully:
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 3000
+  failureThreshold: 1   # drain immediately when unhealthy
+```
+
+```bash
+# Monitor RSS vs heap over time — set up Prometheus scraping
+curl http://localhost:9464/metrics  # if using prom-client
+# Or manually log every 60s:
+watch -n 60 'node -e "console.log(JSON.stringify(process.memoryUsage()))"'
+```
+
+---
+
+## Likely Root Cause Matrix
+
+| Symptom | Most Likely Cause | Probability |
+|---|---|---|
+| Closure count grows steadily, retained by `_events` arrays | Listener leak in request handler registering per-request callbacks | High |
+| External memory >> heap used, Buffer count climbing | Response body buffering in logging/tracing middleware | High |
+| Heap grows linearly, GC doesn't help | Closure capturing `req`, `res`, or full request/response cycle | Medium |
+| Intermittent spikes, not monotonic | Response serialization to JSON in logs accumulating large strings | Medium |
+| Leaks even after manual GC | Global/module-level caches (e.g., `Map` storing responses keyed by req.id) | Low-Medium |
+
+---
+
+## Order of Operations
+
+1. **Instrument now** — add listener counting and `external` memory monitoring to catch the metric diverging in prod
+2. **Force GC + snapshot** — `global.gc()` then `--heapsnapshot-signal=SIGUSR2` at 300MB, 1GB, and 3GB
+3. **Compare snapshots** — focus on Closure and Buffer classes, examine retainer paths
+4. **Audit emitter registrations** — grep for `.on()` / `.addListener()` inside route handlers
+5. **Audit logging** — grep for `body`, `response`, `chunks`, `Buffer.concat` in middleware
+6. **Apply targeted fix**, monitor RSS for 24h
+
+Start with step 1 today — instrument the prod pod before making any changes. The goal is to confirm whether the leak is closure-based (listener registry) or Buffer-based (middleware) before committing to a fix, since the two require completely different approaches.

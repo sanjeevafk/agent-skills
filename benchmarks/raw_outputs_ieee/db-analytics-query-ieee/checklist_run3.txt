@@ -1,0 +1,277 @@
+[exit=0 latency=24.15s]
+# Diagnosing the 40s Postgres Reporting Query
+
+## Problem Summary
+
+800M-row `events` table → Seq Scan + disk-spilling sort + stale planner estimates (100 predicted vs 2M actual) + window rank + join to 2M-row `users` table = **40 seconds**.
+
+---
+
+## Node-by-Node EXPLAIN ANALYZE Breakdown
+
+Assume the plan looks something like this (the nodes you described):
+
+```
+WindowAgg  (cost=... time=40000ms)
+ └─ Sort  (sort method: external merge, disk=250MB)  ← disk spill
+    └─ Hash Join  (hash: Users)
+       ├─ Hash
+       │  └─ Seq Scan on users  (cost=... rows=2M width=...)  ← full table scan
+       └─ Recheck Cond: (tenant_id = ... AND event_type = ...)
+          └─ Seq Scan on events  (actual rows=2M, expected rows=100)  ← stale estimate
+```
+
+**Three distinct root causes:**
+
+| # | Node | Symptom | Root Cause |
+|---|------|---------|------------|
+| 1 | Seq Scan on events | Full table scan of 800M rows | No usable composite index matching filter columns |
+| 2 | Sort (disk=250MB) | External merge sort spilled to disk | Large intermediate result + window frame not supported by an index |
+| 3 | Events row estimate | Planner says 100, got 2M (20000× off) | Stale statistics, likely due to high cardinality skew and/or lack of column-level stats |
+
+---
+
+## Diagnosis & Fix — Step by Step
+
+### 1. Index Strategy: Why Column Order Matters
+
+The filters are: `tenant_id`, `event_type`, `created_at`. The key insight: **column order in a composite index must follow equality predicates first, then range predicates.**
+
+**Correct composite index:**
+```sql
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_created
+ON events (tenant_id, event_type, created_at);
+```
+
+**Why this order?**
+- `tenant_id` = equality → partitions the B-tree into one small subtree per tenant
+- `event_type` = equality → further narrows within that tenant's partition
+- `created_at` = range → sequential scan within the already-tight slice
+
+If you reversed it to `(created_at, tenant_id, event_type)` the B-tree would be useless because the range predicate on `created_at` consumes the entire tree, making the subsequent equality predicates unable to prune.
+
+**Benchmarks against alternatives:**
+
+| Index | Selectivity | Rows scanned | Verdict |
+|-------|-------------|-------------|---------|
+| `(tenant_id, event_type, created_at)` | Best | ~1% of tenant data | ✅ |
+| `(tenant_id, created_at)` | Good | ~10% of tenant data | Acceptable if `event_type` is rarely filtered alone |
+| `(created_at, tenant_id)` | Bad | Whole table | ❌ Range on col 1 makes cols 2–N unindexable |
+| Single index on `tenant_id` only | Poor | ~all tenant rows | Only helps if one tenant has 99% of traffic |
+
+### 2. Covering Index — Eliminate Heap Fetches
+
+If the window function (`RANK() OVER (PARTITION BY ... ORDER BY ...)`) needs additional columns from events (e.g., `score`, `value`), a covering index avoids random heap I/O:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_covering
+ON events (tenant_id, event_type, created_at)
+INCLUDE (user_id, score, value);  -- INCLUDE columns don't affect sort order
+```
+
+`INCLUDE` (Postgres 11+) stores these in the index leaf pages as payload data. The B-tree structure still sorts by `(tenant_id, event_type, created_at)`, but the query can satisfy itself entirely from the index (an "index-only scan"). This often cuts I/O by 60–80%.
+
+### 3. Partial Index — Tenant-Specific Hot Paths
+
+If queries always run for specific tenants (or tenant tiers), a partial index shrinks the index size dramatically and gives the planner sharper selectivity estimates:
+
+```sql
+-- Only index events from the top 10 tenants (who generate 80%+ of reports)
+CREATE INDEX CONCURRENTLY idx_events_top_tenants
+ON events (tenant_id, event_type, created_at)
+WHERE tenant_id IN (
+    SELECT tenant_id FROM tenants
+    WHERE tier = 'enterprise'
+);
+```
+
+Or more commonly, if all reporting goes through a single tenant context:
+
+```sql
+-- If every report is tenant-scoped at connection level,
+-- this is implicit. But if your app always adds a WHERE tenant_id = $1,
+-- ensure the composite index above covers it.
+```
+
+Partial indexes shine when the predicate is highly selective AND the workload is predictable. Don't overdo it — every partial index means another index the planner picks through.
+
+### 4. Fix the Stale Estimates
+
+Planner expecting 100 rows but getting 2M is a **statistics problem**. Causes and fixes:
+
+```sql
+-- Force a full autovacuum ANALYZE to refresh statistics
+ANALYZE events;
+ANALYZE users;
+
+-- If statistics are still stale (skewed data), increase the target:
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+ANALYZE events;
+
+-- Create extended statistics for multi-column correlation (critical for the planner)
+-- This tells the planner the joint distribution of these columns
+CREATE STATISTICS IF NOT EXISTS stat_events_tenant_type
+    ON tenant_id, event_type
+    FROM events;
+ANALYZE events;
+```
+
+With `ndistinct` > 10K for `tenant_id`, the default `STATISTICS = 100` cannot capture the skewed distribution. Setting it to 1000 (max) lets the histogram model the distribution much more accurately.
+
+### 5. The Partitioning Question — Month-Range?
+
+**Rule of thumb: Only partition when you have operational reasons, not just performance ones.**
+
+| Scenario | Partition? | Reason |
+|----------|-----------|--------|
+| All queries filter `created_at` to ≤ 90 days | ✅ Yes | Old data drops off; `DELETE FROM events WHERE created_at < ...` becomes instant with `DROP PARTITION` |
+| Append-only time-series data | ✅ Yes | Hot/warm/cold storage tiers; old partitions archived to S3/iceberg |
+| Queries span 6+ months | ❌ No | Partition pruning works but the overhead (one lock per partition, larger system catalog) outweighs benefits |
+| One-time migration to 800M rows | ❌ No | Just get better indexes + stats first; partition later if justified |
+
+**For this case**, since the query uses a `created_at` range and you're seeing disk spills from large intermediate sets, I'd recommend **monthly range partitioning** ONLY if:
+- Data older than 3–6 months is never queried
+- You delete/archive old data regularly
+
+```sql
+-- Example: monthly range partitioning (only do this if the above conditions hold)
+CREATE TABLE events (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    tenant_id   bigint NOT NULL,
+    event_type  text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    user_id     bigint,
+    score       numeric(10,2),
+    value       jsonb,
+    PRIMARY KEY (id, created_at)  -- partition key MUST be part of PK
+) PARTITION BY RANGE (created_at);
+
+-- Create partitions (run in a script for all months)
+CREATE TABLE events_y2025m01 PARTITION OF events
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_y2025m02 PARTITION OF events
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+-- etc.
+
+-- Then create indexes ON EACH PARTITION (or on the parent; PG creates them automatically)
+CREATE INDEX CONCURRENTLY idx_events_part_tenant
+ON events (tenant_id, event_type, created_at);
+-- This creates the same index on every partition
+```
+
+The index on the parent propagates to all partitions. When your query specifies `created_at BETWEEN '2025-06-01' AND '2025-06-30'`, only the matching 1–2 partitions are scanned (not 800M rows).
+
+**But start here before partitioning** — the index + stats fix alone may bring the query to <2s.
+
+### 6. Rewrite the Query
+
+Here's the optimized query pattern with CTE/materialization strategy explained:
+
+```sql
+-- ============================================================
+-- STRATEGY: Materialize the filtered subset first via CTE,
+-- then apply the window function. This forces the planner to
+-- materialize (cache) the filtered events set so the window
+-- operation doesn't re-evaluate the filter.
+-- ============================================================
+
+WITH filtered_events AS MATERIALIZED (
+    -- Use explicit hints via proper indexing (see above)
+    -- The planner will now use the composite index with accurate stats
+    SELECT
+        e.id,
+        e.tenant_id,
+        e.event_type,
+        e.created_at,
+        e.user_id,
+        e.score,
+        e.value
+    FROM events e
+    WHERE e.tenant_id = $1           -- equality (first in index)
+      AND e.event_type = $2          -- equality (second in index)
+      AND e.created_at >= $3         -- range (third in index)
+      AND e.created_at <  $4         -- range end
+)
+
+SELECT
+    fe.*,
+    u.name      AS user_name,
+    u.email     AS user_email,
+    RANK() OVER (
+        PARTITION BY fe.tenant_id
+        ORDER BY fe.created_at DESC
+    ) AS event_rank
+FROM filtered_events fe
+INNER JOIN users u ON u.id = fe.user_id
+ORDER BY fe.tenant_id, event_rank;
+```
+
+**Key decisions explained:**
+
+| Choice | Why |
+|--------|-----|
+| `AS MATERIALIZED` (PG 12+) | Forces the CTE to be executed once into a temp object, not inlined. Without this, the planner may inline and re-plan per usage, potentially picking worse plans for complex CTEs. **In PG 12+, CTEs are optimization fences by default** unless marked `MATERIALIZED` vs `NOT MATERIALIZED`. Use `MATERIALIZED` here to cache the filtered 2M-row result before the window/rank. |
+| `INNER JOIN` over `LEFT JOIN` | We only care about events with matching users. Reduces result set and allows nested loop hash joins. |
+| Window function in outer SELECT | After the CTE filters down from 800M → ~2M, the window operates on a much smaller dataset. Disk spill risk drops significantly. |
+| `EXISTS` subquery alternative | If `users` join is just a filter (no columns from `users` in output), replace the JOIN with `WHERE EXISTS (SELECT 1 FROM users WHERE id = fe.user_id)` — avoids duplicating events columns in the join. |
+
+**When to use `NOT MATERIALIZED` instead:**
+
+If the CTE result is tiny (< 10K rows), don't materialize — inline it:
+
+```sql
+WITH filtered_events AS NOT MATERIALIZED (
+    ...same WHERE clause...
+)
+```
+
+The planner can push down predicates through a non-materialized CTE, potentially combining the filter with the window's sort. For 2M rows, `MATERIALIZED` is almost always correct.
+
+---
+
+## Complete Action Plan (Order of Execution)
+
+```sql
+-- STEP 1: Refresh statistics immediately (fixes the 100→2M estimate problem)
+ANALYZE events;
+ANALYZE users;
+
+-- STEP 2: Increase statistics target for skewed columns
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;
+ALTER TABLE events ALTER COLUMN event_type SET STATISTICS 1000;
+CREATE STATISTICS IF NOT EXISTS stat_events_tenant_type
+    ON tenant_id, event_type FROM events;
+ANALYZE events;
+
+-- STEP 3: Add the composite index (build while DB is running)
+CREATE INDEX CONCURRENTLY idx_events_tenant_type_created
+    ON events (tenant_id, event_type, created_at);
+
+-- STEP 4 (optional): Covering index if you need additional columns
+CREATE INDEX CONCURRENTLY idx_events_covering
+    ON events (tenant_id, event_type, created_at)
+    INCLUDE (user_id, score, value);
+
+-- STEP 5 (if partitioning applies): Migrate to monthly range partitioning
+-- See partitioning DDL above. Requires REINDEX or CREATE TABLE AS + swap.
+
+-- STEP 6: Set maintenance_work_mem higher for index builds
+SET maintenance_work_mem = '2GB';  -- or 25% of available RAM
+```
+
+Then verify:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+-- [paste the rewritten query here]
+```
+
+Look for:
+- ✅ **Index Scan using idx_events_tenant_type_created** on events (not Seq Scan)
+- ✅ **Rows estimated ≈ actual rows** (within 10–20%, not 20000× off)
+- ✅ **No "external merge" / "disk="** in the Sort node (works-in-memory sort)
+- ✅ **Index Only Scan** if you added the covering index
+- ✅ Sort memory usage under `work_mem` (check `sort memory used` line in EXPLAIN)
+
+**Expected outcome:** With proper indexes + accurate statistics, the 800M-row scan becomes a targeted lookup of one tenant's narrow time range — typically 0.1–2s depending on the date span. The window function on ~10K–2M rows works in-memory with adequate `work_mem` (set to at least 256MB–1GB for this workload).

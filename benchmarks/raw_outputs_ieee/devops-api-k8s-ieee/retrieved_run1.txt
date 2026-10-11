@@ -1,0 +1,527 @@
+[exit=0 latency=36.20s]
+I'll work through this systematically and provide all three manifests plus the detailed explanations.
+
+---
+
+## Production Manifests
+
+### Namespace (prerequisite)
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: go-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: go-api-role
+  namespace: go-api
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["go-api-secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: go-api-rolebinding
+  namespace: go-api
+subjects:
+  - kind: ServiceAccount
+    name: go-api-sa
+    namespace: go-api
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: go-api-role
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: go-api-sa
+  namespace: go-api
+automountServiceAccountToken: false
+```
+
+---
+
+### Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: go-api
+  labels:
+    app: go-api
+spec:
+  # Replicas managed by HPA; set min to match HPA minReplicas
+  replicas: 3
+  selector:
+    matchLabels:
+      app: go-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # Never drop below desired count during update
+  template:
+    metadata:
+      labels:
+        app: go-api
+    spec:
+      serviceAccountName: go-api-sa
+      automountServiceAccountToken: false
+
+      # CRITICAL: Must be >= graceful shutdown timeout in your code
+      # See termination-drain sequence explanation below
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: go-api
+          image: ghcr.io/org/go-api:v1.2.3         # Pin to immutable tag
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ── Resources ──────────────────────────────────────────────────
+          # Request = expected steady-state usage at p95.
+          # Limit   = p99 spike ceiling. Gap between them = burst budget.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+
+          # ── Probes ─────────────────────────────────────────────────────
+          # Startup probe: covers the 20s cold-cache warmup with heavy margin
+          # failureThreshold × periodSeconds = 40 × 5 = 200s max startup time
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 40
+            periodSeconds: 5
+            initialDelaySeconds: 2              # First check at t=2s
+
+          # Liveness: only runs AFTER startup probe succeeds.
+          # Detects permanent failures (deadlocks, goroutine leaks).
+          # failureThreshold × periodSeconds = 3 × 15 = 45s before restart.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 3
+            periodSeconds: 15
+            initialDelaySeconds: 0
+
+          # Readiness: runs from the start (no initialDelay override needed,
+          # startup probe gates scheduling). Checks DB connectivity + cache
+          # status so kube-proxy never routes to a pod that can't serve.
+          # failureThreshold × periodSeconds = 3 × 5 = 15s until deregistered.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            failureThreshold: 3
+            periodSeconds: 5
+            initialDelaySeconds: 2
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            # Secrets mounted as FILES (not env vars) via ExternalSecrets
+            - name: secrets
+              mountPath: /etc/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: secrets
+          secret:
+            secretName: go-api-secrets
+            defaultMode: 0400             # -r-------- per-file
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: go-api
+```
+
+**Readiness endpoint behavior (`/readyz`)**: Returns `200 OK` when both conditions are true:
+
+```go
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+    dbOK := db.Ping() == nil
+    cacheOK := cache.WarmedUp() // true after ~20s cold start
+    if !dbOK || !cacheOK {
+        w.WriteHeader(503)
+        return
+    }
+    w.WriteHeader(200)
+}
+```
+
+This ensures the pod is removed from `kube-proxy` iptables/IPVS rules *before* accepting production traffic while the cache is still warming.
+
+---
+
+### HorizontalPodAutoscaler (v2 API — supports custom metrics)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api-hpa
+  namespace: go-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    # ── CPU-based scaling ──────────────────────────────────────────
+    # Scales up when average CPU across pods exceeds 60% of the
+    # requested 100m. This fires well before hitting the 250m limit,
+    # preventing p99 tail latencies from CPU starvation.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # ── Custom metric: queue depth per pod ─────────────────────────
+    # Assuming you expose a Prometheus metric like:
+    #   go_api_queue_depth{namespace="go-api",pod="go-api-abc12"} = 17
+    #
+    # TargetAverageValue means each pod should see this value on
+    # average. Set it to the concurrency limit where latency starts
+    # climbing (measure with benchmarking).
+    - type: Pods
+      pods:
+        metric:
+          name: go_api_queue_depth
+        target:
+          type: AverageValue
+          averageValue: "5"
+
+    # ── Optional: add HTTP requests-per-second if available ───────
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: http_requests_total_rate
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "50"
+
+  behavior:
+    # Scale-up: aggressive — evaluate every 15s, allow scaling to
+    # 2× current replicas quickly.
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max           # Pick the most aggressive policy
+
+    # Scale-down: conservative — wait 5 minutes between scaling
+    # events to prevent flapping when traffic drops temporarily.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min           # Pick the gentler policy
+```
+
+**Why averageValue for custom metrics?** Because the HPA divides `sum(all pod queue depths) / replica_count`. If you have 5 pods with queue depths [2, 3, 8, 1, 6], the sum is 20, divided by 5 = average of 4. Since the target is 5, no scale-up triggers. When one pod spikes to 15 ([2, 3, 15, 1, 6]), average = 5.4 → exceeds target → HPA adds pods.
+
+---
+
+### PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: go-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+With `replicas: 3` and `minAvailable: 2`, Kubernetes allows **at most 1 pod disruption at a time**. During a node drain:
+
+1. Kubelet signals the first pod → receives SIGTERM
+2. PDB blocks eviction of a second pod until the first is fully Terminated
+3. Zero risk of all-replicas dropping simultaneously
+
+If you increase replicas to 4+, consider switching to `maxUnavailable: 1` which behaves identically but reads more clearly at higher replica counts.
+
+---
+
+### Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-api
+  namespace: go-api
+spec:
+  selector:
+    app: go-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+```
+
+---
+
+## Probe Threshold Arithmetic
+
+The three probes operate in a handoff pattern, not concurrently:
+
+### Timeline
+
+```
+t=0s      Container starts
+t=2s      First startupProbe check (initialDelaySeconds: 2)
+...       Every 5s thereafter (periodSeconds: 5)
+t=2s-42s  Cache warming happens inside the process
+t=44s     readinessProbe returns 200 (cache warmed ≈20s, +buffer)
+          ⬆ Pod added to kube-proxy endpoints — receives traffic
+...
+t=202s    Last possible startupProbe success (40 failures × 5s)
+          ⬇ After any single success, startup probe DISAPPEARS
+          
+          Liveness probe activates (no overlap with startup probe)
+          Periodic checks every 15s
+          
+          Readiness continues running independently
+```
+
+### Key Math
+
+| Probe | Config | Effective Window | What It Catches |
+|-------|--------|-----------------|-----------------|
+| **startup** | `failureThreshold: 40 × periodSeconds: 5` | Up to **200s** max | Process hangs during init, slow cold-start, missing deps |
+| **liveness** | `failureThreshold: 3 × periodSeconds: 15` | **45s** between consecutive failures | Deadlock, goroutine leak, perpetual error loop |
+| **readiness** | `failureThreshold: 3 × periodSeconds: 5` | **15s** between consecutive failures | DB down, cache miss cascade, downstream outage |
+
+### Why `failureThreshold: 40` for startup?
+
+The cache takes ~20s to warm. A naive reading might suggest `threshold: 4 × period: 5 = 20s`. But real-world variance exists:
+
+- Node-level GC pauses (can add 2–5s to container startup)
+- Image pull caching delays
+- Go binary initialization (especially with large dependency graphs)
+- Database connection pooling (first connections take longer)
+
+The safety factor of **10×** over the nominal 20s is intentional. A failed startup probe kills and restarts the container — there's no penalty for being generous here because the HPA will immediately spin up a replacement.
+
+### Critical: No Race Between Startup and Liveness
+
+Kubernetes semantics: **when the startup probe succeeds at least once, the kubelet removes it entirely**. The liveness probe then becomes the sole timer. This means:
+
+- A pod that warms up in 20s has its startup probe succeed at `t=22s`, it disappears immediately
+- The liveness probe (checking every 15s starting from container start) is now responsible for catching problems
+- There is **zero overlap** — you don't need to worry about a failing liveness probe restarting a pod that's still in its startup phase
+
+---
+
+## Termination-Drain Sequence
+
+The goal: **zero dropped in-flight requests** during rolling updates or node drains. Here's the exact sequence:
+
+### Phase 1: SIGTERM Sent
+
+```
+Node drain / deployment rollout triggers
+        │
+        ▼
+kubelet sends SIGTERM to PID 1 (your Go process)
+        │
+        ├──► 1. Stop AcceptTcp4/6 listeners (accept new connections: false)
+        ├──► 2. Remove pod from Kubernetes endpoints
+        │         │
+        │         ▼
+        │     Ready probe fails → kube-proxy removes pod from
+        │     iptables/IPVS routing tables
+        │         │
+        │         ▼
+        │     ~15s: All traffic stops flowing to this pod
+        │
+        ▼
+Phase 2: Drain in-flight requests
+        │
+        ├──► Wait for active request count → 0
+        │         (use http.Server.Shutdown(ctx) with context deadline)
+        │
+        ▼
+Phase 3: Force exit
+        │
+        ├──► At t=60s (terminationGracePeriodSeconds): SIGKILL
+        │         (if any goroutines are still holding connections)
+```
+
+### Required Go Code
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+)
+
+func main() {
+    srv := &http.Server{
+        Addr:         ":8080",
+        Handler:      router(),
+
+        // These timeouts cap individual request duration.
+        // Together with gracefulShutdownTimeout, they bound total shutdown.
+        ReadHeaderTimeout: 5 * time.Second,
+        ReadTimeout:       10 * time.Second,
+        WriteTimeout:      30 * time.Second,
+        IdleTimeout:       120 * time.Second,
+    }
+
+    // Start server in background
+    go func() {
+        log.Println("listening on :8080")
+        if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatalf("server error: %v", err)
+        }
+    }()
+
+    // Block until SIGTERM or SIGKILL
+    gracefulShutdown(srv)
+}
+
+func gracefulShutdown(srv *http.Server) {
+    // Wait for SIGTERM (sent by kubelet during pod termination)
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGTERM)
+    <-quit
+
+    log.Println("shutting down...")
+
+    // 55s leaves buffer before the 60s SIGKILL at terminationGracePeriodSeconds
+    ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
+    defer cancel()
+
+    // Shutdown rejects new requests, waits for in-flight ones to finish
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Printf("forced shutdown: %v", err)
+        srv.Close() // emergency: kill remaining connections
+    }
+
+    log.Println("server stopped cleanly")
+}
+```
+
+### Timing Budget
+
+```
+terminationGracePeriodSeconds: 60s
+├── SIGTERM received                    at t=0s
+├── Endpoint removal (readiness fails)   ~0-2s after SIGTERM
+├── Traffic drains                      ~2-15s (depends on periodSeconds/failureThreshold)
+├── srv.Shutdown() context timeout       t=55s
+└── SIGKILL (enforced by kubelet)        t=60s
+```
+
+### Why `maxUnavailable: 0` in Deployment Strategy
+
+Combined with the PDB (`minAvailable: 2`), this ensures:
+
+1. During a rolling update, old pods are **never terminated** until new pods are Running and Ready
+2. The new pod must pass startup probe AND readiness probe (cache warmed) before the old pod is killed
+3. At no point do we drop below the replica count — the PDB guarantees availability even under independent pressure
+
+### End-to-End Update Scenario
+
+```
+Current state: 3 pods (A, B, C) all serving traffic
+Deploy v1.2.4 image:
+
+Step 1: Kubernetes creates pod D (new image)
+        ┌── Startup probe: passes (cache warms in ~20s)
+        ├── Readiness probe: passes (cache ready)
+        └── PodD added to endpoints → traffic starts flowing to D
+
+Step 2: maxUnavailable: 0 blocks killing any old pod
+        ┌── New pod E created (also goes through full startup)
+        └── Still waiting for E to become Ready
+
+Step 3: Once both D and E are Ready, kill pod A (maxUnavailable=1)
+        ┌── PodA gets SIGTERM → graceful drain (see sequence above)
+        └── 0 requests dropped (all in-flight completed within 55s)
+
+Step 4: Kill pod B, create F. Kill pod C, create G.
+Step 5: Cleanup complete. 3 old pods gone, 3 new pods (D, E, F) serving.
+```
+
+The entire rollout preserves availability at the PDB-mandated minimum of 2 pods throughout.
+
+---
+
+## Verification Checklist
+
+Before applying to production:
+
+- [ ] Confirm `/healthz` returns `200` even when cache isn't warmed (startup/liveness only needs liveness)
+- [ ] Confirm `/readyz` returns `503` when cache is *not* warmed (gates traffic correctly)
+- [ ] Benchmark: verify p99 latency fits within `memory: 256Mi` RSS at expected RPS
+- [ ] Install Prometheus adapter (or equivalent) to expose `go_api_queue_depth` metric
+- [ ] Test rollout: `kubectl rollout restart deployment/go-api -n go-api` and verify zero 5xx errors with a live client
+- [ ] Test PDB: simulate node drain and confirm only 1 pod evicts at a time

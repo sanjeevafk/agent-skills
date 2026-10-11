@@ -1,0 +1,778 @@
+[exit=0 latency=45.31s]
+# Node.js 20 Memory Leak Diagnosis Plan
+
+## Phase 1: Safe Heap Snapshot Capture in Production
+
+### Snapshot Collection Strategy
+
+```bash
+# Option A: Built-in heap profiler via SIGUSR2 (Node 20)
+# Trigger snapshot without restart — sends to /tmp/heap.${pid}.heapsnapshot
+kill -SIGUSR2 <node-pid>
+
+# Option B: Programmatic snapshot via debugger protocol
+curl http://localhost:<debug-port>/snapshot > heap_$(date +%s).heapsnapshot
+
+# Option C: Using --heapsnapshot-signal-on-exit for controlled captures
+NODE_OPTIONS="--heapsnapshot-signal-on-exit" node server.js
+# Then: kill -SIGUSR2 <pid>  # writes on next graceful exit
+```
+
+### Safe Capture Protocol
+
+```javascript
+// Place in monitoring health-check route or cron job
+const fs = require('fs');
+const path = require('path');
+
+async function takeHeapSnapshot(label) {
+  // Use vm module to avoid GC interference during snapshot
+  const vm = require('vm');
+  
+  // Step 1: Force a full GC before snapshot for clean baseline
+  if (global.gc) {
+    global.gc();
+    await sleep(100); // let GC settle
+  } else {
+    // Enable profiling GC even without --expose-gc
+    process._rawDebug('No manual GC available; using forced profile mode');
+    process.setMinTickBeforeForceGC(1);
+    process.forceGC?.();
+  }
+  
+  // Step 2: Write snapshot atomically
+  const filePath = path.join('/tmp', `heap_${label}_${Date.now()}.heapsnapshot`);
+  const writeStream = fs.createWriteStream(filePath);
+  
+  return new Promise((resolve, reject) => {
+    process.stdout.write(`DEBUGPORT=${process.argv.find(a => a.startsWith('--inspect')) || 'not set'}`);
+    
+    // Use v8's built-in snapshot capability via eval in debug context
+    const snapshotPath = `/tmp/heap_${label}_${process.pid}_${Date.now()}.heapsnapshot`;
+    
+    // Best approach: use --max-old-space-size monitoring to know WHEN to snapshot
+    resolve(snapshotPath);
+  });
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+```
+
+**Production-safe cadence:**
+1. Take snapshot every 6 hours (matching your observation interval)
+2. Store on persistent volume (EFS, GCS, S3 mount) not node-local disk
+3. Compress with zstd to reduce storage pressure
+4. Keep rolling window of last 8 snapshots (~2 days at 6h intervals)
+
+### Automated Monitoring Script
+
+```javascript
+// monitor-memory.js — run as sidecar container
+const cron = require('node-cron'); // or use OS cron
+const { execSync } = require('child_process');
+const https = require('https');
+
+const CONFIG = {
+  nodePid: process.env.NODE_PID || parseInt(process.pid),
+  snapshotIntervalMinutes: parseInt(process.env.SNAPSHOT_INTERVAL_MIN || '360'),
+  maxRetainedMb: parseInt(process.MAX_RETAINED_MB || '512'),
+  uploadTo: process.env.UPLOAD_TARGET, // S3/GCS endpoint
+};
+
+// Health metrics collection
+function getMemoryMetrics() {
+  const mem = process.memoryUsage();
+  const heapStats = process.getHeapStatistics?.();
+  
+  return {
+    timestamp: Date.now(),
+    rss: mem.rss,              // Total RSS — your climbing metric
+    heapUsed: mem.heapUsed,
+    heapTotal: mem.heapTotal,
+    external: mem.external,     // Important: Buffer/memory-pool backed data
+    arrayBuffers: mem.arrayBuffers,
+    // Derived rates
+    rssPerMb: mem.rss / 1024 / 1024,
+    heapUsedPerMb: mem.heapUsed / 1024 / 1024,
+    externalPerMb: mem.external / 1024 / 1024,
+    // Capacity
+    heapLimit: heapStats?.heap_size_limit ? heapStats.heap_size_limit / 1024 / 1024 : 0,
+    rssUtilization: mem.rss / (heapStats?.heap_size_limit * 3), // rough proxy
+  };
+}
+
+// Alert when RSS exceeds threshold
+function shouldTriggerSnapshot(metrics) {
+  return metrics.externalPerMb > 200 ||      // External (Buffer) growing fast
+         metrics.rssPerMb > CONFIG.maxRetainedMb ||
+         metrics.external > metrics.heapUsed * 0.5;  // External consuming too much
+}
+
+// Periodic check + snapshot trigger
+setInterval(async () => {
+  const metrics = getMemoryMetrics();
+  
+  console.log(JSON.stringify({
+    type: 'memory-metrics',
+    ...metrics,
+    trend: detectTrend(metrics),  // compare to last recorded value
+  }));
+  
+  if (shouldTriggerSnapshot(metrics)) {
+    await triggerSnapshot(metrics);
+  }
+}, CONFIG.snapshotIntervalMinutes * 60 * 1000);
+```
+
+---
+
+## Phase 2: Retainer Chain Analysis
+
+### Step 1: Identify Dominator Trees in Chrome DevTools
+
+Open two snapshots side-by-side in Chrome (`chrome://inspect` → Open DevTools → Memory tab):
+
+```
+1. Load heap_6h.heapsnapshot
+2. Switch to heap_12h.heapsnapshot  
+3. Select "Comparison" view
+4. Look for "Delta" column — shows net object growth
+```
+
+**Key columns to inspect:**
+| Column | What It Tells You |
+|--------|------------------|
+| `Shallow Size` | Memory used by the objects themselves (not what they reference) |
+| `Retained Size` | Memory that would be freed if all roots pointing to these objects were removed |
+| `Count Delta` | How many more instances exist now vs baseline |
+
+### Step 2: Trace Emitter Registry Retainers
+
+In the Comparison view:
+
+```
+1. Search filter: "Function" or "Closure"
+2. Group By: "Prototype" → look for EventEmitter-related prototypes
+3. Sort By: "Retained Size Descending"
+4. Click top entries → "Retainers" panel
+5. Follow retainer chain upward:
+   
+   Closure [X bytes]
+     └─ hidden class: Function
+     └─ [[Scopes]]: Closed over {req, res, reqId, startTime}
+        └─ Reference from: Event target listener list
+           └─ EventEmitter [_events] map
+              └─ Module-level singleton or class instance
+```
+
+**Red flags in retainer chain:**
+- ✅ Listener closures holding HTTP request/response objects
+- ✅ Listeners accumulated but never removed (`once()` misused instead of `on()`)
+- ✅ Async callback contexts retaining stack frames through Promises
+- ✅ Closures over large objects (full request body, headers, query strings)
+
+### Step 3: Trace Buffer Retainers
+
+```
+1. Search filter: "JS Array Buffer" or "ArrayBuffer"
+2. Look for "Detached" status — detached buffers that shouldn't exist
+3. Filter: size > 64KB (larger than normal single responses)
+4. Check retainers for "response-logging" or "middleware" paths
+
+Common pattern identified:
+   Buffer [large size]
+     └─ Backed by underlying ArrayBuffer
+        └─ Referenced from:
+           ├─ Array in logging middleware accumulator
+           ├─ WeakMap entry with stale key
+           └─ Custom buffer pool not releasing references
+```
+
+---
+
+## Phase 3: Confirming the Emitter Listener Leak
+
+### Diagnostic Code to Add
+
+```javascript
+const EventEmitter = require('events');
+const originalOn = EventEmitter.prototype.on;
+const originalAddListener = EventEmitter.prototype.addListener;
+const originalOnce = EventEmitter.prototype.once;
+const originalOff = EventEmitter.prototype.off;
+const originalRemoveListener = EventEmitter.prototype.removeListener;
+
+// Track all emitter instances at module scope
+const emitterRegistry = new WeakSet();
+const emitterListenerCounts = new Map();
+let snapshotTime = Date.now();
+
+function logEmitterLeak(sourceEventEmitter) {
+  const id = sourceEventEmitter.kAsyncId || process.domain?.id || 'unknown';
+  const count = sourceEventEmitter.listenerCount?.() ?? 
+                Object.keys(sourceEventEmitter._events || {}).reduce(
+                  (sum, key) => sum + (Array.isArray(sourceEventEmitter._events[key]) 
+                    ? sourceEventEmitter._events[key].length 
+                    : 1), 0
+                );
+  
+  // Check if we're exceeding thresholds
+  const previousCount = emitterListenerCounts.get(id) || 0;
+  const delta = count - previousCount;
+  
+  if (delta > 5 || count > 100) {
+    const elapsed = ((Date.now() - snapshotTime) / 1000 / 60).toFixed(1);
+    console.error(`[EMITTER-LEAK] ${sourceEventEmitter.constructor.name}#${id}: ` +
+      `${count} listeners (+${delta} since last check after ${elapsed}min)` +
+      `\nStack trace:\n${new Error().stack.split('\n').slice(2, 12).join('\n')}`);
+  }
+  
+  emitterListenerCounts.set(id, count);
+}
+
+// Patch EventEmitter to detect accumulation
+class LeakyEmittersDetector {
+  static start() {
+    setInterval(() => {
+      // Find common emitter instances in your app
+      // This requires knowing where your emitters live — typically:
+      for (const [key, emitter] of Object.entries(moduleExports)) {
+        if (emitter instanceof EventEmitter) {
+          logEmitterLeak(emitter);
+        }
+      }
+    }, 60000); // Check every minute
+  }
+}
+
+module.exports = LeakyEmittersDetector;
+```
+
+### Runtime Listener Audit Endpoint
+
+```javascript
+// Add to your API for on-demand inspection
+app.get('/debug/emitters', (req, res) => {
+  const results = [];
+  
+  // Instrument common emitter sources
+  const candidates = [
+    { name: 'http.Server', instance: server },       // If you have server reference
+    { name: 'WebSocketServer', instance: wss },      // If using ws
+    { name: 'RedisClient', instance: redisClient },  // If using ioredis
+    { name: 'AmqpConnection', instance: amqpChannel },
+    // Add based on your actual dependencies
+  ];
+  
+  for (const { name, instance } of candidates) {
+    if (!instance) continue;
+    
+    const count = instance.listenerCount ? instance.listenerCount() : 0;
+    const events = instance.eventNames?.() || [];
+    
+    results.push({
+      name,
+      listenerCount: count,
+      events,
+      details: events.map(event => ({
+        name: event,
+        count: instance.listenerCount(event),
+        // CRITICAL: Show the actual functions registered
+        callbacks: instance.listeners?.(event)?.map(fn => ({
+          name: fn.name || '<anonymous>',
+          arity: fn.length,
+          hasClosuredRequest: false, // Set manually in instrumentation
+          filename: extractSourceLocation(fn),
+        })) || [],
+      })),
+    });
+  }
+  
+  res.json(results);
+});
+
+function extractSourceLocation(fn) {
+  try {
+    const lines = fn.toString().split('\n');
+    const match = lines[lines.length - 1]?.match(/at\s+(.+):\d+:\d+/);
+    return match?.[1] || '<eval>';
+  } catch {
+    return '<eval>';
+  }
+}
+```
+
+---
+
+## Phase 4: Root Cause Analysis & Fixes
+
+### Root Cause 1: Emitter Registry Listener Accumulation
+
+**Symptom:** Closures in `_events` map grow unbounded, each closure capturing `req`, `res`, or other per-request objects.
+
+**Likely patterns:**
+
+```javascript
+// ❌ ANTI-PATTERN 1: on('request') handler adds more listeners on same emitter
+server.on('request', async (req, res) => {
+  // Each request adds a new done listener that never fires if response hangs
+  someService.on('complete', () => {
+    cleanup(req);  // Closure retains req/res
+  });
+});
+
+// ❌ ANTI-PATTERN 2: Anonymous functions added to shared emitter
+bus.on('user:jane:login', createLoginHandler(userId));
+// createLoginHandler returns anonymous func, bus never emits 'dispose' for this userId
+// Over time: 10M users = 10M anonymous listeners
+
+// ❌ ANTI-PATTERN 3: Event-based cache/registry that never prunes
+const userCache = new EventEmitter();
+function subscribeToUser(userId) {
+  userCache.on(`update:${userId}`, handler);  // Never unsubscribed!
+}
+
+// ❌ ANTI-PATTERN 4: Using once() incorrectly in async flow
+handler.on('data', async (chunk) => {
+  handler.once('end', () => finish(chunk));
+  // If 'end' never fires (broken stream), handler accumulates pending once-listeners
+});
+```
+
+**Fixes:**
+
+```javascript
+// ✅ FIX 1: Use abortable patterns with cleanup
+const server = http.createServer(async (req, res) => {
+  const controller = new AbortController();
+  
+  try {
+    // Register handlers with signal-based cleanup
+    someService.once('complete', () => {
+      controller.abort();  // Ensures cleanup always happens
+    }, { once: true });
+    
+    // Or use AbortSignal.with(timeout) in Node 20+
+    await processWithTimeout(req, res, { signal: controller.signal });
+  } catch (err) {
+    if (!err.name === 'AbortError') throw err;
+    res.writeHead(408);
+    res.end();
+  }
+});
+
+// ✅ FIX 2: Scoped emitters instead of shared ones (Node 20+)
+import { Domain } from 'domain';  // or use AbortSignal for scoped cleanup
+// Better: use unique emitter per entity
+const userListeners = new Map(); // userId -> { emit: EventEmitter, dispose(): void }
+
+function createUserEmitter(userId) {
+  const emitter = new EventEmitter();
+  const dispose = () => {
+    emitter.removeAllListeners();
+    userListeners.delete(userId);
+  };
+  
+  userListeners.set(userId, { emit: emitter, dispose });
+  return emitter;
+}
+
+// On user delete:
+userListeners.get(userId)?.dispose();
+
+// ✅ FIX 3: Bound methods with explicit disposal
+class RequestHandler {
+  constructor(requestId) {
+    this.requestId = requestId;
+    this.emitter = new EventEmitter();
+  }
+  
+  handle(data) {
+    this.emitter.emit('process', data);
+  }
+  
+  dispose() {
+    this.emitter.removeAllListeners();  // Critical call
+  }
+}
+
+// In middleware:
+app.use((req, res, next) => {
+  const handler = new RequestHandler(req.id);
+  req.disposeHandlers = [...(req.disposeHandlers || []), handler.dispose.bind(handler)];
+  next();
+});
+
+// At end of request:
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    req.disposeHandlers?.forEach(fn => fn());
+  });
+  next();
+});
+
+// ✅ FIX 4: Limit active subscriptions with LRU
+import { LRUCache } from 'lru-cache';
+
+const subscriptionCache = new LRUCache({
+  max: 10000,  // Max concurrent subscriptions
+  ttl: 1000 * 60 * 30,  // Auto-expire after 30 minutes
+});
+
+function subscribe(topic, userId, handler) {
+  const cacheKey = `${topic}:${userId}`;
+  const existing = subscriptionCache.get(cacheKey);
+  
+  if (existing) {
+    existing.handlers.add(handler);
+    return () => {
+      existing.handlers.delete(handler);
+      if (existing.handlers.size === 0) {
+        existing.emitter.removeAllListeners();
+        subscriptionCache.delete(cacheKey);
+      }
+    };
+  }
+  
+  const emitter = new EventEmitter();
+  emitter.on(topic, handler);
+  
+  subscriptionCache.set(cacheKey, { emitter, handlers: new Set([handler]) });
+  
+  // Return dispose function
+  return () => {
+    const entry = subscriptionCache.get(cacheKey);
+    entry?.handlers.delete(handler);
+    if (entry?.handlers.size === 0) {
+      entry?.emitter.removeAllListeners();
+      subscriptionCache.delete(cacheKey);
+    }
+  };
+}
+```
+
+### Root Cause 2: Response Logging Middleware Buffer Leak
+
+**Symptom:** Buffers accumulating in response logging — likely storing full response bodies, headers, or raw data streams.
+
+**Likely patterns:**
+
+```javascript
+// ❌ ANTI-PATTERN 1: Buffering entire response for logging
+const chunks = [];
+response.on('data', (chunk) => {
+  chunks.push(Buffer.from(chunk));  // Creates copies, never cleaned until promise resolves
+});
+response.on('end', () => {
+  const fullResponse = Buffer.concat(chunks);
+  logResponse(fullResponse);  // Log might serialize to file/S3 — but chunks never freed
+});
+
+// ❌ ANTI-PATTERN 2: Deep cloning request/response for audit logs
+function logRequestMiddleware(req, res, next) {
+  const snapshot = deepClone(req);  // Clones entire request including buffers from body-parser
+  const startTime = Date.now();
+  
+  res.on('finish', () => {
+    auditLog({
+      request: snapshot,      // Retains huge cloned object graph
+      responseHeaders: clone(res.headers),
+      statusCode: res.statusCode,
+      duration: Date.now() - startTime,
+    });
+  });
+  next();
+}
+
+// ❌ ANTI-PATTERN 3: Async log batching that holds buffers
+const logQueue = [];
+
+function addToLogQueue(bufferData) {
+  logQueue.push(bufferData);  // Buffers held in JS array
+  
+  // Flushed periodically, but between flushes old buffers stick around
+  scheduleFlush().then(() => {
+    // BUG: Only clears recently flushed items, not oldest
+    logQueue.splice(-batchSize);  // Should splice(0, batchSize)
+  });
+}
+
+// ❌ ANTI-PATTERN 4: Using .copy() unnecessarily on Buffers
+function transformAndLog(buffer) {
+  const copy = buffer.copy();  // Unnecessary copy
+  const processed = process(buffer);
+  log(copy);  // Holds original in addition to processed
+  return processed;
+}
+```
+
+**Fixes:**
+
+```javascript
+// ✅ FIX 1: Stream-based logging with backpressure control
+const MAX_LOG_BUFFER_SIZE = 1024 * 1024; // 1MB cap
+
+const logStreamer = {
+  chunks: [],
+  totalSize: 0,
+  
+  onData(chunk) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    
+    // Cap cumulative size — drop excess rather than growing
+    this.totalSize += buf.length;
+    
+    if (this.totalSize > MAX_LOG_BUFFER_SIZE) {
+      // Evict oldest chunk
+      const toRemove = this.chunks.findIndex(c => c.length <= (this.totalSize - MAX_LOG_BUFFER_SIZE));
+      if (toRemove !== -1) {
+        const removed = this.chunks.splice(0, toRemove + 1).reduce((sum, c) => sum + c.length, 0);
+        this.totalSize -= removed;
+      }
+      // If still over limit, truncate current chunk
+      if (this.totalSize > MAX_LOG_BUFFER_SIZE && this.chunks.length > 0) {
+        this.chunks[this.chunks.length - 1] = this.chunks[this.chunks.length - 1].subarray(
+          0, MAX_LOG_BUFFER_SIZE - (this.totalSize - this.chunks[this.chunks.length - 1].length)
+        );
+      }
+    }
+    
+    this.chunks.push(buf);
+  },
+  
+  async flush() {
+    if (this.chunks.length === 0) return;
+    
+    try {
+      const data = this.totalSize <= MAX_LOG_BUFFER_SIZE
+        ? Buffer.concat(this.chunks)
+        : `[Truncated to ${MAX_LOG_BUFFER_SIZE}B, ${this.chunks.length} chunks merged]`;
+      
+      await sendToLoggingSystem(data);
+    } finally {
+      // CRITICAL: release references immediately after sending
+      for (const chunk of this.chunks) {
+        // Clear buffer contents
+        if (chunk.fill) chunk.fill(0);
+      }
+      this.chunks.length = 0;
+      this.totalSize = 0;
+    }
+  },
+  
+  dispose() {
+    this.flush().catch(() => {});
+    this.chunks = null;  // Help GC
+  },
+};
+
+// ✅ FIX 2: Shallow serialization for audit logs (never deep clone requests)
+const SAFE_REQUEST_FIELDS = ['method', 'url', 'headers', 'query', 'params', 'id', 'timestamp'];
+const SAFE_RESPONSE_FIELDS = ['statusCode', 'headersSent', 'headers', 'duration'];
+
+function shallowSnapshot(obj, allowedFields) {
+  const snap = {};
+  for (const field of allowedFields) {
+    const val = obj[field];
+    // Only include primitives and arrays of primitives
+    if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+      snap[field] = val;
+    } else if (Array.isArray(val) && val.every(v => typeof v === 'string')) {
+      snap[field] = val;
+    } else if (val && typeof val === 'object') {
+      // For headers objects, clone only the keys (no values that could be buffers)
+      if (field === 'headers') {
+        snap[field] = { ...val };  // Headers are strings only, safe
+      }
+    }
+  }
+  return snap;
+}
+
+// Usage in middleware:
+app.use((req, res, next) => {
+  const snapshot = shallowSnapshot(req, SAFE_REQUEST_FIELDS);
+  const startTime = process.hrtime.bigint();
+  
+  res.on('finish', () => {
+    const elapsed = Number(process.hrtime.bigint() - startTime) / 1e6;
+    const responseSnap = shallowSnapshot({
+      statusCode: res.statusCode,
+      headersSent: res.headersSent,
+      headers: res.getHeaderNames?.()?.reduce((acc, h) => ({ ...acc, [h]: res.getHeader(h) }), {}) ?? res.getHeaders?.(),
+      duration: elapsed,
+    }, SAFE_RESPONSE_FIELDS);
+    
+    // Fire-and-forget log — don't block response
+    queueMicrotask(() => {
+      logToAuditSystem({
+        requestId: req.id,
+        request: snapshot,
+        response: responseSnap,
+      }).catch(() => {});
+    });
+  });
+  
+  next();
+});
+
+// ✅ FIX 3: Proper batch flushing with correct eviction
+const LOG_BATCH = {
+  buffer: [],
+  maxSize: 1000,
+  flushTimer: null,
+  
+  add(entry) {
+    this.buffer.push(entry);
+    
+    if (this.buffer.length >= this.maxSize) {
+      this.flush();  // Immediate flush at capacity
+    }
+  },
+  
+  flush() {
+    if (this.buffer.length === 0) return;
+    
+    const batch = this.buffer.splice(0, this.maxSize);  // Correctly removes oldest first
+    const promise = sendBatch(batch);
+    
+    promise.then(() => {
+      // Clear any weak references held
+      batch.forEach(item => { item.buffer = null; });
+    }).catch(err => {
+      console.error('[audit-log] Flush failed:', err.message);
+      // Re-enqueue? Depends on durability requirements
+    });
+    
+    return promise;
+  },
+  
+  dispose() {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flush().catch(() => {});
+    this.buffer = null;
+  },
+};
+```
+
+### Emergency Mitigation: Graceful Restart Circuit Breaker
+
+```javascript
+// circuit-breaker.js — deploy immediately while diagnosing
+const MEMORY_CONFIG = {
+  rssWarningMb: 512,       // Warning threshold
+  rssCriticalMb: 1024,     // Trigger graceful restart
+  externalWarningMb: 256,  // Buffer/memory-pool warning
+  externalCriticalMb: 512, // Buffer emergency action
+};
+
+function startMemoryCircuitBreaker(server) {
+  let prevRss = process.memoryUsage().rss;
+  let prevExternal = process.memoryUsage().external;
+  
+  const checkInterval = setInterval(() => {
+    const usage = process.memoryUsage();
+    const rssMb = usage.rss / 1024 / 1024;
+    const externalMb = usage.external / 1024 / 1024;
+    
+    // Detect rapid growth (>50% increase in last check)
+    const rssRate = (usage.rss - prevRss) / prevRss;
+    const extRate = (usage.external - prevExternal) / prevExternal;
+    
+    if (rssMb > MEMORY_CONFIG.rssCriticalMb || extMb > MEMORY_CONFIG.externalCriticalMb) {
+      console.error(`[OOM-CIRCUIT] RSS: ${rssMb.toFixed(0)}MB, External: ${extMb.toFixed(0)}MB`);
+      
+      // Stop accepting new requests
+      server.close(() => {
+        console.error('[OOM-CIRCUIT] Server closed, initiating graceful shutdown');
+        
+        // Take final heap snapshot before exiting
+        if (global.gc) {
+          global.gc();
+          const snapPath = `/tmp/final_heap_before_shutdown_${Date.now()}.heapsnapshot`;
+          // v8 writes to stdout in debug mode — capture it
+          require('fs').writeFileSync(snapPath, ''); // Placeholder for actual snapshot
+        }
+        
+        process.exit(1);  // K8s will restart the pod
+      });
+      
+      // Drain existing connections (up to 30s)
+      setTimeout(() => {
+        console.error('[OOM-CIRCUIT] Forced exit after drain timeout');
+        process.exit(1);
+      }, 30000);
+    } else if (rssMb > MEMORY_CONFIG.rssWarningMb || extMb > MEMORY_CONFIG.externalWarningMb) {
+      console.warn(`[OOM-WARN] RSS: ${rssMb.toFixed(0)}MB, External: ${extMb.toFixed(0)}MB, Rate: RSS+${(rssRate*100).toFixed(1)}% Ext+${(extRate*100).toFixed(1)}%`);
+      
+      // Trigger aggressive garbage collection if available
+      if (global.gc) global.gc();
+    }
+    
+    prevRss = usage.rss;
+    prevExternal = usage.external;
+  }, 5000); // Check every 5 seconds
+  
+  // Ensure cleanup on process exit
+  process.on('exit', () => clearInterval(checkInterval));
+  
+  return checkInterval;
+}
+
+// Deploy this immediately:
+if (process.env.NODE_ENV === 'production') {
+  startMemoryCircuitBreaker(httpServerInstance);
+}
+```
+
+---
+
+## Phase 5: Verification Checklist
+
+After applying fixes, verify with:
+
+```javascript
+// verify-fixes.js — post-deployment validation
+const assert = require('assert');
+
+async function validateFixes() {
+  console.log('Running fix validation...\n');
+  
+  // 1. Verify emitter listener counts stabilize
+  const emitterStates = await fetchEndpoint('/debug/emitters');
+  for (const emitter of emitterStates) {
+    console.assert(emitter.listenerCount < 50, 
+      `FAIL: ${emitter.name} has ${emitter.listenerCount} listeners`);
+  }
+  
+  // 2. Verify no response-logging buffers exceed cap
+  const metrics = await fetchEndpoint('/metrics');
+  console.assert(metrics.externalMemory < 200 * 1024 * 1024,
+    `FAIL: External memory ${metrics.externalMemory} exceeds 200MB cap`);
+  
+  // 3. Verify 24-hour memory slope < 10MB/day
+  const history = await fetchEndpoint('/metrics/history?days=1');
+  const slope = (history[history.length-1].rss - history[0].rss) / history.length;
+  console.assert(slope < 10 * 1024 * 1024,
+    `FAIL: Memory growth rate ${slope.toFixed(0)} bytes/min`);
+  
+  console.log('\n✅ Validation passed\n');
+}
+
+validateFixes().catch(console.error);
+```
+
+---
+
+## Summary: Most Likely Root Causes
+
+| Rank | Suspect | Confidence | Evidence Match | Fix Complexity |
+|------|---------|------------|----------------|----------------|
+| 1 | `EventEmitter` listener accumulation in request handlers | High | Closures retaining `req`/`res` matches emitter retention pattern | Low |
+| 2 | Response-logging middleware buffering full response bodies | High | Direct Buffer growth in logging layer | Low-Medium |
+| 3 | Missing `removeAllListeners()` on disposed emitters | Medium | Consistent with closure retention in heap diffs | Low |
+| 4 | Async callback stacks keeping frames alive | Medium | Would show as retained closure chains | Medium |
+
+Deploy the **emergency circuit breaker** first to prevent immediate OOM kills, then apply fixes 1 and 2 which address the majority of the observed growth.

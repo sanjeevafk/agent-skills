@@ -1,0 +1,363 @@
+[exit=0 latency=28.95s]
+Here's the full zero-downtime sequence for renaming `users.email` → `users.primary_email` on 120M rows with 8 mixed-version replicas.
+
+---
+
+## Lock Behavior Reference
+
+| Statement | Lock Mode | Blocks? | Duration |
+|---|---|---|---|
+| `ALTER TABLE ... ADD COLUMN` (nullable) | AccessShare | Nothing | Instant |
+| `CREATE INDEX` (concurrent) | IndexShareLock | Readers + other indexes only, NOT writes | Minutes for 120M |
+| `UPDATE ... WHERE` (batched) | RowExclusiveRow | Rows being updated | Short per batch |
+| `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` | AccessExclusive | Full table lock for seconds-minutes while checking | **Blocks writes during check** |
+| `DROP COLUMN` | AccessExclusive | Full table lock while rewriting | Never do this on 120M without precautions |
+| `ALTER TABLE ... RENAME COLUMN` | AccessExclusive | Brief (metadata-only) | Seconds — acceptable |
+
+Key insight: you must **never** run `ALTER TABLE ... DROP COLUMN` or `SET NOT NULL` without first verifying no old replica will read the column. The rewrite cost on 120M is catastrophic.
+
+---
+
+## Phase 1: Add `primary_email` (Nullable) — Deploy to All Replicas
+
+```sql
+-- Migration 1: add new column (instant, never blocks)
+BEGIN;
+ALTER TABLE users ADD COLUMN primary_email TEXT;
+COMMIT;
+```
+
+**Lock:** `AccessShare` on the table. Zero impact. Accepts NULL. No data movement.
+
+**Rollback:** `ALTER TABLE users DROP COLUMN primary_email;` — instant, safe at any time.
+
+**Deployment order:** Roll out this migration+code change to all 8 replicas before proceeding. Verify all replicas have restarted with the new binary (e.g., health endpoint returns `"schema_version": 2`). If even one replica still references `users.email`, you cannot proceed past Phase 4.
+
+---
+
+## Phase 2: Dual-Write via Triggers
+
+Deploy new code that writes to BOTH columns on INSERT and UPDATE. Existing code continues writing `email`. Triggers ensure `primary_email` mirrors it.
+
+```sql
+-- Migration 2: trigger-based dual-write (no DML, zero risk)
+CREATE OR REPLACE FUNCTION users_sync_primary_email()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.primary_email := NEW.email;
+    RETURN NEW;
+  ELSIF TG_OP = 'UPDATE' THEN
+    -- Only set if email changed OR primary_email was NULL (stale from backfill)
+    IF NEW.email IS DISTINCT FROM OLD.email OR NEW.primary_email IS NULL THEN
+      NEW.primary_email := NEW.email;
+    END IF;
+    RETURN NEW;
+  ELSE
+    RETURN OLD;
+  END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS sync_primary_email_insert ON users;
+DROP TRIGGER IF EXISTS sync_primary_email_update ON users;
+
+CREATE TRIGGER sync_primary_email_insert
+  BEFORE INSERT ON users
+  FOR EACH ROW EXECUTE FUNCTION users_sync_primary_email();
+
+CREATE TRIGGER sync_primary_email_update
+  BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION users_sync_primary_email();
+```
+
+**Lock:** No table locks. Functions are created in the catalog. Triggers fire per-row during existing INSERTs/UPDATEs — negligible overhead (< 1%).
+
+**Important nuance:** The trigger uses `IS DISTINCT FROM` so NULL ↔ value transitions are caught. The `OR NEW.primary_email IS NULL` clause is critical: it catches rows backfilled by Phase 3 but which were subsequently updated on old replicas that wrote only `email`. Without this, a stale row could end up with mismatched values.
+
+**Rollback:** Drop the triggers and function. The column remains for later use. Code continues dual-writing until rollback completes.
+
+---
+
+## Phase 3: Backfill in Bounded Batches with Lock-Aware Progress Tracking
+
+This is where most migrations fail on 120M rows. You must control transaction size, respect statement timeouts, and track progress atomically.
+
+### 3a. Create progress-tracking table
+
+```sql
+CREATE TABLE IF NOT EXISTS migration_progress (
+  key       TEXT PRIMARY KEY,
+  last_id   BIGINT NOT NULL DEFAULT 0,
+  synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  paused    BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Ensure the table has its own index (small, irrelevant to performance)
+```
+
+### 3b. Backfill worker SQL
+
+```sql
+-- Batch size tuned for your latency budget.
+-- For 120M rows at ~5K batches/sec throughput, expect ~1-2 hours.
+-- Adjust BATCH_SIZE based on your p99 write latency. Lower = faster completion but more batches.
+
+DO $$
+DECLARE
+  BATCH_SIZE CONSTANT BIGINT := 10000;
+  last_id    BIGINT := COALESCE(
+                 (SELECT last_id FROM migration_progress WHERE key = 'backfill_users'),
+                 0);
+  affected   INT;
+  start_ts   TIMESTAMPTZ := NOW();
+BEGIN
+  LOOP
+    -- Exit when we've covered the entire table
+    EXIT WHEN last_id >= (SELECT MAX(id) FROM users);
+
+    -- Check if someone paused us
+    IF (SELECT paused FROM migration_progress WHERE key = 'backfill_users') THEN
+      RAISE NOTICE 'Backfill paused';
+      PERFORM pg_sleep(30);
+      CONTINUE;
+    END IF;
+
+    -- Update the target column using the same value source as the trigger would
+    -- This keeps consistency with live writes
+    UPDATE users u
+    SET primary_email = u.email
+    WHERE u.id BETWEEN last_id + 1 AND last_id + BATCH_SIZE
+      AND u.primary_email IS NULL;
+
+    GET DIAGNOSTICS affected = ROW_COUNT;
+
+    -- Record progress ATOMICALLY in the same transaction
+    INSERT INTO migration_progress (key, last_id, synced_at)
+      VALUES ('backfill_users', last_id + BATCH_SIZE, NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET last_id = EXCLUDED.last_id,
+            synced_at = EXCLUDED.synced_at;
+
+    COMMIT;
+
+    -- Reset statement timeout for next batch (default may be 1s in some setups)
+    SET LOCAL statement_timeout = '5min';
+
+    last_id := last_id + BATCH_SIZE;
+
+    -- Report progress every 500 batches (~5M rows)
+    IF (last_id % 5000000) < BATCH_SIZE THEN
+      RAISE NOTICE 'Backfilled %.6M / %.6M rows (%.1f%%)',
+        last_id::bigint / 1000000,
+        (SELECT id::bigint FROM users ORDER BY id DESC LIMIT 1)::bigint / 1000000,
+        (last_id * 100.0 / (SELECT COUNT(*) FROM users));
+    END IF;
+
+    -- Brief pause between batches to reduce WAL pressure and let replication keep up
+    -- Increase if streaming replication is falling behind
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+
+  RAISE NOTICE 'Backfill complete at %, processed % in %',
+    NOW(), last_id, NOW() - start_ts;
+END $$;
+```
+
+### 3c. Why `BETWEEN id AND id + N` instead of OFFSET/LIMIT?
+
+Postgres evaluates `WHERE` against physical tuple order, not logical id order. Using sequential `id` ranges gives optimal sequential scan behavior, avoids N+1 queries, and ensures no rows are skipped even under concurrent inserts. Adding `AND u.primary_email IS NULL` skips already-synced rows (from both backfill and live dual-writes), making repeated runs safe.
+
+### 3d. Monitoring and control endpoints
+
+You need these operational controls available via your admin API or CLI:
+
+```bash
+# Check progress
+psql -c "SELECT key, last_id, synced_at, paused FROM migration_progress WHERE key='backfill_users';"
+
+# Pause mid-flight
+psql -c "UPDATE migration_progress SET paused = TRUE WHERE key='backfill_users';"
+
+# Resume
+psql -c "UPDATE migration_progress SET paused = FALSE WHERE key='backfill_users';"
+
+# Abort (safe — leaves partial state)
+psql -c "DELETE FROM migration_progress WHERE key='backfill_users'; DROP TRIGGER IF EXISTS ...;"
+
+# Watch the tail of backfill activity
+psql -c "SELECT pg_current_wal_lsn(), pg_last_wal_receive_lsn();"
+```
+
+### 3e. Statement timeout management
+
+Each batch runs in its own transaction. Set `statement_timeout = '5min'` (or lower) per transaction via `SET LOCAL`. With `BATCH_SIZE = 10000` on an indexed `id` column, each batch typically completes in < 100ms. The timeout is a safety net for runaway scans (e.g., missing index). Make sure your connection pool doesn't override this — set it at the session level, not just globally.
+
+### 3f. Lock behavior during backfill
+
+Each `UPDATE ... WHERE id BETWEEN ...` acquires **RowExclusiveLock** on the matching rows. This means:
+- Concurrent application writes wait briefly for rows in the batch window, then proceed
+- No table-level locks
+- No deadlocks (all operations touch by primary key range)
+- Replication lag depends on throughput vs. write volume — monitor with `pg_replication_lag()`
+
+If you observe unacceptable latency spikes, reduce `BATCH_SIZE` to 1000–5000 and accept longer wall-clock time.
+
+### 3g. Rollback at Phase 3
+
+Drop triggers, delete progress row. Application resumes normal writes to `email` only. New rows written during backfill are fine because triggers will re-sync them when re-deployed. Safe to revert the application code at any time.
+
+---
+
+## Phase 4: Verify Consistency
+
+Before switching reads, prove the data is clean. Run these checks:
+
+```sql
+-- 4a. Count rows where trigger hasn't yet caught up (null primary_email)
+SELECT COUNT(*) AS stale_rows
+FROM users
+WHERE primary_email IS NULL;
+-- Expected: 0 (plus any rows inserted after backfill started but before triggers took effect)
+
+-- 4b. If 4a shows stale rows, run a quick catch-up batch
+UPDATE users u
+SET primary_email = u.email
+WHERE u.primary_email IS NULL;
+SELECT COUNT(*) AS remaining_stale FROM users WHERE primary_email IS NULL;
+-- Must be 0
+
+-- 4c. Spot-check: compare random samples for structural consistency
+SELECT COUNT(*) FROM users WHERE email IS DISTINCT FROM primary_email;
+-- Should return 0 at this point (triggers handle live writes)
+
+-- 4d. Verify all 8 replicas report healthy and running the deploy with dual-write code
+-- Query your deployment orchestration system, not Postgres
+```
+
+Only proceed when `stale_rows = 0` and all replicas are confirmed running the new version.
+
+---
+
+## Phase 5: Contract — Flip Reads, Drop Old Column
+
+**Precondition:** ALL 8 replicas have been deployed with code reading `primary_email` instead of `email`. Mixed-version period is OVER.
+
+```sql
+-- Migration 5: flip reads (code change, not schema)
+-- This is entirely a code change: rename `email` references to `primary_email`
+-- No DDL needed here — the application layer handles this.
+
+-- Migration 6: make primary_email NOT NULL and unique (optional but recommended)
+-- WARNING: SET NOT NULL on 120M requires an AccessExclusive-like check pass
+-- It does NOT rewrite the table, but it DOES scan all rows to verify.
+-- Schedule during low-traffic window.
+
+BEGIN;
+-- First, ensure the index exists
+CREATE INDEX CONCURRENTLY idx_users_primary_email_unique
+  ON users (primary_email)
+  WHERE primary_email IS NOT NULL;
+
+-- Then add NOT NULL constraint
+ALTER TABLE users ALTER COLUMN primary_email SET NOT NULL;
+
+-- Finally enforce uniqueness if emails must be unique
+ALTER TABLE users ADD CONSTRAINT users_primary_email_unique UNIQUE USING INDEX idx_users_primary_email_unique;
+COMMIT;
+```
+
+**NOT NULL lock:** `AccessExclusive` for the duration of the validation scan (seconds to ~1 minute on 120M with pre-built index). **Briefly blocks all reads and writes.** This is the single most disruptive DDL in the entire sequence. Minimize disruption by:
+- Running during a maintenance window or low-traffic period
+- Having connection draining ready (graceful shutdown for all replicas)
+- Pre-building the index concurrently (doesn't block, but makes `SET NOT NULL` much faster)
+
+If you can't tolerate the brief outage, skip `SET NOT NULL` and leave it nullable. Enforce uniqueness at the application level instead.
+
+### Dropping the old `email` column
+
+```sql
+-- Migration 7: remove old column
+-- IMPORTANT: On Postgres 15+, DROP COLUMN is metadata-only (TOAST handling notwithstanding).
+-- On older versions it rewrites the table. Check your version first.
+
+-- Version-safe approach:
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::int >= 150000 THEN
+    -- PG15+: fast metadata op
+    ALTER TABLE users DROP COLUMN email;
+  ELSE
+    -- PG < 15: this will rewrite. Consider leaving email as-is forever.
+    -- Or use pg_repack/vacuum full strategy documented below.
+    ALTER TABLE users DROP COLUMN email;
+  END IF;
+END $$;
+```
+
+On Postgres 15+, `DROP COLUMN` marks the column invisible — it does NOT rewrite the table. O(`n`) space is reclaimed during the next `VACUUM FULL` or via `ALTER TABLE ... REPLICA IDENTITY`.
+
+On Postgres < 15, dropping a column on 120M rows triggers a full table rewrite. Alternatives:
+1. Leave `email` column indefinitely (harmless once code stops reading it)
+2. Use `pg_repack` to rebuild the table without downtime, then drop the column
+3. Schedule `VACUUM FULL` during maintenance window
+
+**Recommendation:** Don't drop `email` unless you're on PG15+. Just leave it invisible to the app. It costs minimal space (column header + TOAST pointer) and eliminates risk.
+
+### Final lock summary for Phase 5
+
+| Operation | Lock | Blocks | Time | Tolerable? |
+|---|---|---|---|---|
+| CREATE INDEX CONCURRENTLY | None on table | None | ~5-10 min | Yes, anytime |
+| SET NOT NULL | Scan-phase (short AccessExclusive) | Briefly | ~30-60s | Needs planning |
+| ADD CONSTRAINT UNIQUE | Same as above | Briefly | ~10-30s | Needs planning |
+| DROP COLUMN (PG15+) | Metadata-only | None | Instant | Anytime |
+| DROP COLUMN (PG<15) | Rewrites table | 10-60 min | Unacceptable without prep |
+
+---
+
+## End-to-End Rollback Paths
+
+Each phase has an independent rollback that doesn't require completing later phases:
+
+| Phase | Rollback Action | Side Effects | Re-deploy Cost |
+|---|---|---|---|
+| 1 (add column) | `DROP COLUMN primary_email` | Zero — column didn't exist | Redeploy code removing column reference |
+| 2 (triggers) | `DROP TRIGGER`, `DROP FUNCTION` | `primary_email` stops receiving updates | Redeploy code removing dual-write |
+| 3 (backfill) | Delete progress row, stop batcher | Some rows remain stale; triggers caught live writes | Restart backfill from `last_id` (resumable) |
+| 4 (verify) | N/A — informational only | — | — |
+| 5a (flip reads) | Switch code back to read `email` | Writes go to `email` only; triggers keep `primary_email` current | Redeploy reader code |
+| 5b (NOT NULL/unique) | `ALTER TABLE ALTER COLUMN ... DROP NOT NULL`; `ALTER TABLE DROP CONSTRAINT` | Columns return to original state | Redeploy code removing constraints |
+| 5c (drop old column) | If dropped, irreversible without restore | Cannot undo | Restore from backup (extreme) |
+
+Critical rollback principle: **you can always roll back by reverting the code and waiting for triggers to stabilize data**. The schema changes are additive until Phase 5, and Phase 5 requires confirmation that all replicas are on the new version before proceeding.
+
+---
+
+## Complete Execution Sequence (Abbreviated)
+
+```
+Step  Action                                  Deployment Order     Downtime
+───── ────────────────────────────────────────── ──────────────────── ────────
+  1   Add primary_email (nullable)              All 8 replicas       ZERO
+  2   Install dual-write triggers               All 8 replicas       ZERO
+  3   Backfill in batches                       Background, no deploy ZERO
+  4   Verify stale_rows == 0                    After backfill       ZERO
+  5   Deploy read-side code change (→primary)   All 8 replicas       ZERO*
+  6   [Optional] SET NOT NULL + unique index    Low-traffic window   BRIEF*
+  7   [Optional] Drop email column              PG15 only, optional  NONE**
+
+* Brief blocking only if Step 6 is executed
+** Zero cost on PG15+
+```
+
+## Monitoring Checklist
+
+During the migration, watch these metrics continuously:
+
+- **Replication lag:** `pg_replication_lag()` — backfill generates significant WAL
+- **Transaction count:** `pg_stat_database.xact_commit/rollback` — sudden commit drops indicate long-running transactions timing out
+- **Lock waits:** `pg_locks` joined with `pg_stat_activity` — any `AccessExclusive` locks beyond 5s are red flags
+- **p99 query latency:** Split by table name — any spike on `users` table during backfill batches
+- **Progress rate:** `migration_progress` table polling every 60s, alert if `synced_at` is older than 5 minutes (indicates stuck batcher)
+- **Row discrepancy:** Every 100M rows processed, run the consistency check again as a mid-flight sanity check

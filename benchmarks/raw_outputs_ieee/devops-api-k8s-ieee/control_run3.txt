@@ -1,0 +1,402 @@
+[exit=0 latency=31.90s]
+Here's the complete implementation — all three manifests with embedded design rationale, followed by the arithmetic walkthrough and termination sequence.
+
+---
+
+## 1. HorizontalPodAutoscaler (HPA)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50          # Scale down below 50% CPU avg
+    - type: External
+      external:
+        metric:
+          name: http_request_queue_depth_per_replica
+        target:
+          type: AverageValue
+          averageValue: "100"           # Target ≤100 queued reqs per replica
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Cooldown — prevents thrash during deploy
+      policies:
+        - type: Percent
+          value: 25                       # At most 25% removal per period
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100                      # Aggressive ramp-up
+          periodSeconds: 15
+        - type: Pods
+          value: 4                        # Or 4 new pods, whichever is lower
+          periodSeconds: 15
+      selectPolicy: Max
+```
+
+### Why these numbers
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `averageUtilization: 50` | 50% CPU | Headroom so a burst to p99 doesn't trigger cooldown immediately; gives the scheduler room to place new pods |
+| `averageValue: "100"` | 100 queue / replica | When p99 latency climbs because the system is saturated, the queue depth hits 100 and scales up *before* requests start timing out |
+| `scaleDown.stabilizationWindowSeconds: 300` | 5 min cooldown | Deploy rollout creates a brief dip in total capacity → old pods terminate, traffic rebalances → HPA must NOT scale down during this transient. 300 s covers the typical rolling-update window |
+| `scaleUp.stabilizationWindowSeconds: 60` | 60 s | Once demand is confirmed (not a spike), react fast |
+
+The external metric (`http_request_queue_depth_per_replica`) is exported by the application itself via an OpenTelemetry/StatsD histogram. If using KEDA instead of native HPA, the same logic applies but the source is KEDA's ScaledObject targeting the same Prometheus query.
+
+---
+
+## 2. PodDisruptionBudget (PDB)
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: production
+spec:
+  minAvailable: 1                          # Always keep ≥1 replica online
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+Alternative formulation (same effect with labels):
+
+```yaml
+# spec.maxUnavailable: 0       # Never allow disruption to exceed zero → equivalent to minAvailable: 1
+```
+
+`minAvailable: 1` ensures a node drain (upgrade, taint, CNI replace) cannot simultaneously remove all pods. The draining kubelet will honor the PDB and wait until the Deployment controller replaces the evicted pod(s) first, then proceeds.
+
+---
+
+## 3. Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: production
+spec:
+  replicas: 3                                   # Initial baseline; HPA adjusts
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                               # Create exactly 1 extra pod before killing old
+      maxUnavailable: 0                         # Never drop below desired replica count
+  selector:
+    matchLabels:
+      app: go-api
+  template:
+    metadata:
+      labels:
+        app: go-api
+      annotations:
+        # Signal to HPA / Prometheus scrapers
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2112"
+        prometheus.io/path: "/metrics"
+    spec:
+      # ── Anti-affinity so one node failure ≠ losing all replicas ──
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [go-api]
+                topologyKey: kubernetes.io/hostname
+
+      # ── Service account, DNS, etc. ──
+      serviceAccountName: go-api
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: false
+
+      # ── Termination drain: give in-flight requests time to finish ──
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: go-api
+          image: registry.internal/go-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ─── CPU & Memory sizing ───
+          resources:
+            requests:
+              cpu: "500m"          # Guaranteed share → no throttling at p99
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"         # Allow burst to 1 core; HPA reacts if sustained
+              memory: "512Mi"
+
+          # ─── Probe arithmetic (see section below for derivation) ───
+          # Startup: app has a 20s cold-cache warmup. Do NOT start checking
+          # readiness/liveness until the warmup is almost certainly done.
+          # Period 10s × FailureThreshold 10 = 100s grace period.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 10               # 10s × 10 = 100s grace
+            successThreshold: 1
+
+          # Readiness: gate traffic until cache is warm (≥ 25s after container start)
+          # Period 5s × FailureThreshold 3 = 15s detection; 2 consecutive failures
+          # removes pod from Service endpoints → no new traffic routed here.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 0             # Handled by startupProbe serialisation
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 2
+
+          # Liveness: only matters AFTER warmup. Detects hangs / goroutine leaks.
+          # Does NOT fire until startupProbe succeeds → warmup is over.
+          # Period 10s × FailureThreshold 3 = 30s detection → container restarted
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 2
+            successThreshold: 1
+
+          # ─── Secrets as files (CSI Secret Store Driver) ───
+          env: []                                # Intentionally empty — all secrets via volume
+
+          volumeMounts:
+            # Mount database credentials as individual keys on disk
+            - name: postgres-creds
+              mountPath: /etc/secrets/postgres
+              readOnly: true
+
+            # Optional: TLS cert / private key pair
+            - name: tls-secret
+              mountPath: /etc/secrets/tls
+              readOnly: true
+
+          # Graceful-shutdown hook: run before SIGKILL to drain the local queue
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  # 1. Remove self from Service endpoints (stop receiving new traffic)
+                  |
+                  echo "Removing pod from Service endpoints..."
+                  # Wait for readiness gate to be removed (~4s propagation delay)
+                  sleep 5
+                  # 2. Drain in-flight requests — stop accepting, let existing finish
+                  echo "Draining in-flight requests (timeout=20s)..."
+                  curl -sf -o /dev/null --retry 3 --retry-delay 2 \
+                    http://localhost:8080/healthz/drain || true
+                  # 3. Remaining 20s until SIGKILL: finish outstanding 2xx requests
+                  echo "Graceful drain complete. Proceeding to termination."
+
+      volumes:
+        - name: postgres-creds
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: go-api-postgres
+
+        - name: tls-secret
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: go-api-tls
+```
+
+---
+
+## 4. Supporting CRDs (must exist before Deployment)
+
+```yaml
+# SecretProviderClass ties a K8s Secret to the secrets store (AWS SM / Vault / GCP SM)
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: go-api-postgres
+  namespace: production
+spec:
+  provider: aws                         # or vault, gcp-secrets-manager, etc.
+  parameters:
+    objects: |
+      - objectName: "go-api/pg-password"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: "password"
+            objectAlias: password
+          - path: "host"
+            objectAlias: host
+          - path: "port"
+            objectAlias: port
+          - path: "dbname"
+            objectAlias: dbname
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: go-api-tls
+  namespace: production
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "go-api/tls-crt"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: "tls.crt"
+            objectAlias: tls.crt
+          - path: "tls.key"
+            objectAlias: tls.key
+```
+
+---
+
+## Probe Threshold Arithmetic
+
+The three probes interact through Kubernetes' probe serialization protocol: **kubelet does not begin checking `readinessProbe` or `livenessProbe` until `startupProbe` succeeds** (v1.18+). This is critical — the startup probe is the *gate*.
+
+### Step-by-step timeline
+
+```
+T+0s     Container starts, app binary launches
+T+0s     kubelet begins firing startupProbe every 10s → app is returning 503 (cache cold)
+T+20s    App finishes cache warmup internally
+T+20s    /healthz now returns 200 → next probe at T+20s or T+30s succeeds
+T+30s    ✓ startupProbe succeeds → kubelet STARTS readinessProbe & livenessProbe
+         │
+         ├─ readinessProbe: 5s period, failThresh=3, timeout=2
+         │  → Fails at most once (2s > 0) before succeeding again → negligible risk
+         │  → If genuinely unhealthy: removes from Service endpoints in ~5-7s
+         │
+         └─ livenessProbe: 10s period, failThresh=3, timeout=2
+           → Needs 3 consecutive failures → 30s before container is killed
+```
+
+### Why not smaller numbers?
+
+| Probe | What would break if we shrink it |
+|---|---|
+| `failureThreshold: 3` on readiness | A slow GC pause (even with generational collectors, STW pauses in Go can hit 200-400ms) could cause a single failed request → at 5s period, a 200ms spike shouldn't trip a failure. But under heavy CPU saturation, 3 failures provides margin against a cluster-wide event where all replicas temporarily slow |
+| `periodSeconds: 10` on startup | 20s warmup ÷ 10s = 2 chances. That's barely enough. The 10×100s = **100s** grace far exceeds 20s warmup, covering worst-case scenarios like I/O-stalled node, large cache payload, or network-slow secrets-mount |
+| `initialDelaySeconds: 0` everywhere | Safe *only because* startupProbe serializes. Without the startupProbe you'd need `initialDelaySeconds: 25` on readiness to avoid draining traffic before cache warms. With the startup gate, `0` is correct and cleaner |
+| `failureThreshold: 3` on liveness | Go's runtime handles many transient issues (GC, timer drift) within one cycle. Waiting for 3 failures avoids restarting a pod that would heal itself within 10-20s |
+
+### Key insight
+
+This entire cascade works because **the startup probe absorbs the cold-start risk**, freeing readiness and liveness to operate with normal sensitivity tuned for production faults (crashes, deadlocks, OOM) rather than bootstrap transients.
+
+---
+
+## Termination Drain Sequence
+
+The sequence below describes what happens from `kubectl rollout` (or manual deletion) until the last byte of the last in-flight request completes.
+
+```
+Step 0  RollingUpdate triggers
+        ├── maxSurge=1    → Pod "go-api-NEW-abcdef" is CREATED
+        └── maxUnavailable=0 → NO OLD POD TERMINATED yet
+
+Step 1  NEW pod enters CrashLoopStart phase, startupProbe fires
+        ├── T+20s    Cache warmup completes, /healthz → 200
+        └── T+30s    ReadinessProbe → 200 → pod added to Service Endpoints
+                     → kube-proxy iptables/ipvs rules propagate (~2-4s)
+
+Step 2  Traffic now splits between OLD and NEW pods (Nginx/Cilium LB sees both)
+        └── Only after endpoint propagation: proceed to drain
+
+Step 3  Kubelet sends SIGTERM to OLD pod (terminationGracePeriodSeconds=30)
+        ├── lifecycle.preStop hook executes:
+        │     ├── sleep 5s           → waits for readiness removal + LB propagation
+        │     │   → kubeadm removes old pod from endpoints → 0 new reqs sent
+        │     │
+        │     ├── curl to /drain     → optional: flush local in-process buffer
+        │     │
+        │     └── 20s remaining      → let all in-flight 2xx requests finish
+        │
+        └── Any request arriving during step 3 gets connection refused (removed from endpoints)
+
+Step 4  If any request is still in-flight at T+30s (since SIGTERM):
+        └── kubelet sends SIGKILL → hard kill, Docker/containerd cleans up
+             (ideally never happens because preStop + 20s drain is sufficient)
+
+Step 5  OLD pod fully terminated, rolling update proceeds to next replica
+```
+
+### Zero-dropped-requests guarantee breakdown
+
+| Mechanism | What it protects against |
+|---|---|
+| `maxUnavailable: 0` | Replica count never dips below desired → capacity is maintained throughout |
+| `maxSurge: 1` | Exactly one "extra" slot exists to accept rebalanced traffic during drain |
+| `preStop.sleep 5` | Ensures endpoint removal propagates to all kube-proxy instances (bounded by `iptables-sync-period` default 75s, but practically faster via conntrack sync). Increase to 10-15s on clusters with many nodes |
+| `terminationGracePeriodSeconds: 30` | Time budget for: 5s preStop sleep + drain endpoint propagation + N × in-flight-request-latency |
+| `preStop: /drain` | Application-level hook to flush any in-memory request buffers or message queues |
+| PDB `minAvailable: 1` | Guarantees at least one healthy replica survives voluntary disruptions (node drains, OS updates) |
+
+### How to verify end-to-end
+
+```bash
+# Watch the rollout with full detail
+kubectl rollout status deployment go-api -n production --watch
+
+# During rollout, observe no 5xx spikes
+# kubectl top pod -l app=go-api -n production --containers
+
+# Verify endpoints are always populated
+kubectl get ep go-api -n production -w
+
+# Confirm PDB is respected during a node drain
+kubectl drain <node> --pod-disruption-budget-force-evict=true --dry-run=client
+
+# Check HPA behavior
+kubectl describe hpa go-api -n production
+```
+
+### Tuning guide for your workload
+
+If you observe requests still in-flight when `preStop` finishes:
+
+1. Increase `terminationGracePeriodSeconds` to 45-60
+2. Set `http.MaxIdleConnsPerHost` equal to (replicas × connections/replica) so the Go `net/http` transport reuses connections properly
+3. In your HTTP server, set `server.Shutdown(ctx)` with a context derived from `context.WithTimeout(baseCtx, 25s)` and call it on SIGTERM
+4. Optionally reduce `maxSurge: 1` to `0` if your load balancer supports dynamic backend discovery (e.g., Cilium, Envoy) and you want the new pod fully serving before anything old is killed

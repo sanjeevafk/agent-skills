@@ -1,0 +1,372 @@
+[exit=0 latency=27.43s]
+I'll work through this methodically — severity first, then fixes. Here's what's wrong and how to correct it.
+
+## Vulnerabilities (Ordered by Severity)
+
+### 1. Parsed Body Before Signature Verification — Critical
+
+The endpoint parses the full request body into a Python dict *before* checking the HMAC. This is a resource-exhaustion DoS vector: the attacker sends thousands of large payloads, each consuming memory and CPU on deserialization, all without ever being validated. The signature check happens too late in the pipeline. An unverified body should never be fully materialized.
+
+### 2. In-Memory Replay-Id Store — High
+
+An in-memory `dict` has three fatal flaws:
+- **Lost on process restart** — after a deploy or crash, previously-seen event IDs are forgotten, enabling replays immediately post-deploy.
+- **No cross-worker visibility** — under uvicorn with multiple workers, worker A knows nothing of worker B's dedup set, so the same event ID arrives as "new" to each worker.
+- **Unbounded growth** — nothing evicts old entries; the dict grows until OOM under sustained traffic.
+
+It needs a durable, shared backing store (e.g., PostgreSQL with a unique constraint).
+
+### 3. Race Condition in Idempotency — High
+
+Even if you used a shared store, inserting + checking must be atomic. Two concurrent requests for the same `event-id` can both read "not present," both proceed, and both process the payment — double-charging the customer. You need either a DB `INSERT ... ON CONFLICT DO NOTHING` or a database-level advisory lock.
+
+### 4. Processor Error Leakage — Medium
+
+Returning raw processor exceptions (stack traces, internal URLs, API keys from config names) gives attackers reconnaissance on your infrastructure. Errors must be collapsed to a generic 500 for clients while preserving detailed logs server-side.
+
+### 5. Missing Request Size Limit — Low/Medium
+
+Without a body-size cap, a single extremely large payload can exhaust memory even before reaching the signature check (since we now verify *first*, but some frameworks still attempt to buffer the stream). Explicitly bound the incoming body.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+idempotent_webhook.py
+
+Production-hardened FastAPI webhook for receiving payments from a third-party processor.
+
+Threat model addressed:
+  1. Unverified-body DoS          -> verify HMAC before any body parsing
+  2. Replay attacks               -> durable event-id ledger with UNIQUE constraint
+  3. Concurrent duplicate webhooks-> INSERT ... ON CONFLICT (atomic upsert)
+  4. Error leakage                -> generic client errors, full details only in logs
+  5. Oversized payloads           -> explicit body-size cap
+"""
+
+import hashlib
+import hmac
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Event,
+    Integer,
+    String,
+    create_engine,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# ---------------------------------------------------------------------------
+# Configuration (all from environment — see Secrets section below)
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = ""  # populated from env in main()
+SECRETS: list[bytes] = []  # populated from env in main()
+
+MAX_BODY_BYTES = 65_536  # 64 KB cap — hard limit on raw bytes
+
+logger = logging.getLogger("webhook")
+
+# ---------------------------------------------------------------------------
+# Database setup
+# ---------------------------------------------------------------------------
+
+Base = declarative_base()
+
+
+class DeliveryRecord(Base):
+    """
+    Durable idempotency / replay-prevention table.
+
+    (event_id, proc_step) is UNIQUE so that a concurrent race resolves at
+    the database level rather than in Python application code.
+    """
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    proc_step = Column(String(64), nullable=True)  # e.g. "signature_ok", "processed"
+
+
+engine = create_engine("", echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+
+def init_db(database_url: str) -> None:
+    global engine, SessionLocal
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+    Base.metadata.create_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Secret rotation support
+# ---------------------------------------------------------------------------
+
+def _load_secrets_from_env() -> list[bytes]:
+    """
+    Return secrets ordered newest-first.  Index 0 is the active signing key.
+    Previous keys remain available for N days to cover clock-skew during
+    rotation windows.
+    """
+    raw = __import__("os").environ.get("WEBHOOK_HMAC_SECRETS", "")
+    if not raw:
+        raise RuntimeError("WEBHOOK_HMAC_SECRETS must be set (comma-separated hex)")
+    return [bytes.fromhex(s.strip()) for s in raw.split(",") if s.strip()]
+
+
+# ---------------------------------------------------------------------------
+# HMAC verification — BEFORE any body parsing
+# ---------------------------------------------------------------------------
+
+def compute_hmac(body_bytes: bytes, secret: bytes) -> str:
+    """HMAC-SHA256 of raw request bytes, returned as lowercase hex."""
+    return hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
+
+
+def verify_signature(raw_body: bytes, signature_hex: str) -> bool:
+    """
+    Verify HMAC against ALL configured secrets (newest first).
+    Returns True exactly when *one* key produces a matching MAC.
+    """
+    for secret in SECRETS:
+        if hmac.compare_digest(compute_hmac(raw_body, secret), signature_hex):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Pydantic model for parsed payload — ONLY consumed after sig verification
+# ---------------------------------------------------------------------------
+
+class WebhookPayload(BaseModel):
+    event_id: str
+    event_type: str
+    amount_cents: int
+    currency: str
+    customer_id: str
+
+    @field_validator("amount_cents")
+    @classmethod
+    def positive_amount(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("amount_cents must be positive")
+        return v
+
+    @field_validator("currency")
+    @classmethod
+    def three_letter_code(cls, v: str) -> str:
+        if len(v) != 3 or not v.isalpha():
+            raise ValueError("currency must be a 3-letter ISO 4217 code")
+        return v.upper()
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Payment Webhook Receiver")
+
+
+@app.post("/webhook/processor")
+async def receive_webhook(
+    request: Request,
+    x_processor_signature: str = Header(..., alias="X-Processor-Signature"),
+    x_processor_event_id: str = Header(..., alias="X-Processor-Event-Id"),
+):
+    # ------------------------------------------------------------------
+    # Step 1 — Reject oversized bodies BEFORE buffering into memory
+    # ------------------------------------------------------------------
+    async with request.stream() as streamed_body:
+        raw_body = b""
+        size = 0
+        async for chunk in streamed_body:
+            size += len(chunk)
+            if size > MAX_BODY_BYTES:
+                return JSONResponse(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    content={"error": "request too large"},
+                )
+            raw_body += chunk
+
+    # ------------------------------------------------------------------
+    # Step 2 — Verify HMAC against raw bytes (NOT the parsed object)
+    # ------------------------------------------------------------------
+    if not verify_signature(raw_body, x_processor_signature):
+        logger.warning(
+            "Invalid signature for event_id=%s (headers: %s)",
+            x_processor_event_id,
+            x_processor_event_id,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"error": "invalid signature"},
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3 — Atomic idempotency guard via DB-level UNIQUE constraint
+    # ------------------------------------------------------------------
+    db: SessionLocal = SessionLocal()
+    try:
+        record = DeliveryRecord(event_id=x_processor_event_id, proc_step="seen")
+        try:
+            db.add(record)
+            db.commit()
+        except Exception:
+            # UNIQUE violation → duplicate delivery; return original response
+            db.rollback()
+            logger.info("Duplicate event_id=%s — skipping", x_processor_event_id)
+            # Return 200 (or 202 Accepted) as though processed successfully;
+            # the processor's retry logic expects success acks.
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "already_processed"})
+
+        # Insert succeeded → this worker owns the processing duty
+        record.proc_step = "processing"
+        db.commit()
+    finally:
+        db.close()
+
+    # ------------------------------------------------------------------
+    # Step 4 — NOW parse and validate (signature already verified)
+    # ------------------------------------------------------------------
+    try:
+        payload: WebhookPayload = WebhookPayload.model_validate_json(raw_body)
+    except Exception as exc:
+        logger.error("Malformed payload for event_id=%s: %r", x_processor_event_id, exc)
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "malformed request body"},
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5 — Process the payment (idempotent by event_id)
+    # ------------------------------------------------------------------
+    try:
+        await process_payment(payload)
+    except Exception as exc:
+        # Generic 500 — no internal detail leaks to the caller
+        logger.exception(
+            "Processing failed for event_id=%s: %s",
+            x_processor_event_id,
+            exc,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "processing error"},
+        )
+
+    # Mark complete
+    db = SessionLocal()
+    try:
+        rec = (
+            db.query(DeliveryRecord)
+            .filter_by(event_id=x_processor_event_id)
+            .with_for_update()
+            .first()
+        )
+        if rec:
+            rec.proc_step = "processed"
+            db.commit()
+    finally:
+        db.close()
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Payment processing stub (replace with real logic)
+# ---------------------------------------------------------------------------
+
+async def process_payment(payload: WebhookPayload) -> None:
+    """
+    Core business logic: apply the payment to the customer's account.
+
+    Must itself be idempotent — the DB unique constraint on event_id ensures
+    this function is called at most once per event_id even under concurrency.
+    """
+    # TODO: implement actual payment posting (e.g. update ledger, send receipt)
+    logger.info(
+        "Posting payment: event_id=%s customer=%s %d %s",
+        payload.event_id,
+        payload.customer_id,
+        payload.amount_cents,
+        payload.currency,
+    )
+
+    # Example external call — also needs timeouts and retry bounds
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"https://ledger.internal/api/payments",
+            json={
+                "event_id": payload.event_id,
+                "customer_id": payload.customer_id,
+                "amount_cents": payload.amount_cents,
+                "currency": payload.currency,
+            },
+        )
+        resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    global SECRETS
+
+    SECRETS = _load_secrets_from_env()
+    init_db(__import__("os").environ["DATABASE_URL"])
+
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## What Changed and Why
+
+| Problem | Old Behavior | Fix |
+|---|---|---|
+| **Parse before verify** | `await request.json()` ran, producing a dict, *then* HMAC was checked. Wasted cycles on every forged request. | Stream the body manually, cap at 64 KB, verify HMAC on raw bytes, *then* deserialize. Invalid signatures exit in microseconds. |
+| **In-memory replay store** | `seen_events: dict[str, datetime]` lost everything on restart, invisible across workers, grew without bound. | PostgreSQL `UNIQUE(event_id)` on `webhook_deliveries`. Durability survives restarts. Global across all workers. Add a periodic cleanup job (not shown) to prune entries older than ~90 days. |
+| **Non-atomic idempotency** | `if event_id not in seen_dict:` followed by insertion is a TOCTOU race. | `db.add(record)` + `db.commit()` — the UNIQUE constraint makes concurrent inserts for the same `event_id` resolve at the storage layer. One wins, the other gets a clear duplicate. |
+| **Error leakage** | `raise exc` propagated stack traces, env var names, internal URLs to the caller. | `except Exception` catches everything, logs the full traceback server-side, returns `{"error": "processing error"}` to the client. No internals exposed. |
+| **Secret rotation** | Single static key — no graceful rotation window. | `WEBHOOK_HMAC_SECRETS` accepts comma-separated hex values, newest first. Verification tries all keys. Old keys expire naturally via env config changes. |
+
+## Required Environment Variables
+
+```bash
+# Comma-separated hex-encoded HMAC keys, newest first
+WEBHOOK_HMAC_SECRETS="a1b2c3d4...,9f8e7d6..."
+
+# PostgreSQL connection string
+DATABASE_URL=postgresql+psycopg2://user:pass@host/webhook_db
+```
+
+## Additional Hardening Notes
+
+- **Clock-skew window**: Consider adding a timestamp header (`X-Processor-Timestamp`) and rejecting events older than 5–15 minutes, computed with `abs(now - ts) > skew_limit`. Not included above for brevity but recommended.
+- **Cleanup job**: Run a daily cron that `DELETE FROM webhook_deliveries WHERE created_at < NOW() - INTERVAL '90 days'` to prevent unbounded table growth.
+- **Network-level auth**: If possible, also restrict the endpoint by IP allowlist using a WAF or firewall rule as defense-in-depth.

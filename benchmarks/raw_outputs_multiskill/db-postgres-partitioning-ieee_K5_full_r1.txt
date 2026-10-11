@@ -1,0 +1,285 @@
+I'll provide a comprehensive zero-downtime partitioning strategy for your `audit_logs` table.
+
+## Pre-Migration Setup
+
+First, ensure pg_partman is installed and configure lock/session parameters to prevent blocking:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+
+-- These will be used by the backfill script
+-- statement_timeout = kill statements that exceed batch window
+-- lock_timeout = prevent waiting indefinitely for row locks
+-- idle_in_transaction_session_timeout = safety net
+```
+
+## Step 1: Create the Partitioned Parent Table
+
+Create a new partitioned table alongside the existing one. The key is keeping the column names and types identical so the swap is seamless.
+
+```sql
+-- New partitioned table (not yet receiving traffic)
+CREATE TABLE audit_logs_partitioned (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    org_id      bigint NOT NULL,
+    user_id     bigint,
+    action      text NOT NULL,
+    resource    text,
+    details     jsonb,
+    ip_address  inet,
+    created_at  timestamptz NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
+
+-- Indexes must be created on the parent — they propagate to partitions
+CREATE INDEX idx_audit_logs_part_org_created
+    ON audit_logs_partitioned (org_id, created_at);
+CREATE INDEX idx_audit_logs_part_action
+    ON audit_logs_partitioned (action, created_at);
+CREATE INDEX idx_audit_logs_part_details_gin
+    ON audit_logs_partitioned USING gin (details);
+```
+
+## Step 2: Create Initial Partitions
+
+Bootstrap partitions covering your data range plus a buffer:
+
+```sql
+-- Create partitions for the historical range (e.g., 2023-01 through 2026-12)
+SELECT partman.create_parent(
+    p_parent_table := 'public.audit_logs_partitioned',
+    p_control   := 'created_at',
+    p_type      := 'range',
+    p_interval  := '1 month',
+    p_premake   := 3,           -- pre-create 3 future partitions
+    p_startup   := '2023-01-01' -- earliest data
+);
+```
+
+## Step 3: Concurrent Backfill Script
+
+The core migration runs in small batches inside explicit transactions with aggressive lock timeouts. This runs concurrently against the live table.
+
+```sql
+DO $$
+DECLARE
+    v_last_id     bigint := 0;
+    v_batch_size  int := 5000;
+    v_rows_moved  int;
+    v_total       bigint := 0;
+    v_start       timestamptz;
+BEGIN
+    LOOP
+        -- Set per-statement guardrails
+        SET LOCAL statement_timeout = '30s';
+        SET LOCAL lock_timeout = '5s';
+        SET LOCAL idle_in_transaction_session_timeout = '60s';
+
+        v_start := clock_timestamp();
+
+        -- Move a batch of rows that haven't been migrated yet
+        WITH batch AS (
+            SELECT id
+            FROM audit_logs
+            WHERE id > v_last_id
+            ORDER BY id
+            LIMIT v_batch_size
+            FOR UPDATE SKIP LOCKED  -- skip rows locked by concurrent writes
+        ),
+        moved AS (
+            INSERT INTO audit_logs_partitioned
+                (id, org_id, user_id, action, resource, details, ip_address, created_at)
+            SELECT id, org_id, user_id, action, resource, details, ip_address, created_at
+            FROM audit_logs
+            WHERE id IN (SELECT id FROM batch)
+            ON CONFLICT (id) DO NOTHING  -- idempotent; safe to re-run
+            RETURNING id
+        )
+        SELECT count(*) INTO v_rows_moved FROM moved;
+
+        -- Exit when no more rows to migrate
+        EXIT WHEN v_rows_moved = 0;
+
+        -- Track progress
+        SELECT max(id) INTO v_last_id
+        FROM audit_logs_partitioned
+        WHERE id <= v_last_id + v_batch_size;
+
+        v_total := v_total + v_rows_moved;
+
+        -- Throttle to reduce impact on the live table
+        IF clock_timestamp() - v_start < interval '200ms' THEN
+            PERFORM pg_sleep(0.2);
+        END IF;
+
+        -- Log progress every 100k rows
+        IF v_total % 100000 = 0 THEN
+            RAISS NOTICE 'Migrated % rows so far (last_id: %)', v_total, v_last_id;
+        END IF;
+
+        -- Release locks frequently
+        COMMIT;
+    END LOOP;
+
+    RAISS NOTICE 'Migration complete. Total rows moved: %', v_total;
+END $$;
+```
+
+**Key design decisions in this script:**
+
+- **`FOR UPDATE SKIP LOCKED`** — skips rows currently being modified by live traffic instead of waiting.
+- **Small batches with frequent commits** — prevents long-running transactions from holding locks and bloating vacuum.
+- **`ON CONFLICT DO NOTHING`** — makes the script idempotent; safe to re-run after interruption.
+- **Throttling** — `pg_sleep` between batches reduces I/O pressure on the source table.
+
+## Step 4: Cutover Strategy
+
+Once backfill is caught up, perform a brief maintenance window (typically seconds, not minutes):
+
+```sql
+BEGIN;
+    SET LOCAL lock_timeout = '5s';
+
+    -- 1. Brief exclusive lock on both tables for atomic rename
+    LOCK TABLE audit_logs IN ACCESS EXCLUSIVE MODE;
+    LOCK TABLE audit_logs_partitioned IN ACCESS EXCLUSIVE MODE;
+
+    -- 2. Final delta sync (rows inserted during backfill tail)
+    INSERT INTO audit_logs_partitioned
+        (id, org_id, user_id, action, resource, details, ip_address, created_at)
+    SELECT id, org_id, user_id, action, resource, details, ip_address, created_at
+    FROM audit_logs
+    WHERE id > (SELECT max(id) FROM audit_logs_partitioned)
+    ON CONFLICT (id) DO NOTHING;
+
+    -- 3. Atomic rename swap
+    ALTER TABLE audit_logs RENAME TO audit_logs_old;
+    ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+COMMIT;
+```
+
+The `ACCESS EXCLUSIVE` lock is held only for the final delta sync + rename — typically under a second.
+
+## Step 5: Partition Pruning Verification
+
+After cutover, verify the planner correctly prunes partitions:
+
+```sql
+-- Enable pruning stats
+SET enable_partition_pruning = on;
+
+-- Test 1: Single partition scan (should hit only 1 partition)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT count(*)
+FROM audit_logs
+WHERE created_at >= '2026-08-01'
+  AND created_at < '2026-09-01';
+-- Expected: "Seq Scan on audit_logs_2026_08" only
+
+-- Test 2: Multi-month range (should hit N partitions)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT org_id, action, count(*)
+FROM audit_logs
+WHERE created_at >= '2026-06-01'
+  AND created_at < '2026-09-01'
+GROUP BY org_id, action;
+-- Expected: scans partitions for 2026_06, 2026_07, 2026_08 only
+
+-- Test 3: Partition elimination with org_id filter
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT *
+FROM audit_logs
+WHERE org_id = 42
+  AND created_at BETWEEN '2026-08-15' AND '2026-08-16';
+-- Expected: "Rows Removed by Filter" should show pruning worked
+
+-- Confirm all partitions are recognized by the planner
+SELECT schemaname, tablename, attname, n_distinct
+FROM pg_stats
+WHERE tablename LIKE 'audit_logs_%'
+ORDER BY tablename;
+```
+
+The gold standard: in `EXPLAIN` output, you should see only the relevant partitions listed under "Append" or "Seq Scan" — never a full scan across all partitions.
+
+## Step 6: Automated Future Partition Management with pg_partman
+
+pg_partman handles partition creation, retention, and maintenance automatically:
+
+```sql
+-- Configure automated maintenance
+UPDATE partman.partman_config
+SET    infinite_time_partitions = true,   -- auto-create future partitions
+       retain_count            = 24,      -- keep 24 months of data
+       retain_interval         = '1 month',
+       premake                 = 3,       -- always have 3 future partitions ready
+       maintenance_interval    = '1 hour'
+WHERE  parent_table = 'public.audit_logs';
+
+-- Run maintenance manually (also schedule via pg_cron or your scheduler)
+SELECT partman.run_maintenance(p_analyze := true, p_job_id => 1);
+
+-- Schedule with pg_cron (runs every hour)
+SELECT cron.schedule('audit-logs-maintenance', '0 * * * *',
+    $$SELECT partman.run_maintenance('public.audit_logs', p_analyze := true)$$
+);
+```
+
+**What `run_maintenance` does:**
+1. Creates partitions up to `premake` intervals ahead.
+2. Detaches and drops partitions older than `retain_count * retain_interval`.
+3. Updates partition statistics via `ANALYZE`.
+
+## Optional: Sub-Partitioning for Hot Orgs
+
+If certain `org_id`s generate disproportionate data, sub-partition by hash:
+
+```sql
+CREATE TABLE audit_logs_partitioned (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    org_id      bigint NOT NULL,
+    user_id     bigint,
+    action      text NOT NULL,
+    resource    text,
+    details     jsonb,
+    ip_address  inet,
+    created_at  timestamptz NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
+
+-- Sub-partition each monthly range by org_id hash
+CREATE TABLE audit_logs_2026_09 PARTITION OF audit_logs_partitioned
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01')
+    PARTITION BY HASH (org_id);
+
+CREATE TABLE audit_logs_2026_09_p0 PARTITION OF audit_logs_2026_09 FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE audit_logs_2026_09_p1 PARTITION OF audit_logs_2026_09 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE audit_logs_2026_09_p2 PARTITION OF audit_logs_2026_09 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE audit_logs_2026_09_p3 PARTITION OF audit_logs_2026_09 FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+```
+
+pg_partman supports native sub-partitioning via `p_sub_type` in `create_parent`.
+
+## Rollback Plan
+
+If something goes wrong post-cutover:
+
+```sql
+BEGIN;
+    ALTER TABLE audit_logs RENAME TO audit_logs_partitioned;
+    ALTER TABLE audit_logs_old RENAME TO audit_logs;
+COMMIT;
+```
+
+The old table remains intact until you drop it.
+
+---
+
+**Summary of the migration sequence:**
+
+1. Create partitioned parent + initial partitions via pg_partman
+2. Backfill in concurrent batches with `SKIP LOCKED` and throttling
+3. Brief cutover window with atomic rename
+4. Verify partition pruning via `EXPLAIN ANALYZE`
+5. Enable automated maintenance via pg_partman + pg_cron
+
+The total downtime window is the time to acquire two `ACCESS EXCLUSIVE` locks for the final delta sync and rename — typically sub-second on a table of this size.

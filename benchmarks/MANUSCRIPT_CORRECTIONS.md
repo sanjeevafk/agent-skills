@@ -1,0 +1,293 @@
+# Manuscript Corrections Log
+
+Editorial pass applied to `paper/MANUSCRIPT.md` on 2026-10-09.
+
+`paper/` is git-ignored (unpublished manuscript, third-party PDFs), so these
+edits are **not** in the artifact repository's history. This file records what
+changed and the evidence behind each correction, so reviewers and future
+authors can audit them.
+
+Every numeric correction below was re-verified against the archived data before
+being applied. Nothing was changed on the basis of a draft note.
+
+## A. Claims that overstated the evidence
+
+### A1. Headline reframed from "30% savings at no quality cost" to a
+###     detection-limited null
+
+**Was:** "structure-preserving static compilation achieved a mean score within
+0.21 points of uncompressed manuals … while reducing prompt overhead by 30.0%."
+
+**Now:** the central result is stated as a null with an informative asymmetry,
+in the abstract, Finding 1, §10, and Finding 4.
+
+**Why:** the claim "no quality cost" requires ruling out degradation below the
+detection threshold. With a measured test-retest floor of σ = 6.09 on
+byte-identical prompts, the minimum detectable effect at 80% power is ≈ 2.53
+points on the 35-point rubric (7.2%). The 0.21-point gap is 8.3% of that floor,
+and resolving it directly would need roughly 3,700 paired runs. "No significant
+difference" here means *below threshold*, not *equivalent*.
+
+The paper already said this in §7.5 in principle but never quantified it. The
+defensible claim — "format effects below ~7% of the rubric are not observable
+in this design" — is stronger and is now stated explicitly.
+
+### A2. Abstract shortened from ~805 to 236 words
+
+IEEE limits abstracts to roughly 250 words. The previous abstract was
+non-compliant by a factor of three. Rewritten around the null + TDD
+asymmetry rather than the compression win.
+
+### A3. `r = +0.616` construct-validity claim removed
+
+**Was (§9 and abstract):** "in self-contained tasks, syntax compilation aligns
+strongly and statistically significantly with the judge's Correctness subscore
+(e.g. `sec-django-hardening`: r = +0.616, p = 0.001)."
+
+**Now:** the pooled null (Pearson r = +0.047, p = 0.473) is presented as the
+only reproducible construct-validity figure, and the paper states explicitly
+that per-task subgroup correlations are not independently recomputable from the
+artifact because the per-run `syntax_rate` records were never persisted.
+
+**Why:** `scripts/run_execution_calibration.py` rebuilt `calibration_records`
+in memory and wrote only a Markdown report; no machine-readable calibration
+JSON exists in the repository. Worse, lines 616 and 689 of that script embedded
+`r = +0.616, p = 0.001` and `r = +0.344, p = 0.108` as **literal text inside
+f-strings** — adjacent to genuinely interpolated values such as `{pear_r:.3f}`.
+Re-running the calibration therefore reproduced the same claim regardless of
+what the data actually showed.
+
+**Also fixed:** the generator now interpolates the two largest computed
+subgroup correlations instead of hardcoding them, and states that per-task
+values are not persisted.
+
+### A4. "Wins" and "Rank Points" columns removed from Table 1
+
+These came from the judge's free-text `ranking` field, not from the scores, and
+were never defined in the paper. Recomputed: across the 80 judgement records
+carrying a ranking, the judge's top-ranked arm was not its own highest-scoring
+arm in **10 cases (12.5%)**. Under that measure `checklist_v2` received the
+*fewest* top rankings (10) while holding the second-highest mean, and
+`checklist_v1` received the *most* (18) while holding the lowest mean — an
+ordering that inverts the score column printed beside it.
+
+Replaced with a note recording that the ranking field was collected, found
+unreliable, and deliberately discarded.
+
+## B. Numeric corrections
+
+| location | was | now | verified by |
+|---|---|---|---|
+| §8.4 header | N = 66 scored runs | **N = 69** | 69 records in `ablation_results.json` (a1=12, a2=21, a3=18, a4=18) |
+| §8.4 A2 paired test | mean diff **+1.53**, t = **+0.67** | **−1.53**, t = **−0.67** | mean of the paper's own six listed deltas (2.00, 2.00, −8.50, −9.00, 2.00, 2.33) = −1.5283; SD 5.598 → t = −0.6688 |
+| abstract + §9 judge-window pilot | mean gap **+0.83** | **−0.83** | `judge_window_pilot.json`: 6 paired outputs, diffs (24k − 10k) = [−3, −7, +1, +1, −5, +8], mean −0.8333, p = 0.7201 |
+
+Both sign errors were direction-only: magnitudes and p-values were already
+correct. Neither changes a conclusion, but both would be caught by a careful
+reviewer and would cast doubt on the surrounding numbers.
+
+## C. Threats to Validity — two subsections added
+
+### C1. Judge Position Bias and Statistical Power
+
+Discloses a bias the manuscript never tested. Per-slot mean deviations from the
+grand mean: A +2.08, B +0.70, C −0.79, D −1.58, E −0.37. One-way ANOVA
+F = 4.5373, p = 0.00136; Kruskal–Wallis H = 15.82, p = 0.00328. The A-to-D
+spread of +3.66 points is ~17× the headline treatment effect and is the largest
+systematic effect in the benchmark.
+
+Position is close to balanced across arms (11–20 runs per arm-slot cell), which
+is what the random permutation was designed to achieve, so the bias averages
+into noise rather than confounding an arm with a slot. Correcting for it leaves
+every conclusion intact (`full` − `checklist_v2` narrows +0.204 → +0.120, paired
+t = 0.1901, p = 0.8516; no arm beats `control`, all Welch p > 0.6; excluding
+slot A widens the gap to +0.407).
+
+Reproduce with `uv run python scripts/analyze_position_bias.py`. Full write-up
+in `POSITION_BIAS_AUDIT.md`. Pinned by `TestJudgePositionBias` in
+`tests/test_paper_claims.py`.
+
+### C2. Statistical Power
+
+States the minimum detectable effect (≈ 2.53 points at 80% power, from SD 7.87
+on 78 paired comparisons) and which findings survive it: TDD tracer-bullet
+removal (Δ = −8.50) clears the 6.09 floor; the `checklist_v1` Testing & QA drop
+(Δ = −6.32, n = 11) clears it only marginally.
+
+## D. Compiler provenance (§7.1)
+
+Corrected in the previous commit. Summary:
+
+- The "abstract syntax tree (AST)" characterisation was wrong — the
+  implementation is a line-oriented section parser. Prose now says
+  "section-and-element structure", and Algorithm 1's pseudocode variable was
+  renamed `AST` → `TREE` so it no longer contradicts the prose.
+- §7.1 now names `scripts/skills_compiler.py` and states that all five
+  delivery arms and all ablation conditions come from it. (The compiler was
+  formerly the Rust crate `crates/skills-compiler`; it is now a byte-for-byte
+  Python port, cross-validated against the Rust binary on all six compilation
+  modes across the benchmark corpus -- 120/120 byte-identical -- before the
+  crate was removed. No recorded number changed.)
+- The test count was corrected from "13 unit tests" to 16 A4-specific tests
+  (27 total in `tests/test_compiler_parity.py`), with a breakdown of
+  behavioural guards versus known-gap characterisation tests.
+
+## Not changed, still open
+
+- **`checklist_v2` confound.** The arm is the only one carrying an extra
+  `[INSTRUCTION]` directive, which plausibly explains its higher output-token
+  volume. Not addressed by any edit here — it needs a re-run, not a rewrite.
+- **"Sub-second skill routing"** in §8.7 contradicts the paper's own measured
+  2.08 s end-to-end (cross-encoder p50 = 1.95 s). The §8.7-A naive baseline
+  ("4.5 minutes" for 440 passes) is ~3.2× faster than the measured per-pass
+  cost. Needs a wording fix.
+- **Token figures** throughout are `len(text) // 4` character estimates rather
+  than real tokenizer output. The 680-token and 30.0% numbers inherit the
+  approximation and should be described as estimates.
+- **`skills/tdd/SKILL.md` and `skills/debugging-code/`** remain unrestored, so
+  2 of 18 artifacts do not reproduce and two tests are `xfail`.
+
+## E. Routing section (§8.7) rewritten as a negative result
+
+### E1. Prior §8.7 numbers withdrawn
+
+| claim | status |
+|---|---|
+| Two-stage router 55.6% Top-1 / 61.1% Top-5 | **withdrawn** |
+| "TF-IDF baseline" 0.0% Top-1 / 11.1% Top-5 | **withdrawn** (was never TF-IDF) |
+| Level 2 end-to-end: 24.67 vs 23.00, +1.67 | **withdrawn** |
+| "sub-second skill routing" | **withdrawn** (contradicted own 2.08 s) |
+| Naive cross-encoder baseline "4.5 minutes" | **withdrawn** (own measurement implies 14.3 min) |
+| "Contrastive Bi-Encoder" | **withdrawn** (off-the-shelf checkpoint, no fine-tuning) |
+| Catalogue "440 skills" / "11 domains" | restated as **531 skills** |
+
+Three defects caused the reversal, each verified in source: the lexical baseline
+was a hand-weighted keyword scorer (exact-name 100, substring 30, tag 20,
+description 15, category 10) that cannot rank technical queries by construction;
+the catalogue vectors embedded `f"{name}: {desc}"`, leaking skill names; and the
+reranker was unimportable while the paper named a different model ID than the
+code.
+
+### E2. Corrected results (17 scorable tasks, 531 skills)
+
+| method | Top-1 | Top-5 | p50 latency |
+|---|---:|---:|---:|
+| TF-IDF baseline | 8/17 (47.1%) | 11/17 (64.7%) | 1.75 ms |
+| Stage 1 only (BGE-small) | 7/17 (41.2%) | 11/17 (64.7%) | 47 ms |
+| Stage 1 + Julia-1 rerank | 5/17 (29.4%) | 11/17 (64.7%) | 401 ms |
+
+Cross-encoder reranking **reduced** Top-1 from 41.2% to 29.4%, overriding a
+correct shortlist hit in 6 of 11 cases. Top-5 recall is identical across all
+three methods, so candidate generation — not reranking — is the bottleneck.
+
+### E3. Option-truncation defect found and fixed
+
+Julia-1 enforces a 48-token per-option limit; descriptions average 42 words. The
+first corrected run word-clipped description *prefixes*, truncating 17 of 18
+routes to ~79% of their text, and scored 2/17. Replacing head-clipping with
+retention of each description's leading clause (clipped only when the runtime
+rejects it) leaves 529 of 531 catalogue options intact and raised reranker
+accuracy to 5/17. Truncation was real but not the whole story: the reranker
+remains net-negative against its own shortlist.
+
+### E4. Recovered skill sources
+
+`skills/debugging-code/` (never in git) and the benchmark-time `skills/tdd/`
+(predating the initial commit) were rebuilt from their surviving compiled v2
+artifacts. Both reconstructed sources recompile to the **exact recorded artifact
+byte-for-byte**, verified by SHA-256. Narrative prose pruned by the compiler is
+not recoverable, so the original token counts remain manifest-sourced rather than
+re-measurable. Details in `skills/RECOVERY.md`.
+
+With `debugging-code` restored, `scripts/verify_compiled_artifacts.py` reports
+**17 of 18 artifacts reproduce** (previously 16, with one skill absent). The
+single remaining exception is `tdd`, whose recorded pre-run source no longer
+exists.
+
+## F. Catalogue de-duplication (2026-10-10)
+
+Nine near-duplicate catalogue pairs (seven byte-identical, cosine 1.000) were
+found and collapsed into a 522-skill routable set from a 531-skill index. Each
+pair is one skill registered under both a short and a `huggingface-` prefixed
+name. `scripts/dedupe_catalogue.py` collapses them deterministically (canonical
+tier first, else shorter name, else lexicographic), registers the absorbed name
+in the index alias map, and deletes nothing. Maximum off-diagonal cosine among
+routable entries fell from 1.0000 to 0.9353.
+
+**No reported number changes.** TF-IDF 8/17, Stage 1 7/17, Stage 1 + Julia-1
+5/17 and Top-5 11/17 are identical before and after de-duplication, because all
+nine duplicates are Hugging Face tooling skills unrelated to the 18 benchmark
+tasks. Reported as a hygiene fix, not an improvement.
+
+Three tests now guard this contract: collapsed names must not be routable, each
+must resolve through the alias registry, and no two routable entries may embed
+identically. The router and benchmark both read `skills_canonical.json`, and the
+router additionally hard-fails if a collapsed name reappears in the routable set.
+
+New finding recorded in §8.7: the lexical and dense retrievers agree on only
+**4 of 17** top-1 answers (lexical 8, dense 7, shared 4), so their failure modes
+are largely complementary and a union shortlist is the most promising untested
+direction. The dominant residual failure (`e2e-testing` vs `playwright`,
+cosine 0.87) is a genuine semantic near-duplicate that a 0.95 threshold
+correctly leaves alone; separating it needs a task-level notion of
+interchangeability we have not established.
+
+## G. Union shortlist follow-up (2026-10-10)
+
+Follow-up to §8.7, testing whether the two retrievers' complementary failures can
+be combined. `scripts/union_shortlist_experiment.py` (no API calls, no judge):
+
+| shortlist | recall@5 | top-1 |
+|---|---:|---:|
+| lexical top-5 | 11/17 | 8/17 |
+| dense top-5 | 11/17 | 7/17 |
+| union (lex-first, deduped, mean size 9.06) | **14/17** | 8/17 |
+| union + Julia-1 rerank | 14/17 | **5/17** |
+| oracle ceiling over union | 14/17 | 14/17 |
+
+Recall lifts from 11/17 to 14/17 for ~4 extra candidates (k=5 each is the
+operating point; k=10 adds nothing, k=15 buys one task for 27 candidates). But
+the reranker overrides a correct shortlist hit 9 times, losing 9 of the 14
+recoverable tasks. This localises the bottleneck to Stage 2: retrieval surfaces
+the right skill; the reranker cannot retain it. Added as §8.7-D, with Finding 6
+updated to reflect that reranking is a net loss at every measured operating
+point.
+
+## H. Finding 2 confound resolved: the directive explains ~82% of it (2026-10-10)
+
+`checklist_v2` was the only delivery arm carrying a trailing
+`[INSTRUCTION]: ... Output your complete, production-grade code implementation`
+directive (`skill_delivery_experiment.py:236`). Finding 2 attributed its +843
+token output-volume gap to structure-preserving compression. A paired
+experiment isolates it: the same task, same skill, same model
+(`qwen/qwen3.7-flash` via `cmd`), 5 tasks x 3 runs x 2 conditions, 30/30
+generations succeeded.
+
+| condition | mean output tokens |
+|---|---:|
+| `checklist_v2` **with** directive | 4,225 |
+| `checklist_v2` **without** directive | 3,535 |
+| **directive effect** | **+690 (+16.3%)** |
+
+The archived Finding 2 gap was **+843 tokens (+18.4%)**. The directive alone
+accounts for **82% of it**. The direction holds in **12 of 15** paired cells,
+with the largest single effect on the TDD task (+2,119 tokens).
+
+**Statistics, stated honestly:** paired *t* = +1.628, *p* = 0.126; Wilcoxon
+*W* = 29.0, *p* = 0.083. Neither reaches *p* < 0.05 at n = 15 paired
+observations (sd = 1,641, driven by the TDD cell). So this is a large,
+directionally consistent effect that this design is underpowered to confirm at
+conventional significance — not a null, and not a clean significance claim
+either.
+
+**Consequence.** Finding 2's causal reading is withdrawn. The ~30% *prompt*
+token saving is unaffected (that is a measurement of the prompt, and the
+directive adds ~30 tokens to a 1,590-token prompt). What is withdrawn is the
+claim that `checklist_v2` elicits unusually long output *because of
+compression*; the measured evidence says the longer output came mostly from an
+instruction that told the model to produce more.
+
+**Measurement caveat:** both this experiment and the archived Finding 2 used the
+same `len(text) // 4` character estimator for output tokens, so the comparison
+is consistent between them. The `cmd` backend does not report per-call token
+usage, so no real-tokenizer numbers are available for either side.

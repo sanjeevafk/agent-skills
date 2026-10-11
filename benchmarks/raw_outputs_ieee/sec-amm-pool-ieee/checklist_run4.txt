@@ -1,0 +1,391 @@
+[exit=0 latency=40.94s]
+# Constant-Product AMM Audit: Attack Analysis & Hardened Implementation
+
+## Executive Summary
+
+Five distinct attack paths span three vulnerability classes: spot-price oracle manipulation, accounting flaws from raw `balanceOf` reserve math, and execution-order failures (CEI violations, missing slippage). Two critical-severity exploits allow near-total theft of LP funds with negligible capital.
+
+---
+
+## Ranked Attack Paths
+
+### 🔴 Priority 1 — Flash-Loan Spot-Price Manipulation (CRITICAL · ~0.5% capital required)
+
+| Step | Action |
+|------|--------|
+| 1 | Attacker calls `swap()` with `amountOutMin = 0` and no deadline |
+| 2 | Router flash-loans 100× the pool's TokenA reserves and deposits them via `deposit()` |
+| 3 | Pool's spot price (`balanceOf(A)/balanceOf(B)`) skews 100:1 |
+| 4 | Attacker swaps a small amount of TokenB for TokenA at the distorted price, receiving vastly more than fair value |
+| 5 | Repays flash loan + fees; keeps the spread |
+
+**Root cause:** Price derives from `token.balanceOf(address(this))`, which reflects every token ever sent to the contract, including flash-loaned ones. Zero TWAP damping.
+
+### 🟠 Priority 2 — Donation-Based Reserve Inflation (HIGH · free capital required)
+
+| Step | Action |
+|------|--------|
+| 1 | Attacker calls `donateTokens(TokenB, 1_000_000)` sending tokens directly to the pool |
+| 2 | Pool's recorded reserves jump, but no new LP shares were minted |
+| 3 | Next `deposit()` caller gets `shares = assets × totalShares / totalReservesA` — inflated denominator under-mints their shares |
+| 4 | When a legit LP later withdraws face-value, the attacker pockets the gap |
+
+**Root cause:** Reserves are set from raw `balanceOf(address(this))` rather than measuring actual received amounts. Arbitrary donations permanently distort the invariant.
+
+### 🟠 Priority 3 — Reentrancy via Premature Balance Update (HIGH · callback-capable token needed)
+
+```solidity
+// VULNERABLE FLOW:
+balances[user].outToken += amountOut;        // effects AFTER interaction
+tokenOut.transfer(user, amountOut);          // interaction FIRST
+// if tokenOut is malicious/fallback-triggering:
+//   user callback fires → read stale balances/reserves → duplicate payout
+reserves[tokenB] -= amountOut;               // state mutation after external call
+```
+
+Outputs to the user must always be written back to storage *before* any `transfer` call that might trigger a callback.
+
+### 🟡 Priority 4 — Front-End Sandwich / No-Slippage Quotes (MEDIUM · standard MEV)
+
+Server-side quoting without `amountOutMin` lets any user submission become a free sandwich target. Bot frontruns, user fills, bot back-runs — zero friction.
+
+### 🟢 Priority 5 — First-Depositor Price Capture (LOW-MEDIUM · timing-dependent)
+
+On an empty pool (`_totalAssets == 0`), the first depositor sets initial pricing. A frontrunner can capture a small edge, but this is bounded and far less impactful than P1–P3.
+
+---
+
+## Hardened Implementation
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+contract HardenedAMMPool is ReentrancyGuard, Ownable2Step {
+    using SafeERC20 for IERC20;
+
+    // ── Storage ──────────────────────────────────────────────
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    // Internal reserve accounting — never derived from balanceOf
+    uint256 private _reserveA;
+    uint256 private _reserveB;
+
+    // Total assets under management (measured on each deposit)
+    uint256 private _totalAssetsA;
+    uint256 private _totalAssetsB;
+
+    // LP share supply
+    uint256 public totalSupply;            // total lpShares minted
+    mapping(address => uint256) public balanceOfLP;
+
+    // Fee parameters
+    uint256 public feeDenominator = 1e6;
+    uint256 public feeNumeratorA;
+    uint256 public feeNumeratorB;
+
+    // Pause gating
+    bool public paused;
+
+    // Oracle TWAP cache (used internally)
+    int56 private _twapTickCumulativePrev;
+    uint32  private _twapSecondsAgo;       // configurable lookback window
+
+    // Events
+    event Swap(
+        address indexed sender,
+        address indexed recipient,
+        address indexed tokenIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event Deposit(
+        address indexed lp,
+        uint256 assetsA,
+        uint256 assetsB,
+        uint256 lpShares
+    );
+    event Withdraw(
+        address indexed lp,
+        uint256 lpSharesBurned,
+        uint256 assetsA,
+        uint256 assetsB
+    );
+    event FeesSet(uint256 feeNA, uint256 feeNB);
+    event TwapLookbackUpdated(uint32 secondsAgo);
+    event Paused(bool paused);
+
+    modifier whenNotPaused() { require(!paused, "Paused"); _; }
+
+    constructor(
+        IERC20 _a,
+        IERC20 _b,
+        uint32 twapLookbackSeconds
+    ) Ownable2Step(msg.sender) {
+        tokenA = _a;
+        tokenB = _b;
+        _twapSecondsAgo = twapLookbackSeconds;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  SWAP  — CEI-compliant, slippage-gated, reserve-checked
+    // ═══════════════════════════════════════════════════════
+    /// @param tokenIn      Which token is being sold (must be tokenA or tokenB)
+    /// @param amountIn     Exact amount to sell
+    /// @param amountOutMin Minimum acceptable output (slippage bound)
+    /// @param recipient    Address that receives the output tokens
+    /// @param deadline     Timestamp after which the tx reverts
+    function swap(
+        IERC20 tokenIn,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address recipient,
+        uint256 deadline
+    ) external nonReentrant whenNotPaused {
+        require(block.timestamp <= deadline, "Swap: expired");
+        require(recipient != address(0), "Swap: zero recipient");
+        require(amountIn > 0, "Swap: zero input");
+
+        // Determine direction
+        bool aToB;
+        if (address(tokenIn) == address(tokenA)) {
+            aToB = true;
+        } else if (address(tokenIn) == address(tokenB)) {
+            aToB = false;
+        } else {
+            revert("Swap: unsupported token");
+        }
+
+        // ── Check (effects written before interaction) ───
+        uint256 reserveIn  = aToB ? _reserveA : _reserveB;
+        uint256 reserveOut = aToB ? _reserveB : _reserveA;
+        require(reserveIn > 0 && reserveOut > 0, "AMM: empty pool");
+
+        // Apply fee to input
+        uint256 feeAmount = FullMath.mulDiv(amountIn, feeNumeratorA, feeDenominator);
+        uint256 amountInAfterFee = amountIn - feeAmount;
+
+        // Constant-product: x * y = k; amountOut = y - xy/(x+Δx)
+        // Use safe mulDiv throughout
+        uint256 amountOut = reserveOut -
+            FullMath.mulDiv(reserveOut, amountInAfterFee, reserveIn + amountInAfterFee);
+
+        require(amountOut >= amountOutMin, "AMM: slippage exceeded");
+
+        // State mutation BEFORE any external call  (CEI order)
+        if (aToB) {
+            _reserveA += amountIn;
+            _reserveB -= amountOut;
+        } else {
+            _reserveB += amountIn;
+            _reserveA -= amountOut;
+        }
+
+        // ── Interaction (external call) ──────────────────
+        tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
+        // Fee side goes to treasury / burns depending on design
+        // Here we keep fees inside pool for simplicity; alternative:
+        // if (feeAmount > 0) IERC20(tokenA).safeTransfer(treasury, feeAmount);
+
+        // Transfer output to recipient
+        if (aToB) {
+            tokenB.safeTransfer(recipient, amountOut);
+        } else {
+            tokenA.safeTransfer(recipient, amountOut);
+        }
+
+        emit Swap(msg.sender, recipient, address(tokenIn), amountIn, amountOut);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  DEPOSIT  — measures actual received, no balanceOf
+    // ═══════════════════════════════════════════════════════
+    function deposit(
+        uint256 assetsA,
+        uint256 assetsB,
+        address recipient
+    ) external nonReentrant whenNotPaused returns (uint256 lpShares) {
+        require(recipient != address(0), "Deposit: zero recipient");
+        require(assetsA > 0 && assetsB > 0, "Deposit: zero assets");
+
+        // Measure actual received tokens
+        uint256 balBeforeA = tokenA.balanceOf(address(this));
+        tokenA.safeTransferFrom(msg.sender, address(this), assetsA);
+        uint256 actualA = tokenA.balanceOf(address(this)) - balBeforeA;
+
+        uint256 balBeforeB = tokenB.balanceOf(address(this));
+        tokenB.safeTransferFrom(msg.sender, address(this), assetsB);
+        uint256 actualB = tokenB.balanceOf(address(this)) - balBeforeB;
+
+        // Burn mismatch allowance for minor rounding; reject if shortfall is large
+        uint256 minReceiveA = assetsA / 1000;  // 0.1% tolerance
+        uint256 minReceiveB = assetsB / 1000;
+        require(actualA >= minReceiveA, "Deposit: shortfall A");
+        require(actualB >= minReceiveB, "Deposit: shortfall B");
+
+        // Compute LP shares
+        if (totalSupply == 0) {
+            // Initial liquidity: proportional contribution
+            // Shares = min(actualA * totalTargetRatio, actualB * totalTargetRatio)
+            // Simple approach: use the smaller proportionality
+            uint256 idealShareA = (_totalAssetsA == 0)
+                ? actualA
+                : FullMath.mulDiv(actualA, totalSupply, _totalAssetsA);
+            uint256 idealShareB = (_totalAssetsB == 0)
+                ? actualB
+                : FullMath.mulDiv(actualB, totalSupply, _totalAssetsB);
+            lpShares = idealShareA < idealShareB ? idealShareA : idealShareB;
+            require(lpShares > 0, "Deposit: too small");
+        } else {
+            // Weighted average of proportions, weighted by relative imbalance
+            uint256 shareA = FullMath.mulDiv(actualA, totalSupply, _totalAssetsA);
+            uint256 shareB = FullMath.mulDiv(actualB, totalSupply, _totalAssetsB);
+            // Use minimum to protect existing LPs from dilution
+            lpShares = shareA < shareB ? shareA : shareB;
+        }
+
+        // Effects: update state before returning
+        _totalAssetsA += actualA;
+        _totalAssetsB += actualB;
+        totalSupply += lpShares;
+        balanceOfLP[recipient] += lpShares;
+
+        emit Deposit(recipient, actualA, actualB, lpShares);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  WITHDRAW  — CEI: burn shares, THEN transfer
+    // ═══════════════════════════════════════════════════════
+    function withdraw(
+        uint256 lpShares,
+        address recipient
+    ) external nonReentrant whenNotPaused returns (uint256 assetsA, uint256 assetsB) {
+        require(balanceOfLP[msg.sender] >= lpShares, "Withdraw: insufficient");
+        require(lpShares > 0, "Withdraw: zero shares");
+        require(recipient != address(0), "Withdraw: zero recipient");
+
+        // Proportional withdrawal from internal reserves
+        uint256 ratio = lpShares / totalSupply;
+
+        assetsA = FullMath.mulDiv(_reserveA, ratio, 1);
+        assetsB = FullMath.mulDiv(_reserveB, ratio, 1);
+
+        // CEI: burn first, then transfer
+        balanceOfLP[msg.sender] -= lpShares;
+        totalSupply -= lpShares;
+        _totalAssetsA -= assetsA;
+        _totalAssetsB -= assetsB;
+        _reserveA -= assetsA;
+        _reserveB -= assetsB;
+
+        tokenA.safeTransfer(recipient, assetsA);
+        tokenB.safeTransfer(recipient, assetsB);
+
+        emit Withdraw(msg.sender, lpShares, assetsA, assetsB);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  DONATION — BLOCKED (no arbitrary donations accepted)
+    // ═══════════════════════════════════════════════════════
+    /// NOTE: This function intentionally does NOT exist.
+    /// Accepting arbitrary token donations lets attackers inflate
+    /// balanceOf-based reserve math, causing LP dilution.
+    /// If protocol needs excess-token handling, implement a
+    /// controlled sweep that credits fees to LPs proportionally.
+
+    // ═══════════════════════════════════════════════════════
+    //  SWEEP  — admin removes mistakenly sent tokens
+    // ═══════════════════════════════════════════════════════
+    function sweep(IERC20 token, uint256 amount) external onlyOwner {
+        require(token != tokenA && token != tokenB, "Sweep: cannot sweep pool tokens");
+        token.safeTransfer(owner(), amount);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  GOVERNANCE
+    // ═══════════════════════════════════════════════════════
+    function setFees(uint256 feeNA, uint256 feeNB) external onlyOwner {
+        require(feeNA < feeDenominator && feeNB < feeDenominator, "Fee > denom");
+        feeNumeratorA = feeNA;
+        feeNumeratorB = feeNB;
+        emit FeesSet(feeNA, feeNB);
+    }
+
+    function setTwapLookback(uint32 secondsAgo) external onlyOwner {
+        _twapSecondsAgo = secondsAgo;
+        emit TwapLookbackUpdated(secondsAgo);
+    }
+
+    function pause() external onlyOwner {
+        paused = true;
+        emit Paused(true);
+    }
+
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Paused(false);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  ORACLE TWAP VIEW  — for off-chain or advanced strategies
+    // ═══════════════════════════════════════════════════════
+    /// Plugged with a Uniswap V3 pool address for real TWAP data.
+    /// Below is a stub showing the interface expected.
+    function _currentTWAPTick() internal view returns (int24 twapTick) {
+        // TODO: Inject UniV3 pool address via constructor or setter.
+        // Example implementation:
+        /*
+        IUniswapV3Pool pool = _poolForOracle();
+        (int56[] memory tickCumulatives, ) = pool.observe(_twapSecondsAgo);
+        twapTick = int24((tickCumulatives[1] - tickCumulatives[0])
+                            / int56(uint56(_twapSecondsAgo)));
+        */
+        // Fallback placeholder until oracle is wired:
+        revert("TWAP: oracle not configured");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  READ-ONLY HELPERS
+    // ═══════════════════════════════════════════════════════
+    function getReserves() external view returns (uint256 rA, uint256 rB) {
+        return (_reserveA, _reserveB);
+    }
+
+    /**
+     * Quote a swap without executing — useful for front-ends.
+     * RECOMMENDED: front-end MUST enforce amountOutMin >= quoted * (1 - maxSlippagePct)
+     * on-chain swap still requires both `amountOutMin` AND `deadline`.
+     */
+    function quoteSwap(
+        IERC20 tokenIn,
+        uint256 amountIn
+    ) external view returns (uint256 amountOut) {
+        bool aToB;
+        if (address(tokenIn) == address(tokenA)) aToB = true;
+        else if (address(tokenIn) == address(tokenB)) aToB = false;
+        else revert("Quote: unsupported token");
+
+        uint256 reserveIn  = aToB ? _reserveA : _reserveB;
+        uint256 reserveOut = aToB ? _reserveB : _reserveA;
+        require(reserveIn > 0 && reserveOut > 0, "Quote: empty pool");
+
+        uint256 feeAmount = FullMath.mulDiv(amountIn,
+            aToB ? feeNumeratorA : feeNumeratorB, feeDenominator);
+        uint256 amountInAfterFee = amountIn - feeAmount;
+
+        return reserveOut -
+            FullMath.mulDiv(reserveOut, amountInAfterFee, reserveIn + amountInAfterFee);
+    }
+
+    // Exposed for balance-safety auditing; NOT used in any logic
+    function contractBalanceA() external view returns (uint256) {
+        return tokenA.balanceOf(address(this));
+    }
+    function contractBalanceB() external view returns (u

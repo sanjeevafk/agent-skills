@@ -1,0 +1,519 @@
+Here's my security review of the described FastAPI payment webhook endpoint.
+
+---
+
+## Vulnerability Analysis (Order of Severity)
+
+### 1. Signature Verified After JSON Parsing — DoS & Resource Exhaustion
+
+The current flow is:
+
+```
+HTTP POST → parse JSON body → verify HMAC signature
+```
+
+**Problem:** An attacker can send unlimited malformed or massive payloads before any auth check. Each `json.loads()` call allocates memory, parses structures, and triggers Python's recursion/depth limits. Under load from unauthenticated clients, this becomes a trivial resource-exhaustion vector. The signature must be verified **before** consuming request body bytes.
+
+**Fix:** Read the raw body first, verify the HMAC on the raw bytes, then decode JSON only after authenticity is confirmed.
+
+---
+
+### 2. In-Memory Replay-ID Dict — No Persistence Across Restarts
+
+```python
+seen_events: set[str] = set()
+```
+
+**Problem 1 (data loss):** On process restart, container spin-up, or pod migration, the entire dedup window vanishes. A legitimate duplicate webhook delivered during or after a restart will be processed twice — double-charging customers is a critical financial bug and regulatory liability.
+
+**Problem 2 (memory leak with no bound):** Even within a single process, `seen_events` grows monotonically. There's no TTL, no eviction strategy, and no bound on cardinality. Over time (especially if events are not deduplicated), this leaks memory.
+
+**Problem 3 (not concurrent-safe):** A plain `set` shared across async workers or Gunicorn threads has a race condition between `if event_id in seen` and `seen.add(event_id)` — two concurrent requests with the same event ID could both slip through.
+
+**Fix:** Use a persistent store (PostgreSQL with a unique constraint, Redis, or SQLite) with bounded retention. Enforce uniqueness at the database level (unique index on `event_id`).
+
+---
+
+### 3. Rotating Secrets With No Versioning Metadata
+
+A "rotating secret" implies multiple active keys, but without metadata attached to each event delivery indicating which key was used to sign it, the receiver cannot determine which secret to verify against. If only one secret is tried, either verification fails (breaking existing signed deliveries) or signing happens with the latest key while verification might try stale ones.
+
+**Fix:** Include a `key-id` header that identifies which secret was used. Maintain a versioned secret store keyed by `(key_id, active|expired)`. Rotate by creating a new key, publishing it as `active`, keeping old `active` keys for a grace period as `grace`, then retiring them to `expired`.
+
+---
+
+### 4. Processor Error Leakage
+
+If internal processing throws an exception (e.g., database error, validation failure), the raw error message propagates back to the third-party processor. This leaks stack traces, table names, connection strings, or internal business logic into an external-facing error response.
+
+**Fix:** Catch all exceptions in a dedicated error handler. Return a generic `"Webhook processing failed"` with status 500 so the processor retries, while logging the full details internally. Never echo exception messages to the client.
+
+---
+
+### 5. Missing Timing-Attack Protection on HMAC Verification
+
+Python's `hmac.compare_digest()` is timing-safe, but naive implementations using `==` on the computed vs. expected digest are vulnerable to byte-by-byte timing attacks that could let an attacker forge valid signatures one character at a time. Additionally, the `key-id` lookup should also be timing-safe when dealing with multiple possible keys.
+
+**Fix:** Always use `hmac.compare_digest()`. If iterating over multiple candidate secrets, use a constant-time comparison function that doesn't short-circuit based on position.
+
+---
+
+### 6. No Content-Type Enforcement
+
+Without checking `Content-Type: application/json` (and charset), an attacker could send a different content type that causes the signature verification to mismatch (the signature is over the raw body bytes). This creates ambiguity about what bytes were actually signed.
+
+**Fix:** Validate the `Content-Type` header before verification.
+
+---
+
+### 7. No Request-Body Size Limit
+
+Combined with vulnerability #1, accepting unlimited request bodies before authentication is a direct path to denial of service.
+
+**Fix:** Set an explicit `max_content_length` on the route and/or enforce at the middleware/starlette config level.
+
+---
+
+## Corrected Implementation
+
+```python
+"""
+payment_webhooks.py — Secure FastAPI payment webhook endpoint.
+
+Processes webhooks from a third-party payment processor with:
+- Pre-parse HMAC signature verification (timing-safe, key-versioned)
+- Persistent, unique-constrained event-id ledger for idempotency
+- Concurrent-safe idempotency enforcement via database-level locks
+- Generic error responses that never leak processor internals
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import secrets
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from enum import Enum
+from typing import Any
+
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from sqlalchemy import (
+    Column,
+    DateTime,
+    EventId,
+    Integer,
+    String,
+    Text,
+    create_engine,
+)
+from sqlalchemy.orm import declarative_base, Session
+
+# ---------------------------------------------------------------------------
+# Configuration — all from environment variables, never hardcoded
+# ---------------------------------------------------------------------------
+
+DATABASE_URL: str = os.environ["WEBHOOK_DATABASE_URL"]
+ALLOWED_MAX_BODY_SIZE: int = int(os.environ.get("WEBHOOK_MAX_BODY_BYTES", "65536"))  # 64 KB default
+
+
+class SecretState(str, Enum):
+    ACTIVE = "active"
+    GRACE = "grace"
+    EXPIRED = "expired"
+
+
+# ---------------------------------------------------------------------------
+# Secret Store — in-process cache backed by env vars for demo;
+# in production, replace with DB-backed lookup with graceful fallback.
+#
+# Expected env vars (one per key version):
+#   WEBHOOK_SECRET_KEY_ID_1  — the key ID label
+#   WEBHOOK_SECRET_VALUE_1   — the actual secret string
+#   WEBHOOK_SECRET_STATE_1   — active | grace | expired
+#   ... etc for additional rotations
+#
+# Production: fetch from a vault or KMS, keyed by (key_id, state).
+# ---------------------------------------------------------------------------
+
+_secret_cache: dict[str, tuple[str, SecretState]] = {}
+_secret_cache_loaded = False
+
+
+def _load_secrets() -> None:
+    """Load configured secrets from environment variables into the cache."""
+    global _secret_cache, _secret_cache_loaded
+    idx = 1
+    while True:
+        kid = os.environ.get(f"WEBHOOK_SECRET_KEY_ID_{idx}")
+        if kid is None:
+            break
+        value = os.environ.get(f"WEBHOOK_SECRET_VALUE_{idx}")
+        if value is None:
+            raise ValueError(
+                f"WEBHOOK_SECRET_KEY_ID_{idx} defined but "
+                f"WEBHOOK_SECRET_VALUE_{idx} is missing"
+            )
+        state_raw = os.environ.get(
+            f"WEBHOOK_SECRET_STATE_{idx}", "active"
+        ).lower()
+        try:
+            state = SecretState(state_raw)
+        except ValueError:
+            raise ValueError(
+                f"WEBHOOK_SECRET_STATE_{idx} must be active/grace/expired, "
+                f"got {state_raw!r}"
+            )
+        _secret_cache[kid] = (value, state)
+        idx += 1
+    _secret_cache_loaded = True
+
+
+def get_secret_for_key(key_id: str) -> str | None:
+    """Return the secret for *key_id* if active or in grace.
+
+    Returns ``None`` when the key has been retired — the caller should
+    reject the request rather than fall back to any other key.
+    """
+    entry = _secret_cache.get(key_id)
+    if entry is None:
+        return None
+    _, state = entry
+    if state not in (SecretState.ACTIVE, SecretState.GRACE):
+        return None
+    return entry[0]
+
+
+def verify_hmac(
+    *, payload_bytes: bytes, expected_signature: str, key_id: str
+) -> bool:
+    """Timing-safe HMAC-SHA256 verification against the correct rotating key."""
+    secret = get_secret_for_key(key_id)
+    if secret is None:
+        return False
+    computed = hmac.new(
+        secret.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(computed, expected_signature)
+
+
+# ---------------------------------------------------------------------------
+# Database models & engine
+# ---------------------------------------------------------------------------
+
+Base = declarative_base()
+
+
+class DeliveryEvent(Base):
+    """Persistent ledger of webhook deliveries.
+
+    The UNIQUE constraint on ``event_id`` guarantees idempotency even
+    under concurrent inserts — the second INSERT raises an integrity
+    error that we treat as "already processed."
+    """
+
+    __tablename__ = "webhook_delivery_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(
+        String(255), unique=True, nullable=False, index=True
+    )
+    processor_name = Column(String(100), nullable=False, default="unknown")
+    processed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    payload_snapshot = Column(Text, nullable=True)  # optional audit trail
+
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+)
+
+
+@asynccontextmanager
+async def db_session():
+    """Yield a SQLAlchemy session, ensuring cleanup."""
+    async with async_session_maker() as session:
+        yield session
+        await session.commit()
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# App factory & middleware
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+async def _enforce_body_size(request: Request, call_next):
+    """Starlette middleware: reject oversized bodies before parsing."""
+    if request.headers.get("content-length"):
+        try:
+            length = int(request.headers["content-length"])
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Content-Length header"},
+            )
+        if length > ALLOWED_MAX_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+    response = await call_next(request)
+    return response
+
+
+app = FastAPI(title="Payment Webhook Receiver")
+
+# Apply middleware stack
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class BodySizeMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.headers.get("content-length"):
+            try:
+                length = int(request.headers["content-length"])
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Invalid Content-Length header"},
+                )
+            if length > ALLOWED_MAX_BODY_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large"},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(BodySizeMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Core webhook handler
+# ---------------------------------------------------------------------------
+
+@app.post("/api/webhooks/payments")
+async def handle_payment_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Accept and process a payment processor webhook.
+
+    Flow (security-critical):
+      1. Validate Content-Type
+      2. Read raw body
+      3. Verify HMAC *before* any JSON parsing
+      4. Check for duplicate event_id in persistent ledger
+      5. Process the payload (background task for fire-and-forget)
+      6. Return 200 immediately if already acknowledged, or start processing
+      7. Catch ALL exceptions — never leak to client
+    """
+
+    # --- Step 1: Content-Type ------------------------------------------------
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="Unsupported Media Type")
+
+    # --- Step 2: Read raw body (size already checked by middleware) ------------
+    raw_body = await request.body()
+
+    # --- Step 3: Extract headers & verify HMAC --------------------------------
+    key_id = request.headers.get("x-webhook-key-id")
+    if not key_id:
+        raise HTTPException(status_code=401, detail="Missing x-webhook-key-id")
+
+    signature = request.headers.get("x-webhook-signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing x-webhook-signature")
+
+    if not verify_hmac(payload_bytes=raw_body, expected_signature=signature, key_id=key_id):
+        logger.warning("HMAC verification failed for key_id=%s from %s", key_id, request.client.host)
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # --- Step 4: Parse JSON *only after* authenticity confirmed ---------------
+    try:
+        import json
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.error("Failed to parse webhook JSON: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # --- Step 5: Extract event metadata ---------------------------------------
+    event_id = payload.get("event_id")
+    processor_name = payload.get("processor", "unknown")
+
+    if not event_id or not isinstance(event_id, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid event_id")
+
+    # --- Step 6: Idempotency — persistent ledger with unique constraint --------
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.exc import IntegrityError
+
+    try:
+        await _register_event(event_id=event_id, payload=payload, processor=processor_name)
+        newly_received = True
+    except DuplicateEventError:
+        newly_received = False
+
+    # --- Step 7: Route to processing ------------------------------------------
+    if newly_received:
+        # Fire-and-forget background processing
+        background_tasks.add_task(_process_webhook_payload, payload=payload, event_id=event_id)
+        # Acknowledge receipt immediately
+        return JSONResponse(status_code=202, content={"status": "accepted"})
+    else:
+        # Already processed — confirm so processor doesn't retry unnecessarily
+        return JSONResponse(status_code=200, content={"status": "already_processed"})
+
+
+class DuplicateEventError(Exception):
+    """Raised when an event_id is already recorded in the ledger."""
+
+
+async def _register_event(*, event_id: str, payload: dict, processor: str) -> None:
+    """Attempt to insert into the events table.
+
+    The UNIQUE constraint on ``event_id`` makes this concurrent-safe:
+    if another worker already inserted, PostgreSQL raises an integrity
+    error, which we translate to DuplicateEventError.
+    """
+    from sqlalchemy import text
+
+    # First, check whether the event already exists (fast path).
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT 1 FROM webhook_delivery_events WHERE event_id = :eid"),
+            {"eid": event_id},
+        )
+        if result.fetchone() is not None:
+            raise DuplicateEventError(f"Event {event_id!r} already in ledger")
+
+        # Insert with payload snapshot for audit trail.
+        await conn.execute(
+            text("""
+                INSERT INTO webhook_delivery_events (event_id, processor_name, processed_at, payload_snapshot)
+                VALUES (:eid, :proc, :ts, :pl)
+            """),
+            {
+                "eid": event_id,
+                "proc": processor,
+                "ts": datetime.now(timezone.utc),
+                "pl": _sanitise_payload_for_audit(payload),
+            },
+        )
+
+
+def _sanitise_payload_for_audit(payload: dict) -> str:
+    """Strip sensitive fields from payload before storing the audit snapshot."""
+    SENSITIVE_KEYS = {"card_number", "cvv", "full_card", "ssn", "password", "secret"}
+    sanitized = {k: v for k, v in payload.items() if k.lower() not in SENSITIVE_KEYS}
+    import json
+    return json.dumps(sanitized, default=str)
+
+
+async def _process_webhook_payload(payload: dict, event_id: str) -> None:
+    """Execute the actual payment processing logic.
+
+    This runs in a background thread — any exception here is caught
+    and logged without exposing details to the client.
+    """
+    try:
+        await _do_actual_processing(payload)
+    except Exception as exc:
+        # LOG FULL DETAILS server-side ONLY
+        logger.exception(
+            "Webhook processing failed for event %s: %s", event_id, exc
+        )
+        # TODO: send alert to ops team (PagerDuty, Sentry, etc.)
+        # NEVER re-raise — the client already received 202/200
+
+
+async def _do_actual_processing(payload: dict) -> None:
+    """Placeholder for real business logic."""
+    # e.g., update order status, charge customer, emit domain events
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Global startup hook — ensure tables exist, load secrets
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+def on_startup():
+    if not _secret_cache_loaded:
+        _load_secrets()
+    # Create tables if they don't exist (dev convenience — use migrations in prod)
+    Base.metadata.create_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Global exception handler — prevents error leakage
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def universal_exception_handler(request: Request, exc: Exception):
+    """Catches anything the route handlers didn't catch.
+
+    Guarantees that no stack trace, internal message, or SQL error
+    leaks back to the payment processor.
+    """
+    logger.exception("Unhandled error in webhook handler: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI helper — rotate secrets safely
+# ---------------------------------------------------------------------------
+
+def rotate_webhook_secret(new_key_id: str) -> None:
+    """Print out instructions for rotating the HMAC secret.
+
+    Production systems would write to a vault, trigger a CI job, or
+    invoke the provider's API. Here we document the env-var changes.
+    """
+    print(
+        f"""
+=== Webhook Secret Rotation Steps ===
+
+1. Generate a new cryptographically random secret:
+   openssl rand -hex 32
+
+2. Add the new secret as the next indexed env var:
+   export WEBHOOK_SECRET_KEY_ID_{new_key_id}=...
+   export WEBHOOK_SECRET_VALUE_{new_key_id}=...
+   export WEBHOOK_SECRET_STATE_{new_key_id}=active
+
+3. Change the PREVIOUS active key to 'grace' state:
+   export WEBHOOK_SECRET_STATE_<prev_idx>=grace
+
+4. Deploy. Old webhooks signed with the grace-period key still verify.
+
+5. After 7 days (or after confirming all old keys are retired):
+   export WEBHOOK_SECRET_STATE_<prev_idx>=expired
+
+6. Clean up expired entries from .env / secret manager.
+"""
+    )
+```
+
+---
+
+## Key Security Decisions Summarized
+
+| Concern | How It's Addressed |
+|---|---|
+| **DoS via pre-auth parsing** | Raw body read → HMAC verified → JSON parsed *only after* authentication |
+| **In-memory replay tracking** | Persistent PostgreSQL table with `UNIQUE(event_id)` constraint — survives restarts |
+| **Concurrent dedup races** | Database-level unique index is atomic; duplicate inserts fail at isolation level |
+| **Rotating secrets** | `x-webhook-key-id` header + versioned secret store with `active/grace/expired` lifecycle |
+| **Timing attacks** | `hmac.compare_digest()` for constant-time comparison throughout |
+| **Error leakage** | Dedicated `universal_exception_handler` + background task catches + generic `detail` field |
+| **Body size abuse** | Middleware rejects >64 KB (configurable via `WEBHOOK_MAX_BODY_BYTES`) |
+| **Content-Type spoofing** | Strict check for `application/json` before processing |
+| **Sensitive data in logs/snapshots** | `_sanitise_payload_for_audit()` strips card/CVV/SSN columns; error handler returns only `"Internal server error"` |

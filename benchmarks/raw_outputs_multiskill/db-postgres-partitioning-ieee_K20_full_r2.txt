@@ -1,0 +1,324 @@
+I'll design a comprehensive zero-downtime partitioning migration for your 500M-row audit_logs table.
+
+## Strategy Overview
+
+The approach uses the expand-contract pattern: create a partitioned shadow table, backfill concurrently in batches, then swap tables with a brief lock.
+
+## 1. DDL — Partitioned Table Schema
+
+```sql
+-- Step 1: Create the new partitioned table structure
+-- Using declarative range partitioning on a timestamp column (assumed: created_at)
+
+CREATE TABLE audit_logs_new (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    org_id      bigint NOT NULL,
+    user_id     bigint,
+    action      text NOT NULL,
+    resource    text,
+    metadata    jsonb DEFAULT '{}',
+    ip_address  inet,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_logs_new_pkey PRIMARY KEY (id, created_at)  -- partition key in PK
+) PARTITION BY RANGE (created_at);
+
+-- Create partitions for historical data (monthly)
+-- Backfill from earliest data to current month
+CREATE TABLE audit_logs_new_2023_01 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2023-01-01') TO ('2023-02-01');
+CREATE TABLE audit_logs_new_2023_02 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2023-02-01') TO ('2023-03-01');
+-- ... continue for each month ...
+CREATE TABLE audit_logs_new_2026_09 PARTITION OF audit_logs_new
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+-- Create default partition to catch anything outside defined ranges (safety net)
+CREATE TABLE audit_logs_new_default PARTITION OF audit_logs_new DEFAULT;
+
+-- Indexes — created concurrently on each partition to avoid locking
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_2023_01_org_id ON audit_logs_new_2023_01 (org_id, created_at);
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_2023_01_user_id ON audit_logs_new_2023_01 (user_id, created_at);
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_2023_01_action ON audit_logs_new_2023_01 (action, created_at);
+-- Repeat for each partition...
+
+-- GIN index for metadata queries (on parent — auto-applies to partitions)
+CREATE INDEX CONCURRENTLY idx_audit_logs_new_metadata ON audit_logs_new USING gin (metadata);
+```
+
+## 2. Concurrent Backfill Script
+
+```sql
+-- scripts/backfill_audit_logs.sql
+-- Run via: psql -f scripts/backfill_audit_logs.sql -v batch_size=10000
+
+\set lock_timeout '2s'
+\set statement_timeout '30s'
+
+DO $$
+DECLARE
+    v_batch_size  int := (:batch_size)::int;
+    v_min_id      bigint;
+    v_max_id      bigint;
+    v_last_id     bigint := 0;
+    v_rows        int;
+    v_total       int := 0;
+    v_start       timestamptz;
+BEGIN
+    -- Get the ID range for the source table
+    SELECT min(id), max(id) INTO v_min_id, v_max_id FROM audit_logs;
+    
+    RAISE NOTICE 'Backfill range: % to %', v_min_id, v_max_id;
+    v_start := clock_timestamp();
+
+    LOOP
+        -- Batch insert with skip-locked to avoid blocking concurrent writes
+        INSERT INTO audit_logs_new (id, org_id, user_id, action, resource, metadata, ip_address, created_at)
+        SELECT id, org_id, user_id, action, resource, metadata, ip_address, created_at
+        FROM audit_logs
+        WHERE id > v_last_id
+          AND id <= v_last_id + v_batch_size
+        ORDER BY id
+        ON CONFLICT (id, created_at) DO NOTHING;
+        
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+        v_total := v_total + v_rows;
+        
+        -- Move cursor forward
+        SELECT max(id) INTO v_last_id FROM audit_logs_new;
+        
+        -- Progress reporting every 100 batches
+        IF v_total % (v_batch_size * 100) = 0 THEN
+            RAISE NOTICE 'Progress: % rows in %, rate: % rows/sec',
+                v_total,
+                clock_timestamp() - v_start,
+                round(v_total::numeric / extract(epoch from (clock_timestamp() - v_start)), 1);
+        END IF;
+
+        -- Commit and brief pause to let other transactions through
+        COMMIT;
+        PERFORM pg_sleep(0.05);  -- 50ms breather between batches
+
+        EXIT WHEN v_rows = 0 OR v_last_id >= v_max_id;
+    END LOOP;
+
+    RAISE NOTICE 'Backfill complete: % rows in %', v_total, clock_timestamp() - v_start;
+END $$;
+```
+
+Shell wrapper for running the backfill with monitoring:
+
+```bash
+#!/bin/bash
+# scripts/run_backfill_v2.sh
+set -euo pipefail
+
+BATCH_SIZE="${BATCH_SIZE:-10000}"
+DB_URL="${DATABASE_URL:-postgres://localhost:5432/app}"
+LOG_FILE="backfill_$(date +%Y%m%d_%H%M%S).log"
+
+echo "Starting backfill with batch_size=$BATCH_SIZE"
+echo "Logging to $LOG_FILE"
+
+psql "$DB_URL" \
+    -v "batch_size=$BATCH_SIZE" \
+    -f scripts/backfill_audit_logs.sql \
+    -P pager=off 2>&1 | tee "$LOG_FILE"
+
+# Verify counts match
+psql "$DB_URL" -t -A -c "
+SELECT 'source=' || count(*) FROM audit_logs
+UNION ALL
+SELECT 'target=' || count(*) FROM audit_logs_new;
+"
+```
+
+## 3. Real-Time Sync (CDC During Backfill)
+
+Since the table is live, new rows arrive during backfill. Use a trigger-based approach:
+
+```sql
+-- Step 2a: Create trigger to dual-write during migration
+CREATE OR REPLACE FUNCTION audit_logs_sync_fn()
+RETURNS trigger AS $$
+BEGIN
+    INSERT INTO audit_logs_new (org_id, user_id, action, resource, metadata, ip_address, created_at)
+    VALUES (NEW.org_id, NEW.user_id, NEW.action, NEW.resource, NEW.metadata, NEW.ip_address, NEW.created_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger AFTER backfill starts, BEFORE table swap
+CREATE TRIGGER audit_logs_sync
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION audit_logs_sync_fn();
+```
+
+## 4. Table Swap (Minimal Downtime)
+
+```sql
+-- Step 3: Atomic swap — brief metadata lock only (~1-2 seconds)
+BEGIN;
+    -- Acquire brief locks on both tables
+    LOCK TABLE audit_logs IN ACCESS EXCHANGE MODE;
+    LOCK TABLE audit_logs_new IN ACCESS EXCHANGE MODE;
+    
+    -- Rename tables atomically
+    ALTER TABLE audit_logs RENAME TO audit_logs_old;
+    ALTER TABLE audit_logs_new RENAME TO audit_logs;
+COMMIT;
+
+-- Drop the sync trigger (no longer needed)
+DROP TRIGGER audit_logs_sync ON audit_logs_old;
+DROP FUNCTION audit_logs_sync_fn;
+
+-- Verify counts
+SELECT 'old=' || count(*) FROM audit_logs_old
+UNION ALL
+SELECT 'new=' || count(*) FROM audit_logs;
+
+-- Drop old table ONLY after validation period (e.g., 7 days)
+-- DROP TABLE audit_logs_old;
+```
+
+## 5. Partition Pruning Verification
+
+```sql
+-- Verify partition pruning is working correctly
+-- Each query should show "Subplans Removed" or only scan relevant partitions
+
+-- Test 1: Single month query
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT count(*) FROM audit_logs
+WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01';
+-- Expected: Only scan audit_logs_2026_08 partition
+
+-- Test 2: Range spanning 3 months
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT org_id, action, count(*) FROM audit_logs
+WHERE created_at >= '2026-06-01' AND created_at < '2026-09-01'
+GROUP BY org_id, action;
+-- Expected: Scan only 2026_06, 2026_07, 2026_08 partitions
+
+-- Test 3: Single day (common query pattern)
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM audit_logs
+WHERE created_at >= '2026-08-15' AND created_at < '2026-08-16'
+  AND org_id = 12345;
+-- Expected: Single partition + index scan
+
+-- Test 4: Verify no default partition hits (should be empty)
+EXPLAIN (ANALYZE)
+SELECT count(*) FROM audit_logs DEFAULT partition;
+-- Expected: 0 rows scanned
+
+-- Partition pruning check function
+CREATE OR REPLACE FUNCTION verify_partition_pruning(
+    p_query text,
+    p_expected_partitions int
+) RETURNS boolean AS $$
+DECLARE
+    v_actual int;
+    v_plan text;
+BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || p_query INTO v_plan;
+    -- Count actual partitions scanned from plan
+    SELECT count(*) INTO v_actual
+    FROM json_array_elements(v_plan->0->'Plan'->'Plans')
+    WHERE ->>'Node Type' = 'Seq Scan'
+      AND ->>'Relation Name' LIKE 'audit_logs_%';
+    
+    RETURN v_actual <= p_expected_partitions;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## 6. pg_partman Automated Partition Management
+
+```sql
+-- Install pg_partman if not present
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+
+-- Configure automatic future partition creation
+SELECT partman.create_parent(
+    p_parent_table := 'public.audit_logs',
+    p_control := 'created_at',
+    p_type := 'range',
+    p_interval := '1 month',
+    p_premake := 3,           -- Create 3 months ahead
+    p_start_partition := '2023-01-01'
+);
+
+-- Verify configuration
+SELECT * FROM partman.part_config;
+
+-- Scheduled maintenance (run via pg_cron or external scheduler)
+-- Pre-create upcoming partitions
+UPDATE partman.part_config SET premake = 4 WHERE parent_table = 'public.audit_logs';
+
+-- Maintenance job: run daily
+SELECT partman.run_maintenance(p_analyze := true, p_jobmon := true);
+
+-- OR use pg_cron for scheduling
+SELECT cron.schedule('audit-logs-maintenance', '0 2 * * *', $$
+    SELECT partman.run_maintenance('public.audit_logs');
+$$);
+
+-- Optional: Retention policy — drop partitions older than N months
+-- WARNING: Test thoroughly before enabling in production
+UPDATE partman.part_config
+SET retention = '12 months',
+    retention_keep_table = false,    -- actually drop, not just detach
+    retention_keep_index = false
+WHERE parent_table = 'public.audit_logs';
+```
+
+## 7. Monitoring & Validation Queries
+
+```sql
+-- Partition size overview
+SELECT
+    schemaname || '.' || tablename AS partition_name,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+    n_live_tup AS row_count,
+    last_vacuum,
+    last_analyze
+FROM pg_stat_user_tables
+WHERE tablename LIKE 'audit_logs_%'
+ORDER BY tablename;
+
+-- Check for gaps or overlapping partitions (should return 0 rows)
+WITH partition_ranges AS (
+    SELECT
+        c.relname AS partition_name,
+        pg_get_expr(c.relpartbound, c.oid) AS range_expr
+    FROM pg_class c
+    JOIN pg_inherits i ON c.oid = i.inhrelid
+    WHERE i.inhparent = 'audit_logs'::regclass
+)
+SELECT * FROM partition_ranges
+WHERE range_expr NOT LIKE 'FOR VALUES FROM%';
+
+-- Lock monitoring during backfill
+SELECT pid, state, query_start, wait_event_type, wait_event, left(query, 100)
+FROM pg_stat_activity
+WHERE query LIKE '%audit_logs%'
+  AND state = 'active'
+ORDER BY query_start;
+```
+
+## Migration Timeline
+
+```
+Hour 0:   Create partitioned table + historical partitions (no locks)
+Hour 1:   Create indexes CONCURRENTLY (~30-60 min, non-blocking)
+Hour 2:   Start batched backfill (runs for hours, throttled)
+Hour 2-8: Backfill runs with pg_sleep breathers
+Hour 8:   Attach dual-write trigger for real-time sync
+Hour 8.5: Catch-up backfill (fast — only missed delta rows)
+Hour 9:   Count verification
+Hour 9.1: Atomic table swap (~1-2 second lock)
+Hour 9.2: Drop sync trigger
+Day 7:    Drop old table after validation period
+```
+
+The swap itself takes 1-2 seconds of exclusive lock. Everything else runs concurrently without blocking production traffic.

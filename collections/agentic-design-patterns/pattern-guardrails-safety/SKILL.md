@@ -1,6 +1,6 @@
 ---
 name: pattern-guardrails-safety
-description: Establish multi-layered defensive shields: input sanitization, prompt injection detection, PII masking, schema gates, and egress filters.
+description: "Establish multi-layered defensive shields: input sanitization, prompt injection detection, PII masking, schema gates, and egress filters."
 metadata:
   category: agent-architecture
   tier: enterprise

@@ -1,0 +1,817 @@
+[exit=0 latency=131.85s]
+Here's my complete security analysis of the four vulnerabilities in your Django multi-tenant REST application. I'll cover each issue with its CWE classification, exploit demonstration, and hardened fix.
+
+---
+
+## 1. SQL Injection via f-string in `cursor.execute()`
+
+**CWE:89 (SQL Injection)**
+
+### The Vulnerable Code
+
+```python
+# views.py or reports/models.py — TERRIBLE PATTERN
+from django.db import connection
+
+def get_report_data(tenant_id, start_date, end_date):
+    # NEVER do this
+    query = f"""
+        SELECT id, amount, status
+        FROM reports_transaction
+        WHERE tenant_id = {tenant_id}
+          AND created_at BETWEEN '{start_date}' AND '{end_date}'
+        ORDER BY created_at DESC
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query)
+        return cursor.fetchall()
+```
+
+### How It's Exploited
+
+A malicious client sends `tenant_id` as:
+
+```json
+{ "tenant_id": "1 OR 1=1 --", "start_date": "2024-01-01", "end_date": "2026-12-31" }
+```
+
+The resulting query becomes:
+
+```sql
+SELECT id, amount, status
+FROM reports_transaction
+WHERE tenant_id = 1 OR 1=1 --
+  AND created_at BETWEEN '2024-01-01' AND '2026-12-31'
+ORDER BY created_at DESC
+```
+
+This returns **every row in the table**, bypassing tenant isolation entirely. An attacker can also use `UNION`-based injection to extract data from unrelated tables like `auth_user`, or use time-based blind injection to exfiltrate column names.
+
+### The Fix
+
+```python
+# reports/views.py — HARDENED
+from django.db import connection, OperationalError
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+
+
+class ReportDataView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # Validate types FIRST — integers must be integers
+        try:
+            tenant_id = int(request.query_params.get('tenant_id'))
+            start_date = request.query_params.get('start_date')
+            end_date = request.query_params.get('end_date')
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Invalid parameters"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not (start_date and end_date):
+            return Response(
+                {"error": "start_date and end_date are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Use parameterized queries — the ONLY way to safely use raw SQL
+        query = """
+            SELECT id, amount, status
+            FROM reports_transaction
+            WHERE tenant_id = %s
+              AND created_at >= %s
+              AND created_at <= %s
+            ORDER BY created_at DESC
+        """
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query, [tenant_id, start_date, end_date])
+                rows = cursor.fetchall()
+        except OperationalError as e:
+            # Log but don't leak internal error details
+            self._log_security_event(request, "query_error", str(e))
+            return Response(
+                {"error": "Internal query failure"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # Map column names to values for readable output
+        columns = [desc[0] for desc in cursor.description]
+        results = [dict(zip(columns, row)) for row in rows]
+
+        return Response({"data": results}, status=status.HTTP_200_OK)
+
+    def _log_security_event(self, request, event_type, detail):
+        """Log security-relevant events for monitoring."""
+        import logging
+        logger = logging.getLogger('security')
+        logger.warning(
+            "Security event: %s | user=%s | ip=%s | detail=%s",
+            event_type,
+            request.user.username,
+            self._get_client_ip(request),
+            detail,
+        )
+
+    @staticmethod
+    def _get_client_ip(request):
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return request.META.get('REMOTE_ADDR', 'unknown')
+```
+
+**Prefer ORM over raw SQL where possible:**
+
+```python
+# Even better — skip raw SQL entirely
+from reports.models import Transaction
+
+def get_report_data_orm(tenant_id, start_date, end_date):
+    return list(
+        Transaction.objects.filter(
+            tenant_id=tenant_id,
+            created_at__gte=start_date,
+            created_at__lte=end_date,
+        ).values('id', 'amount', 'status').order_by('-created_at')
+    )
+```
+
+---
+
+## 2. Client-Side Object-Level Authorization Only
+
+**CWE:285 (Improper Authorization) / CWE:862 (Missing Authorization)**
+
+### The Vulnerable Code
+
+```python
+# Frontend only (React/TypeScript) — ZERO server-side checks
+// components/ReportDashboard.tsx
+async function loadReport(reportId) {
+  // THE USER TELLS US WHAT TO LOAD
+  const res = await fetch(`/api/reports/${reportId}/data`);
+  return res.json();
+}
+
+// Server view has NO object-level permission check
+# reports/views.py
+class ReportDetailView(APIView):
+    permission_classes = [IsAuthenticated]  # ← Only checks "is logged in?"
+
+    def get(self, request, pk):
+        report = Report.objects.get(pk=pk)  # No ownership check!
+        # ANY authenticated user can access ANY report
+        serializer = ReportSerializer(report)
+        return Response(serializer.data)
+```
+
+### How It's Exploited
+
+Alice logs in and gets her reports: `/api/reports/?owner_me=true`. Bob discovers that changing the ID exposes other organizations' data:
+
+```
+GET /api/reports/42/data      → Alice's report (fine)
+GET /api/reports/43/data      → Bob sees Carol's report
+GET /api/reports/99999/data   → Bob sees sensitive financial data
+```
+
+There is no server-side boundary enforcement. CSRF tokens protect against cross-site requests, but any authenticated session — including one compromised by XSS — can enumerate all resources.
+
+### The Fix
+
+```python
+# reports/permissions.py — OBJECT-LEVEL AUTHORIZATION
+from rest_framework.permissions import BasePermission
+from rest_framework.exceptions import NotFound, PermissionDenied
+
+
+class IsTenantMember(BasePermission):
+    """
+    Allow access only if the requesting user is a member of the tenant
+    associated with the requested object. Works for nested lookups
+    (e.g., /api/tenants/<t>/reports/<r>) and direct FK lookups.
+    """
+    message = "You do not have access to this resource."
+
+    def has_object_permission(self, request, view, obj):
+        # Strategy A: obj has a .tenant attribute pointing to Tenant model
+        if hasattr(obj, 'tenant'):
+            return request.user.tenants.filter(id=obj.tenant_id).exists()
+
+        # Strategy B: obj has a foreign key that traverses to a tenant
+        #   e.g., Report.organization.tenant
+        related_tenant_field = getattr(view, '_related_tenant_field', None)
+        if related_tenant_field:
+            try:
+                tenant_id = self._resolve_tenant_id(obj, related_tenant_field)
+                return request.user.tenants.filter(id=tenant_id).exists()
+            except (AttributeError, ObjectDoesNotExist):
+                raise NotFound()
+
+        # Fallback: deny by default if we can't determine tenant membership
+        return False
+
+    @staticmethod
+    def _resolve_tenant_id(obj, field_path):
+        """Walk a dotted field path like 'organization.tenant'."""
+        current = obj
+        for field_name in field_path.split('.'):
+            field = current._meta.get_field(field_name)
+            if field.is_relation:
+                current = getattr(current, field_name + '_id')
+            else:
+                current = getattr(current, field_name)
+        return current
+
+
+class IsReportOwnerOrTenantMember(BasePermission):
+    """Allow if the user owns the report OR is a member of its tenant."""
+
+    def has_object_permission(self, request, view, obj):
+        if hasattr(obj, 'owner') and obj.owner == request.user:
+            return True
+        # Delegate remaining check to IsTenantMember
+        return IsTenantMember().has_object_permission(request, view, obj)
+```
+
+```python
+# reports/views.py — SERVER-SIDE CHECKS
+from rest_framework.exceptions import NotFound
+from .permissions import IsTenantMember
+
+
+class ReportDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsTenantMember]
+
+    def get_queryset(self):
+        """
+        Scope queryset to tenant members immediately — this prevents
+        even fetching objects outside the user's scope.
+        """
+        return Report.objects.filter(
+            tenant__in=self.request.user.tenants.all()
+        )
+
+    def get_object(self):
+        """Override DRF's get_object to enforce tenant scoping."""
+        try:
+            return self.get_queryset().get(pk=self.kwargs['pk'])
+        except Report.DoesNotExist:
+            # Don't distinguish "not found" vs "access denied" — 
+            # same response for both to avoid info leakage
+            raise NotFound(detail="Report not found")
+
+    def get(self, request, pk):
+        report = self.get_object()  # Server-side check happens HERE
+        serializer = ReportSerializer(report)
+        return Response(serializer.data)
+```
+
+**Add these settings to `settings.py`:**
+
+```python
+# Enforce safe URL pattern lookup behavior
+REST_FRAMEWORK = {
+    ...
+    'DEFAULT_FILTER_BACKENDS': [
+        'django_filters.rest_framework.DjangoFilterBackend',
+        'rest_framework.filters.SearchFilter',
+    ],
+    'SEARCH_PARAM': 'search',
+}
+
+# Optional: Add audit logging for all object accesses
+MIDDLEWARE = [
+    ...
+    'myapp.middleware.SecurityAuditMiddleware',
+]
+```
+
+```python
+# myapp/middleware/security_audit.py
+import logging
+
+logger = logging.getLogger('audit.object_access')
+
+class SecurityAuditMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        # Log unauthorized access attempts
+        if response.status_code == 403 and hasattr(request, 'user'):
+            logger.warning(
+                "ACCESS_DENIED user=%s path=%s method=%s ip=%s",
+                getattr(request.user, 'username', 'anonymous'),
+                request.path,
+                request.method,
+                request.META.get('REMOTE_ADDR'),
+            )
+        return response
+```
+
+---
+
+## 3. Hardcoded Secrets in Settings Committed to Git
+
+**CWE:798 (Use of Hard-coded Credentials) / CWE:321 (Use of Hard-coded Password)**
+
+### The Vulnerable Code
+
+```python
+# settings.py — SECRET KEY EXPOSED IN REPOSITORY
+import os
+
+SECRET_KEY = 'django-insecure-x7$kz@9p2m#nq&w5^h+1b8fj$r3ytcvua_!l@o7$*qzs6^n4k'
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'production_db',
+        'USER': 'admin',
+        'PASSWORD': 'SuperSecretPassword123!',     # ← hardcoded credential
+        'HOST': 'db.example.com',
+        'PORT': '5432',
+    }
+}
+
+AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'
+AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+
+REDIS_URL = 'redis://:redis_password_123@cache.example.com:6379/0'
+```
+
+### How It's Exploited
+
+Once committed, every clone of the repository (public or private) has full access:
+
+```bash
+# Search GitHub/GitLab for the string — it's indexed within minutes
+git log --all --source --full-history -S "SuperSecretPassword123!"
+
+# Or simply browse the repo and open settings.py
+cat settings.py | grep PASSWORD
+```
+
+With the database password, an attacker connects directly and exfiltrates or drops the database. With AWS keys, they spin up instances in your account (`credential mining`). With the JWT signing key, they forge arbitrary admin tokens.
+
+### The Fix
+
+```python
+# config/settings/base.py — never contains secrets
+import os
+from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+
+def env(key, default=None, require=False):
+    """
+    Read an environment variable. Raise ImproperlyConfigured if
+    require=True and the variable is missing. This fails FAST at
+    startup rather than introducing subtle runtime bugs.
+    """
+    value = os.environ.get(key, default)
+    if require and value is None:
+        raise ImproperlyConfigured(
+            f"Environment variable '{key}' is required but not set. "
+            f"Set it before starting the application."
+        )
+    return value
+
+
+def secret(key):
+    """Convenience wrapper for mandatory secret values."""
+    return env(key, require=True)
+
+
+# ---------------------------------------------------------------------------
+# Core Django settings — loaded from environment only
+# ---------------------------------------------------------------------------
+SECRET_KEY = secret('DJANGO_SECRET_KEY')
+
+DEBUG = env('DJANGO_DEBUG', 'false').lower() == 'true'  # Default OFF
+
+ALLOWED_HOSTS = env('DJANGO_ALLOWED_HOSTS', '*').split(',')
+
+# ---------------------------------------------------------------------------
+# Database — credentials from environment variables
+# ---------------------------------------------------------------------------
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': env('DB_NAME', 'app_db'),
+        'USER': env('DB_USER', 'app_user'),
+        'PASSWORD': secret('DB_PASSWORD'),
+        'HOST': env('DB_HOST', 'localhost'),
+        'PORT': env('DB_PORT', '5432'),
+        'CONN_MAX_AGE': 60,  # Persistent connections
+        'CONN_HEALTH_CHECKS': True,
+        'OPTIONS': {
+            # Enforce SSL for production connections
+            'sslmode': env('DB_SSL_MODE', 'prefer'),
+        },
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Redis / Cache
+# ---------------------------------------------------------------------------
+REDIS_URL = secret('REDIS_URL')
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': REDIS_URL,
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        },
+    }
+}
+
+# ---------------------------------------------------------------------------
+# AWS / S3 — for media storage
+# ---------------------------------------------------------------------------
+AWS_ACCESS_KEY_ID = secret('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = secret('AWS_SECRET_ACCESS_KEY')
+AWS_STORAGE_BUCKET_NAME = env('AWS_STORAGE_BUCKET_NAME', '')
+```
+
+**Create `.env.example` (committed to git — safe):**
+
+```bash
+# .env.example — TEMPLATE only, DO NOT fill with real secrets
+DJANGO_SECRET_KEY=change-me-when-deploying
+DJANGO_DEBUG=false
+DB_NAME=your_db_name
+DB_USER=your_db_user
+DB_PASSWORD=change-me-when-deploying
+DB_HOST=localhost
+DB_PORT=5432
+DB_SSL_MODE=require
+REDIS_URL=redis://localhost:6379/0
+AWS_ACCESS_KEY_ID=change-me
+AWS_SECRET_ACCESS_KEY=change-me
+AWS_STORAGE_BUCKET_NAME=change-me
+```
+
+**Commit `.env` to `.gitignore`:**
+
+```gitignore
+# .gitignore
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+venv/
+```
+
+**For CI/CD and orchestration (HashiCorp Vault recommended):**
+
+```python
+# config/settings/vault_backend.py — reads from HashiCorp Vault
+import hvac
+
+VAULT_ADDR = env('VAULT_ADDR', 'https://vault.example.com')
+VAULT_ROLE_ID = env('VAULT_ROLE_ID')
+VAULT_SECRET_ID = env('VAULT_SECRET_ID')
+
+
+def get_vault_secret(path):
+    """Fetch a secret from HashiCorp Vault's KV v2 engine."""
+    client = hvac.Client(url=VAULT_ADDR)
+    client.auth.approle.login(
+        role_id=VAULT_ROLE_ID,
+        secret_id=VAULT_SECRET_ID,
+    )
+    secret = client.secrets.kv.v2.read_secret_version(path=path)
+    return secret['data']['data']
+
+
+# Usage example:
+# SECRET_KEY = get_vault_secret('secret/myapp/django')['SECRET_KEY']
+```
+
+**Run a pre-commit hook to catch secrets before they're committed:**
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/securefocus/git-secrets
+    rev: ''
+    hooks:
+      - id: git-secrets
+
+  - repo: https://github.com/zricethevamp/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+```
+
+```ini
+# .git-blame-ignore-revs (optional: ignore bulk-format commits)
+# Not a security control — just history hygiene
+```
+
+---
+
+## 4. Mass-Assignment Serializer Without Field Whitelisting
+
+**CWE:915 (Improperly Controlled Modification of Dynamically-Determined Object Attributes) / CVE-style mass assignment vulnerability**
+
+### The Vulnerable Code
+
+```python
+# reports/serializers.py — NOTHING IS BLOCKED
+from rest_framework import serializers
+from reports.models import Report
+
+
+class ReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Report
+        fields = '__all__'      # ← SERIALIZES EVERY FIELD INCLUDING sensitive ones
+        read_only_fields = []    # ← nothing is read-only
+
+    # User can set `is_staff`, `role`, `is_superuser` through the report
+    # endpoint because they all get serialized:
+    # {"title": "...", "is_staff": true, "role": "admin", ...}
+```
+
+```python
+# views.py — accepts unfiltered input directly into model.save()
+class ReportCreateView(CreateAPIView):
+    serializer_class = ReportSerializer
+    # No extra filtering — client controls ALL model fields
+
+# POST /api/reports/
+# {
+#     "title": "My Report",
+#     "description": "...",
+#     "is_staff": true,       # ← elevates user privileges
+#     "role": "admin",        # ← sets arbitrary role
+#     "owner": 999,           # ← takes ownership of another user's data
+#     "tenant": 1,            # ← forces placement in privileged tenant
+#     "is_published": true,
+#     "content": "<script>alert('xss')</script>"  # ← stored XSS vector
+# }
+```
+
+```python
+# models.py — shows what fields are exposed beyond expectations
+class Report(models.Model):
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reports')
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    is_staff = models.BooleanField(default=False)       # ← privilege flag!
+    role = models.CharField(max_length=50, default='viewer')  # ← role escalation!
+    is_published = models.BooleanField(default=False)
+    content = models.TextField()                         # ← XSS-storable HTML
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+```
+
+### How It's Exploited
+
+An attacker crafts a JSON payload hitting the report creation endpoint:
+
+```http
+POST /api/reports/ HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <valid_token>
+Content-Type: application/json
+
+{
+    "title": "Privileged Report",
+    "description": "I now own this",
+    "is_staff": true,
+    "role": "superadmin",
+    "owner": 1,
+    "tenant": 1,
+    "is_published": true
+}
+```
+
+This creates a report owned by user ID 1 with `is_staff=True` and `role=superadmin`. In a Django app, if the report model intersects with the user profile or admin panel, the attacker may gain administrative access. Even without privilege escalation, they can overwrite critical metadata.
+
+### The Fix
+
+```python
+# reports/permissions.py — write permissions for serialization
+from rest_framework import permissions
+
+
+class IsOwnerOfReport(permissions.BasePermission):
+    """Prevent users from setting owner to someone else."""
+
+    def has_permission(self, request, view):
+        if request.method not in ('POST', 'PATCH'):
+            return True
+        # Allow read operations; block writes only for owner manipulation
+        if request.data.get('owner') is not None and request.method != 'POST':
+            return False
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        return obj.owner == request.user
+```
+
+```python
+# reports/serializers.py — STRICT WHITELISTING
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from reports.models import Report
+
+User = get_user_model()
+
+
+class ReportListSerializer(serializers.ModelSerializer):
+    """Read-only list view — minimal fields."""
+
+    class Meta:
+        model = Report
+        fields = ('id', 'title', 'description', 'is_published', 'created_at')
+        read_only_fields = fields
+
+
+class ReportDetailSerializer(serializers.ModelSerializer):
+    """Read-write detail view — includes computed fields, excludes internals."""
+    owner_username = serializers.CharField(
+        source='owner.username', read_only=True
+    )
+
+    class Meta:
+        model = Report
+        # Whitelist: ONLY fields the client should see/set
+        fields = (
+            'id',
+            'title',
+            'description',
+            'is_published',
+            'owner_username',
+            'created_at',
+            'updated_at',
+        )
+        # Every listed field above is explicitly allowed
+        read_only_fields = ('id', 'owner_username', 'created_at', 'updated_at')
+
+
+class ReportCreateSerializer(serializers.ModelSerializer):
+    """
+    Create-only serializer with maximum validation and zero mass assignment risk.
+    
+    SECURITY NOTES:
+    - owner, tenant, is_staff, role are NEVER accepted from client input
+    - These are set server-side based on authentication context
+    - Content is validated against XSS patterns
+    """
+    # Explicit field whitelist — anything NOT listed cannot be submitted
+    title = serializers.CharField(max_length=255, trim_whitespace=True)
+    description = serializers.CharField(
+        max_length=5000,
+        allow_blank=True,
+        strip_html_tags=False,  # See custom validate below
+    )
+    is_published = serializers.BooleanField(default=False)
+    content = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = Report
+        # ONLY these four fields can be set by the client
+        fields = ('title', 'description', 'is_published', 'content')
+
+    def validate_title(self, value):
+        """Sanitize title input."""
+        value = value.strip()
+        if len(value) < 1 or len(value) > 255:
+            raise serializers.ValidationError("Title must be 1-255 characters.")
+        return value
+
+    def validate_content(self, value):
+        """Block script tags and event handlers to prevent stored XSS."""
+        if value:
+            # Block common XSS vectors
+            dangerous_patterns = [
+                '<script', 'onerror=', 'onload=', 'javascript:',
+                'onmouseover=', 'onclick=', 'eval(', 'document.cookie',
+            ]
+            value_lower = value.lower()
+            for pattern in dangerous_patterns:
+                if pattern in value_lower:
+                    raise serializers.ValidationError(
+                        f"Content contains blocked pattern: {pattern}"
+                    )
+        return value
+
+    def validate_is_published(self, value):
+        """Only draft (False) can be set by clients."""
+        if value:
+            raise serializers.ValidationError(
+                "Users cannot publish reports directly. Contact an administrator."
+            )
+        return False
+
+    def create(self, validated_data):
+        """
+        CRITICAL: Set sensitive fields server-side, not from client input.
+        This is the anti-mass-assignment guarantee.
+        """
+        request = self.context.get('request')
+        if request is None:
+            raise serializers.ValidationError(
+                "Request context is required."
+            )
+
+        # Owner is ALWAYS the authenticated user — never from request body
+        validated_data['owner'] = request.user
+
+        # Tenant comes from the URL path, not the body
+        tenant_id = self.context.get('tenant_id')
+        if not tenant_id:
+            raise serializers.ValidationError(
+                "Tenant context is required (provide in URL)."
+            )
+
+        # is_staff/role are NEVER touched — they remain their defaults
+        # (False / 'viewer' as defined in the model)
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        """Same principle: never let client override sensitive fields."""
+        # Strip any forbidden fields out of validated_data as belt-and-suspenders
+        for field in ('owner', 'tenant', 'is_staff', 'role', 'created_at', 'updated_at'):
+            validated_data.pop(field, None)
+
+        return super().update(instance, validated_data)
+
+
+# -----------------------------------------------------------------------
+# View wiring — map serializer per operation
+# -----------------------------------------------------------------------
+# If using ModelViewSet or GenericAPIView with multiple actions,
+# override get_serializer_class:
+
+class ReportViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
+                    mixins.CreateModelMixin,
+                    generics.GenericAPIView):
+    queryset = Report.objects.none()  # Scoped in get_queryset
+    permission_classes = [IsAuthenticated, IsTenantMember]
+
+    def get_queryset(self):
+        return Report.objects.filter(
+            tenant_id=self.kwargs.get('tenant_pk'),
+            tenant__users=self.request.user,
+        )
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ReportListSerializer
+        elif self.action == 'create':
+            return ReportCreateSerializer
+        return ReportDetailSerializer
+
+    def perform_create(self, serializer):
+        """Inject tenant from URL kwarg into serializer context."""
+        serializer.save(
+            owner=self.request.user,
+            tenant_id=self.kwargs.get('tenant_pk'),
+        )
+```
+
+```python
+# urls.py — nest reports under tenants to enforce scope naturally
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+router = DefaultRouter()
+# /api/tenants/{tenant_pk}/reports/{report_pk}/
+router.register(r'reports', ReportViewSet, basename='report')
+
+urlpatterns = [
+    path('api/tenants/<int:tenant_pk>/', include(router.urls)),
+]
+```
+
+---
+
+## Summary Table
+
+| # | Vulnerability | CWE | Impact | Fix Category |
+|---|---|---|---|---|
+| 1 | f-string SQL query | **CWE-89** | Full DB read/write, tenant escape | Parameterized queries + ORM preference |
+| 2 | Client-only authz | **CWE-285** | Unauthorized data access across tenants | Server-side `BasePermission.has_object_permission` |
+| 3 | Hardcoded secrets | **CWE-798** | Full system compromise (DB, cloud, sessions) | Environment variables + `.env` in `.gitignore` |
+| 4 | Mass-assignment serializer | **CWE-915** | Privilege escalation, data ownership takeover | Explicit field whitelist + server-side field injection |
+
+The unifying principle across all four issues: **never trust client input at any layer**. The database layer, the authorization layer, the deployment layer, and the serialization layer each need independent verification boundaries — none should rely on the others being correct.

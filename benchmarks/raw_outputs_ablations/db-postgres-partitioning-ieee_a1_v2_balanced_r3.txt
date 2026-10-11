@@ -1,0 +1,477 @@
+I'll design the complete migration strategy now.
+
+## Zero-Downtime PostgreSQL Declarative Partitioning — `audit_logs` (500M rows)
+
+---
+
+### Phase 0 — Pre-requisites & Configuration
+
+```sql
+-- Enable pg_partman extension (run once per database)
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+ALTER EXTENSION pg_partman UPDATE;
+
+-- Connection / memory tuning (adjust to RAM; 64 GB server typical)
+ALTER SYSTEM SET max_connections = 200;
+ALTER SYSTEM SET work_mem = '64MB';
+ALTER SYSTEM SET maintenance_work_mem = '2GB';
+ALTER SYSTEM SET effective_io_concurrency = 200;
+
+-- Timeouts: prevent long-running locks from blocking writes
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '60s';
+ALTER SYSTEM SET statement_timeout = '15min';
+ALTER SYSTEM SET lock_timeout = '10s';
+
+SELECT pg_reload_conf();
+```
+
+---
+
+### Phase 1 — New Partitioned Table DDL
+
+```sql
+-- Create the new partitioned table on the same schema.
+-- Using a separate schema avoids name clashes during migration.
+CREATE SCHEMA IF NOT EXISTS audit_mig;
+
+CREATE TABLE audit_mig.audit_logs_partitioned (
+    id          bigint NOT NULL DEFAULT nextval('audit_logs_id_seq'),
+    user_id     bigint,                          -- FK target
+    action      text NOT NULL,                   -- e.g. CREATE, UPDATE, DELETE
+    resource_type text NOT NULL,                 -- e.g. users, orders
+    resource_id bigint,
+    old_values  jsonb,
+    new_values  jsonb,
+    ip_address  inet,
+    user_agent  text,
+    request_id  uuid,
+    extra_data  jsonb DEFAULT '{}'::jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Primary key includes partition key for row-level uniqueness
+ALTER TABLE audit_mig.audit_logs_partitioned
+    ADD CONSTRAINT audit_logs_pk PRIMARY KEY (id, created_at);
+
+-- Composite index: equality on user_id, range on created_at (most common query pattern)
+CREATE INDEX idx_audit_logs_user_created
+    ON audit_mig.audit_logs_partitioned (user_id, created_at DESC);
+
+-- GIN indexes for JSONB filters
+CREATE INDEX idx_audit_logs_old_values  ON audit_mig.audit_logs_partitioned USING gin (old_values  jsonb_path_ops);
+CREATE INDEX idx_audit_logs_new_values  ON audit_mig.audit_logs_partitioned USING gin (new_values  jsonb_path_ops);
+CREATE INDEX idx_audit_logs_extra_data  ON audit_mig.audit_logs_partitioned USING gin (extra_data jsonb_path_ops);
+
+-- Partial index: recent records only (hot data)
+CREATE INDEX idx_audit_logs_recent
+    ON audit_mig.audit_logs_partitioned (created_at DESC)
+    WHERE created_at >= now() - INTERVAL '90 days';
+
+-- Covering index for common read pattern
+CREATE INDEX idx_audit_logs_covering
+    ON audit_mig.audit_logs_partitioned (action, resource_type, created_at DESC)
+    INCLUDE (user_id, resource_id, old_values, new_values);
+
+-- Table-level partitioning policy
+ALTER TABLE audit_mig.audit_logs_partitioned
+    PARTITION BY RANGE (created_at);
+
+-- Retention policy via pg_partman (drop partitions older than 2 years)
+SELECT partman.create_parent(
+    p_parent_table   := 'audit_mig.audit_logs_partitioned',
+    p_control        := 'created_at',
+    p_interval       := '1 month',
+    p_premake        := 3,                  -- pre-create 3 months ahead
+    p_retention      := '2 years',
+    p_retention_keep_table := false,         -- DROP, not archive
+    p_retention_keep_index := true           -- keep FK constraints during drop
+);
+```
+
+---
+
+### Phase 2 — Initial Monthly Partitions (Backfill Window)
+
+```sql
+-- Pre-create all partitions covering existing data + 6 months future buffer.
+-- Run BEFORE starting the backfill to ensure insert routing works.
+
+-- Generate partition DDL for Oct 2018 through March 2027 (~92 months)
+DO $$
+DECLARE
+    start_dt DATE := '2018-10-01';  -- adjust to your oldest record date
+    end_dt   DATE := date_trunc('month', now()) + INTERVAL '6 months';
+    cur_date DATE;
+    part_name TEXT;
+BEGIN
+    cur_date := start_dt;
+    WHILE cur_date < end_dt LOOP
+        part_name := 'audit_logs_p' || to_char(cur_date, 'YYYY_MM');
+        BEGIN
+            EXECUTE format(
+                'CREATE TABLE %I PARTITION OF audit_mig.audit_logs_partitioned
+                 FOR VALUES FROM (%L) TO (%L)',
+                part_name,
+                cur_date,
+                cur_date + INTERVAL '1 month'
+            );
+            RAISE NOTICE 'Created partition: %', part_name;
+        EXCEPTION WHEN duplicate_table THEN
+            RAISE NOTICE 'Partition already exists: %, skipping', part_name;
+        END;
+        cur_date := cur_date + INTERVAL '1 month';
+    END LOOP;
+END $$;
+```
+
+---
+
+### Phase 3 — Incremental Backfill (Zero Downtime)
+
+This is the critical phase. We copy data in small batches while both tables remain live for writes.
+
+```sql
+-- ============================================================
+-- STEP 1: Start a background replication process
+-- ============================================================
+-- Option A: Use INSERT ... SELECT in batches (simpler, recommended)
+-- Option B: Use logical replication (more complex, lower overhead)
+
+-- BATCH BACKFILL SCRIPT (run via pg_background or as a long-running transaction)
+-- Each batch targets one month's partition to leverage partition pruning.
+
+DO $$
+DECLARE
+    -- Configuration
+    start_dt DATE := '2018-10-01';
+    end_dt   DATE := now()::date;              -- up to today
+    cur_date DATE;
+    batch_size CONSTANT INTEGER := 50000;      -- rows per batch
+    v_count  BIGINT;
+    total_copy BIGINT := 0;
+
+    v_batch_start TIMESTAMP;
+    v_batch_end   BIGINT;  -- elapsed ms
+BEGIN
+    cur_date := start_dt;
+
+    WHILE cur_date < end_dt LOOP
+        v_batch_start := clock_timestamp();
+
+        INSERT INTO audit_mig.audit_logs_partitioned (
+            id, user_id, action, resource_type, resource_id,
+            old_values, new_values, ip_address, user_agent,
+            request_id, extra_data, created_at
+        )
+        SELECT
+            id, user_id, action, resource_type, resource_id,
+            old_values, new_values, ip_address, user_agent,
+            request_id, extra_data, created_at
+        FROM public.audit_logs
+        WHERE created_at >= cur_date
+          AND created_at  < (cur_date + INTERVAL '1 month')
+          AND id NOT IN (
+              SELECT id FROM audit_mig.audit_logs_partitioned
+              WHERE created_at >= cur_date
+                AND created_at  < (cur_date + INTERVAL '1 month')
+          )
+        LIMIT batch_size;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        total_copy := total_copy + v_count;
+
+        v_batch_end := EXTRACT(EPOCH FROM (clock_timestamp() - v_batch_start)) * 1000;
+        RAISE NOTICE 'Batch % | Rows: %, Total: %, Duration: %ms',
+            to_char(cur_date, 'YYYY-MM'),
+            v_count, total_copy, v_batch_end;
+
+        -- Prevent lock contention on the source table
+        PERFORM pg_sleep(0.1);
+
+        cur_date := cur_date + INTERVAL '1 month';
+    END LOOP;
+
+    RAISE NOTICE 'Backfill complete. Total rows copied: %', total_copy;
+END $$;
+```
+
+#### Lock Timeout Safeguards
+
+Run this at session level before any backfill operation:
+
+```sql
+SET lock_timeout = '10s';
+SET idle_in_transaction_session_timeout = '60s';
+SET statement_timeout = '15min';
+
+-- Optional: set priority hints for PostgreSQL 16+
+SET io_priority = 3;   -- 0=highest, 7=lowest — be gentle under load
+```
+
+#### Continuous Sync Trigger (Catch Inserts During Backfill)
+
+```sql
+-- Trigger on original table: auto-copy new/updated rows to partitioned table
+CREATE OR REPLACE FUNCTION audit_mig.sync_audit_log()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;  -- nothing to sync on delete (we're read-only during copy)
+    ELSIF TG_OP = 'UPDATE' THEN
+        INSERT INTO audit_mig.audit_logs_partitioned (
+            id, user_id, action, resource_type, resource_id,
+            old_values, new_values, ip_address, user_agent,
+            request_id, extra_data, created_at
+        )
+        VALUES (
+            NEW.id, NEW.user_id, NEW.action, NEW.resource_type, NEW.resource_id,
+            NEW.old_values, NEW.new_values, NEW.ip_address, NEW.user_agent,
+            NEW.request_id, NEW.extra_data, NEW.created_at
+        )
+        ON CONFLICT (id, created_at) DO NOTHING;
+        RETURN NEW;
+    ELSE  -- INSERT
+        INSERT INTO audit_mig.audit_logs_partitioned (
+            id, user_id, action, resource_type, resource_id,
+            old_values, new_values, ip_address, user_agent,
+            request_id, extra_data, created_at
+        )
+        VALUES (
+            NEW.id, NEW.user_id, NEW.action, NEW.resource_type, NEW.resource_id,
+            NEW.old_values, NEW.new_values, NEW.ip_address, NEW.user_agent,
+            NEW.request_id, NEW.extra_data, NEW.created_at
+        )
+        ON CONFLICT (id, created_at) DO NOTHING;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_sync_to_partitioned
+    AFTER INSERT OR UPDATE ON public.audit_logs
+    FOR EACH ROW EXECUTE FUNCTION audit_mig.sync_audit_log();
+```
+
+---
+
+### Phase 4 — Verification Queries
+
+```sql
+-- ============================================================
+-- VERIFY: Row count parity between original and partitioned
+-- ============================================================
+SELECT
+    (SELECT COUNT(*) FROM public.audit_logs)                      AS original_count,
+    (SELECT COUNT(*) FROM audit_mig.audit_logs_partitioned)      AS partitioned_count,
+    (SELECT COUNT(*) FROM public.audit_logs
+     WHERE id NOT IN (SELECT id FROM audit_mig.audit_logs_partitioned)) AS missing_rows;
+
+-- ============================================================
+-- VERIFY: Partition pruning is happening (EXPLAIN ANALYZE)
+-- ============================================================
+EXPLAIN (ANALYZE, COSTS, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_mig.audit_logs_partitioned
+WHERE created_at >= '2024-01-01' AND created_at < '2024-02-01'
+  AND user_id = 42;
+
+-- Expected output should show ONLY the jan_2024 partition scanned,
+-- not ALL partitions. Look for:
+--   ->  Index Scan using idx_audit_logs_user_created on audit_logs_partitioned_2024_01
+
+-- ============================================================
+-- VERIFY: All partition pruning paths are correct
+-- ============================================================
+SELECT
+    schemaname,
+    relname AS partition_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+FROM pg_stat_user_tables
+WHERE relname LIKE 'audit_logs_p%'
+ORDER BY relname;
+
+-- ============================================================
+-- VERIFY: Data integrity — spot-check random samples
+-- ============================================================
+WITH sample_ids AS (
+    SELECT id FROM public.audit_logs ORDER BY random() LIMIT 100
+)
+SELECT
+    o.id,
+    o.action        AS orig_action,
+    p.action        AS part_action,
+    o.user_id       AS orig_uid,
+    p.user_id       AS part_uid,
+    CASE WHEN o.id IS DISTINCT FROM p.id THEN 'MISMATCH' ELSE 'OK' END AS status
+FROM sample_ids s
+LEFT JOIN public.audit_logs o ON o.id = s.id
+LEFT JOIN audit_mig.audit_logs_partitioned p ON p.id = s.id AND p.created_at = o.created_at
+WHERE o.id IS DISTINCT FROM p.id
+   OR o.action IS DISTINCT FROM p.action
+   OR o.user_id IS DISTINCT FROM p.user_id;
+
+-- ============================================================
+-- VERIFY: pg_partman health check
+-- ============================================================
+SELECT
+    parent,
+    type,
+    control,
+    interval,
+    premake,
+    retention,
+    partitions,
+    last_partition
+FROM partman.part_config
+WHERE parent = 'audit_mig.audit_logs_partitioned';
+
+-- Check that future partitions were auto-created
+SELECT child_relid::regclass AS partition_name
+FROM partman.part_children
+WHERE parent = 'audit_mig.audit_logs_partitioned'
+  AND child_relid::regclass::text > to_char(now()::date + INTERVAL '3 months', 'YYYY_MM')
+ORDER BY child_relid::regclass::text;
+```
+
+---
+
+### Phase 5 — Cutover (Minimal Downtime)
+
+```sql
+-- ============================================================
+-- STEP 1: Pause write traffic to audit_logs (update app config)
+-- ============================================================
+-- Set feature flag or toggle to direct writes to audit_mig.audit_logs_partitioned
+-- Wait for continuous sync trigger to catch up.
+
+-- ============================================================
+-- STEP 2: Verify final sync completeness
+-- ============================================================
+SELECT
+    (SELECT COUNT(*) FROM public.audit_logs)                      AS original_count,
+    (SELECT COUNT(*) FROM audit_mig.audit_logs_partitioned)      AS partitioned_count,
+    (SELECT COUNT(*) FROM public.audit_logs
+     WHERE id NOT IN (SELECT id FROM audit_mig.audit_logs_partitioned)) AS still_missing;
+-- still_missing must be 0
+
+-- ============================================================
+-- STEP 3: Drop sync trigger, then swap table names
+-- ============================================================
+DROP TRIGGER IF EXISTS trg_sync_to_partitioned ON public.audit_logs;
+DROP FUNCTION IF EXISTS audit_mig.sync_audit_log();
+
+-- Atomic rename — blocks briefly (milliseconds), then all queries use the new table
+BEGIN;
+
+-- Rename original table away (preserves data for rollback)
+ALTER TABLE public.audit_logs RENAME TO audit_logs_original;
+
+-- Rename partitioned table to production name
+ALTER TABLE audit_mig.audit_logs_partitioned RENAME TO audit_logs;
+
+-- Transfer ownership and permissions
+ALTER TABLE public.audit_logs OWNER TO app_db_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_logs TO app_db_user;
+
+COMMIT;
+
+-- ============================================================
+-- STEP 4: Re-run application connection pool warm-up if needed
+-- ============================================================
+-- The ALTER TABLE INVALIDATES prepared statements in most ORMs.
+-- Restart the connection pool or execute a health-check query to repool.
+```
+
+---
+
+### Phase 6 — Rollback Plan
+
+```sql
+-- If cutover fails, reverse the rename within the same transaction context.
+-- Original data remains intact as audit_logs_original.
+
+BEGIN;
+
+-- Swap names back
+ALTER TABLE public.audit_logs RENAME TO audit_logs_partitioned_tmp;
+ALTER TABLE public.audit_logs_original RENAME TO audit_logs;
+
+-- Restore permissions
+ALTER TABLE public.audit_logs OWNER TO app_db_user;
+
+COMMIT;
+
+-- Once confirmed rolling back, clean up partitioned temp table:
+-- DROP TABLE IF EXISTS public.audit_logs_partitioned_tmp;
+```
+
+---
+
+### Phase 7 — Post-Migration Cleanup
+
+```sql
+-- After confirming stability for 7–14 days:
+-- 1. Drop the old table and its indexes
+DROP TABLE IF EXISTS public.audit_logs_original CASCADE;
+
+-- 2. Run ANALYZE on all partitions for updated statistics
+DO $$
+DECLARE
+    rec RECORD;
+BEGIN
+    FOR rec IN
+        SELECT relid::regclass AS tablename
+        FROM pg_stat_user_tables
+        WHERE relname LIKE 'audit_logs_p%'
+    LOOP
+        EXECUTE format('ANALYZE %I', rec.tablename);
+    END LOOP;
+END $$;
+
+-- 3. Update pg_partman to manage partitions going forward
+-- (already configured in Phase 1 via create_parent)
+
+-- 4. Monitor partition creation schedule
+SELECT job_name, job_state, last_run
+FROM pgq.job
+WHERE job_name LIKE '%audit%';
+```
+
+---
+
+### Architecture Summary
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Application Layer                         │
+│              Writes → audit_mig.audit_logs_partitioned       │
+│              Reads → public.audit_logs (after cutover)       │
+└──────────────────────────────────────────────────────────────┘
+                              │
+┌──────────────────────────────────────────────────────────────┐
+│              pg_partman (Background Worker)                  │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐               │
+│  │ Jan 2027  │  │ Feb 2027  │  │ Mar 2027  │ ...           │
+│  │ (auto)    │  │ (auto)    │  │ (auto)    │               │
+│  └───────────┘  └───────────┘  └───────────┘               │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐               │
+│  │ Oct 2018  │  │ Nov 2018  │  │ Dec 2018  │ ...           │
+│  │ (data)    │  │ (data)    │  │ (data)    │               │
+│  └───────────┘  └───────────┘  └───────────┘               │
+│                                                              │
+│  Auto-drop: 2-year retention                                 │
+│  Auto-create: 3 months ahead                                 │
+│  Size-based: ~5-10 GB/month (estimate for 500M total)       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Composite PK `(id, created_at)`** | Required for unique constraints across partitions; `id` alone isn't safe if sequences cross |
+| **`jsonb_path_ops` GIN indexes** | 40-60% smaller than default GIN, sufficient for containment queries (`@>`) |
+| **`pg_sleep(0.1)` between batches** | Prevents CPU saturation and allows autovacuum to run |
+| **Trigger-based continuous sync** | Guarantees eventual consistency regardless of backfill speed |
+| **Pre-make 3 months** | Provides buffer against timezone/partitioning edge cases |
+| **Retention at 2 years** | Balances compliance requirements against storage cost (~100 GB for 500M rows over 2 years estimated) |
+| **No foreign keys initially** | FK checks slow down bulk inserts; add them after cutover once verified |

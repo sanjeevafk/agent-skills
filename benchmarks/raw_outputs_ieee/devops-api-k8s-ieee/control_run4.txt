@@ -1,0 +1,495 @@
+[exit=0 latency=34.03s]
+Here are production-grade Kubernetes manifests for a stateless Go API with all the requirements addressed.
+
+---
+
+## Complete Manifests
+
+### `deployment.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+  namespace: production
+  labels:
+    app: go-api
+    version: "1"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0            # critical: zero new pods until old ones are drained
+      maxUnavailable: 0      # never drop below desired replica count
+  selector:
+    matchLabels:
+      app: go-api
+  template:
+    metadata:
+      labels:
+        app: go-api
+    spec:
+      serviceAccountName: go-api-sa
+      terminationGracePeriodSeconds: 45
+      priorityClassName: high-priority  # defer to low-priority pods during scheduling pressure
+
+      # --- Secrets as files (not env vars), avoiding protobuf limit & hot-reload ---
+      volumes:
+        - name: app-secrets
+          projected:
+            sources:
+              - secret:
+                  name: go-api-credentials
+                  items:
+                    - key: db_password
+                      path: db_password
+                    - key: api_key
+                      path: api_key
+              - secret:
+                  name: tls-cert
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+        - name: config-volume       # if you also have ConfigMap data
+          configMap:
+            name: go-api-config
+            optional: true
+        - name: tmp-dir             # ephemeral temp space
+          emptyDir: {}
+      containers:
+        - name: go-api
+          image: registry.internal/go-api:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # --- Volume mounts ---
+          volumeMounts:
+            - name: app-secrets
+              mountPath: /etc/secrets
+              readOnly: true
+            - name: config-volume
+              mountPath: /etc/config
+              readOnly: true
+            - name: tmp-dir
+              mountPath: /tmp
+
+          # --- Resources sized to avoid p99 CPU throttling ---
+          resources:
+            requests:
+              cpu: "500m"            # baseline guarantee per replica
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"           # burst ceiling; OOM/CPU-throttle guard
+              memory: "512Mi"
+
+          # =========================================================================
+          # PROBE THRESHOLD ARITHMETIC — explained below after the manifests
+          # =========================================================================
+          # Startup probe: allows 60s for cold-start + 20s cache-warmup + margin
+          # ┌─────────────────────────────────────────────────────────┐
+          # │ initialDelaySeconds = 5   → start checking at t=+5s     │
+          # │ periodSeconds         = 5   → check every 5 seconds       │
+          # │ failureThreshold      = 10  → survive 10 consecutive misses│
+          # │ Total allowance         = 5 + (10 × 5) = 60s            │
+          # │                                                         │
+          # │ Timeline:                                               │
+          # │   t=0    container starts                               │
+          # │   t=0..5  startup probe not yet active (initial delay)  │
+          # │   t=5..65 10 checks fire (period=5, fail-threshold=10)  │
+          # │   t=5..25 cache warming occurs (~20s)                   │
+          # │   t=25..65 ready to serve real requests                 │
+          # │                                                         │
+          # │ If readiness fails BEFORE startup succeeds: container   │
+          # │ gets restarted by kubelet. Setting failureThreshold=10  │
+          # │ means the pod has until t=65 before being killed.       │
+          # │ This covers: 5s delay + 20s warmup + 5s check overhead │
+          # │ + 30s operational margin. Safe for most Go apps.        │
+          # └─────────────────────────────────────────────────────────┘
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 10      # 60s total grace window
+
+          # Readiness probe: tells kube-proxy to add/remove this Pod from
+          # Service endpoints. MUST return OK only when cache is warm.
+          # Failing this removes the pod from LoadBalancer traffic with ZERO drops.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3           # don't wait long for each check
+            failureThreshold: 3         # mark Unready after 3 consecutive misses
+                                          # ~15s from first failure to endpoint removal
+
+          # Liveness probe: only restart the container if the process is deadlocked.
+          # NEVER tie liveness to cache-warmth — a fresh warm-up should NOT cause
+          # a restart spiral. Use AFTER startup probe succeeds (implicit in K8s).
+          # Once ready=true, liveness simply monitors ongoing liveliness.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 15     # give startup some time before monitoring
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3         # kill after 3 consecutive fails (~30s)
+
+          # --- PreStop hook: the drain sequence ----------------------
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c",
+                  # Phase 1: Remove self from Service endpoints immediately.
+                  # kube-proxy stops routing NEW traffic to this Pod.
+                  "curl -sf http://localhost:8080/terminate > /dev/null 2>&1 || true"
+                  #
+                  # Phase 2: Wait for in-flight requests to finish.
+                  # During this sleep, kube-proxy no longer sends new requests
+                  # because we've already fired /terminate or been removed
+                  # from readiness. Old clients still riding existing TCP
+                  # connections will complete normally.
+                  "sleep 15"]
+
+          env:
+            - name: ENVIRONMENT
+              value: production
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          # --- Pull policy for air-gapped / private registries ---
+          imagePullPolicy: IfNotPresent
+```
+
+### `hpa.yaml`
+
+```yaml
+# --------------------------------------------------------------------------
+# HPA v2 — scales on CPU util AND custom queue-depth metric
+# Uses keda-style annotation pattern (works with prometheus adapter):
+#   * cpu.targetAverageUtilization  → classic HPA metric
+#   * queue_depth.targetAverageValue → custom metric via prometheus-adapter
+# --------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-api-hpa
+  namespace: production
+  annotations:
+    # Optional: set min/max replicas independent of Deployment.replicas
+    autoscaling.alpha.kubernetes.io/targetCPUUtilizationPercentage: "60"
+    autoscaling.alpha.kubernetes.io/metrics: |
+      [{
+        "type": "Object",
+        "object": {
+          "describedObject": {
+            "kind": "Deployment",
+            "name": "go-api"
+          },
+          "metricName": "queue_depth",
+          "target": {
+            "type": "AverageValue",
+            "averageValue": "10"
+          }
+        }
+      }]
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  behavior:
+    # Scale UP aggressively but bounded — react fast to queue buildup
+    scaleUp:
+      stabilizationWindowSeconds: 0    # react immediately on spikes
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15            # double capacity per 15s window
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max               # take the most aggressive policy
+
+    # Scale DOWN conservatively — avoid thrash on transient dips
+    scaleDown:
+      stabilizationWindowSeconds: 300  # hold scaled-down for 5 min before scaling more
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+
+  metrics:
+    # ─── Metric 1: CPU utilization ───
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # target 60% average CPU across all pods
+
+    # ─── Metric 2: Custom queue-depth (Prometheus adapter exposure) ───
+    # Assumes your app exposes: go_api_queue_depth_gauge{namespace="production"}
+    # prometheus-adapter maps this to metric name: go_api_queue_depth_gauge
+    - type: Object
+      object:
+        metric:
+          name: go_api_queue_depth_gauge
+        describedObject:
+          apiVersion: apps/v1
+          kind: Deployment
+          name: go-api
+        target:
+          type: AverageValue
+          averageValue: "10"         # add a pod when avg queue depth > 10/pod
+```
+
+### `pdb.yaml`
+
+```yaml
+# ──────────────────────────────────────────────────────────────────────
+# PDB — survives node drains during `kubectl drain` / node upgrade
+#
+# Key constraint: always keep ≥ 2 replicas during voluntary disruptions.
+#
+# Why minAvailable=2 (not equal to replicas)?
+#   * With 3 replicas and maxUnavailable=1, one pod can be evicted
+#     simultaneously. The remaining 2 handle traffic.
+#   * If deployed with 3 replicas and the PDB says
+#     minAvailable=2, it matches a maxUnavailable logic:
+#       allowedEvictions = replicas - minAvailable = 3 - 2 = 1
+#   * During a rolling update (maxSurge=0, maxUnavailable=0), the PDB
+#     won't block updates because no voluntary disruption occurs there —
+#     it only blocks `kubectl drain --ignore-daemonsets` scenarios.
+#
+# Why not maxUnavailable=0? That would prevent ANY voluntary disruption,
+# making node upgrades impossible. We want exactly 1 eviction tolerance.
+# ──────────────────────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-api-pdb
+  namespace: production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: go-api
+```
+
+### `service.yaml` (bonus — for completeness)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-api
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: go-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+```
+
+---
+
+## Probe Threshold Arithmetic Explained
+
+| Probe | Path | Initial Delay | Period | Failure Threshold | Total Window | Purpose |
+|-------|------|:---:|:---:|:---:|:---:|---------|
+| **Startup** | `/healthz` | 5s | 5s | 10 | **60s** | How long the container can take to become healthy. Includes 20s cache warmup + safety margin. |
+| **Readiness** | `/readyz` | 5s | 5s | 3 | **~15s** (after failure) | Drives endpoint registration. When this fails → pod removed from Service LB with zero dropped requests. |
+| **Liveness** | `/livez` | 15s | 10s | 3 | **~30s** (after failure) | Detects deadlocks/crashes. Independent of cache warmth. Only triggers after startup succeeds. |
+
+### Timeline diagram
+
+```
+t=0     Container starts
+        ├─ Cache warmup begins (cold start → ~20s)
+        └─ No probes active yet
+
+t=5     Startup probe begins (5s initial delay)
+        ├─ Checks every 5s
+        ├─ Failure count resets each success
+        └─ Will allow 10 consecutive failures = t=55
+
+t=25    Cache warmup complete (~20s from start)
+        ├─ /readyz starts returning 200
+        ├─ Pod added to Service endpoints
+        └─ Now receiving LB traffic
+
+t=60    MAXIMUM startup budget exhausted
+        ├─ 10 failures happened consecutively
+        └─ Container killed & restarted by kubelet
+```
+
+**Why these thresholds?**
+
+- **Startup `failureThreshold: 10`**: 5s delay + (10 × 5s period) = 60s. Covers 20s warmup + 15s startup variability + 25s operational headroom. Conservative enough for slow disks/network in cloud K8s.
+
+- **Readiness `failureThreshold: 3`**: Once unhealthy, the pod leaves Service endpoints within 3 × 5s = 15s. This is the knob that prevents serving during warmup — new requests bypass this Pod entirely.
+
+- **Liveness `initialDelaySeconds: 15`**: Delays liveness until past the hottest part of startup. Prevents false-positive crashes right as the app is booting. Also benefits from Kubernetes implicit sequencing: liveness is not enforced until startup probe succeeds at least once.
+
+---
+
+## Termination Drain Sequence (Zero Dropped Requests)
+
+```
+                    DEPLOYMENT ROLLING UPDATE
+          maxSurge=0, maxUnavailable=0 (enforced)
+          ──────────────────────────────────────
+
+t=0  New Pod starts, remains Unready (cache warming)
+     Old pods still receive ALL traffic.
+
+     Old Pod lifecycle triggered:
+     ├── kube-sends SIGTERM to PID 1 of the container
+     │    (graceful shutdown handler activates)
+     │    └── app sets internal "draining" flag
+     │    └── HTTP server rejects new accepts gracefully
+
+     └── preStop hook fires:
+          ├─ Step 1: curl /terminate → marks pod Unready immediately
+          │    → kube-proxy removes from endpoints NOW
+          │    → NO NEW requests routed to this pod
+          │
+          └─ Step 2: sleep 15 → waits for in-flight reqs to finish
+               └── Existing TCP connections complete naturally
+
+t=+15  preStop completes → container proceeds to exit
+t=+20  New Pod finishes cache warmup → /readyz returns 200
+       → Added to endpoints → receives traffic
+
+t=+20  Old Pod terminated cleanly
+       Result: zero dropped requests.
+
+t=+∞   Next old Pod follows same sequence (one-by-one, no overlap).
+```
+
+### Why this works
+
+1. **`maxSurge: 0`** ensures zero new pods exist until old ones are fully drained. No traffic redistribution happens mid-drain.
+
+2. **`terminationGracePeriodSeconds: 45`** gives the preStop (15s) + in-flight request buffer (15s) + OS cleanup margin (15s). Conservative but safe.
+
+3. **Readiness-driven endpoint removal** is the critical mechanism. By calling `/terminate` early in the preStop (or relying on readiness becoming false), kube-proxy stops sending new traffic. In-flight requests ride existing TCP connections to completion.
+
+4. **PreStop sleep is deliberate** — it creates a window where the pod is Unready but not yet Terminated. The app can flush caches, write logs, or close DB connections during this phase.
+
+### Graceful shutdown handler code sketch (Go)
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+)
+
+func main() {
+    srv := &http.Server{Addr: ":8080", Handler: router}
+
+    // Graceful shutdown on SIGTERM/SIGINT
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+    go func() {
+        <-sigCh
+        log.Println("shutting down... draining in-flight requests")
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        srv.Shutdown(ctx)
+    }()
+
+    if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+        log.Fatal(err)
+    }
+}
+```
+
+The preStop hook fires BEFORE SIGTERM. So:
+- preStop runs (remove from endpoints + wait)
+- Then kube-sends SIGTERM → Go handler calls `srv.Shutdown()` which:
+  1. Stops accepting new connections
+  2. Waits for in-flight handlers to finish (with 30s timeout)
+  3. Exits cleanly
+
+This double-layer — endpoint removal + `srv.Shutdown()` — guarantees no dropped requests during deploys.
+
+---
+
+## Resource Sizing Rationale
+
+| Metric | Value | Reasoning |
+|--------|-------|-----------|
+| CPU Request | `500m` | Ensures consistent baseline for p99 latency. Go GC pauses are deterministic at known allocation rates when CPU isn't starved. |
+| CPU Limit | `1000m` | 2× burst above request allows handling occasional GC spikes. The `Burstable` QoS class lets other nodes pack more efficiently while protecting against CPU starvation of our critical pods. |
+| Memory Request | `256Mi` | Covers Go runtime + HTTP handler stacks for moderate throughput. |
+| Memory Limit | `512Mi` | `Guaranteed` boundary if request == limit (we're `Burstable`). OOM killer won't touch us unless truly exceeding working set. |
+
+To verify the CPU sizing is correct post-deployment, check for throttling:
+
+```bash
+kubectl top pod -l app=go-api
+# OR query Prometheus for CPU throttling:
+sum(rate(container_cpu_throttled_seconds_total{pod=~"go-api.*"}[5m])) by (pod)
+```
+
+If `throttled_seconds` > 0, increase the `requests.cpu`. Throttling at p99 means the 99th-percentile request hits the cfs quota wall — that's when latency tail-spikes appear.
+
+---
+
+## PDB Behavior During Node Upgrades
+
+```
+Node drain initiated (e.g., CAPI node upgrade)
+     │
+     ├── PDB evaluates: minAvailable = 2
+     │    → With 3 replicas: 1 pod can be evicted
+     │    → 2 remain running → satisfies PDB
+     │
+     ├── Pod 1 evicted → goes through preStop drain (15s)
+     ├── While draining, no other pods evicted (PDB blocks it)
+     ├── After Pod 1 fully gone, Pod 2 can be evicted
+     │
+     └── Repeat: always maintaining ≥ 2 live replicas
+         throughout the entire node upgrade cascade.
+```
+
+The interaction between `RollingUpdate.maxUnavailable=0` and `PDB.minAvailable=2` is complementary, not conflicting:
+- **Deployment strategy** controls rollout pace (one-old-at-a-time).
+- **PDB** controls voluntary disruption outside of rollouts (node drains, cluster-autoscaler reboots).
+- Together they guarantee the API never serves below 2 concurrent replicas.

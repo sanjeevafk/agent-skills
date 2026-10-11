@@ -1,0 +1,345 @@
+[exit=0 latency=25.05s]
+Here's my analysis of the described webhook implementation's vulnerabilities and a corrected version.
+
+---
+
+## Vulnerability Analysis (Ordered by Severity)
+
+### 1. Signature Verification After JSON Parsing — Critical
+
+Verifying the HMAC **after** parsing the request body means an attacker can send a massively malformed or huge payload that gets fully parsed (allocating memory, instantiating objects) before the signature check rejects it. This is a textbook ReDoS / resource-exhaustion vector. The signature must be verified against the **raw request bytes** before any JSON parsing occurs. This prevents:
+- Memory exhaustion via oversized bodies
+- CPU exhaustion via deeply nested JSON structures crafted to trigger ReDoS in the parser
+- Delay-based attacks where each byte costs O(n²) in parsing
+
+### 2. In-Memory Replay-ID Ledger — High
+
+An in-memory `dict` has three fatal flaws:
+- **No persistence across restarts** — if the process restarts, the ledger is wiped and replayed webhooks are silently re-processed, potentially double-charging customers
+- **Lost under scaling** — horizontally scaling the service means node A won't know about events already processed on node B
+- **Memory leak** — the dict grows unbounded forever; there's no TTL or eviction
+
+### 3. Missing Timing-Safe Comparison — Medium-High
+
+If the HMAC comparison uses `==` instead of a constant-time function like `hmac.compare_digest()`, the response time leaks information about which bytes of the MAC match. While Python's `bytes == bytes` does short-circuit on the first mismatch, this timing side-channel enables low-bandwidth key recovery attacks over HTTP.
+
+### 4. No Content-Type Validation — Medium
+
+Without enforcing `Content-Type: application/json`, a client could send HTML or other content types. Combined with lazy parsing, this increases the attack surface for type-confusion bugs or unexpected parser behavior.
+
+### 5. Processor Errors Leaked to Clients — Medium
+
+Raising raw processor exceptions directly from the webhook handler leaks internal details (connection strings, error codes, stack traces) to the third-party processor over the internet. This is information disclosure that aids targeted attacks.
+
+### 6. No Request Size Limit — Medium
+
+Without a body size limit, an attacker sends a 10GB payload. The server allocates gigabytes of RAM before reaching the (broken) signature check.
+
+### 7. Rotating Secret Management Gaps — Low-Medium
+
+If the rotating secret is loaded at startup into a fixed variable without supporting concurrent active secrets during rotation transitions, there's either a window where new secrets aren't accepted or old secrets don't still work during graceful handoff.
+
+---
+
+## Corrected Implementation
+
+```python
+import hashlib
+import hmac
+import logging
+import os
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+app = FastAPI()
+
+WEBHOOK_SECRET_KEY_NAME = os.environ["WEBHOOK_SECRET_KEY_NAME"]
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = int(
+    os.environ.get("WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS", "300")
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _get_secret(key_name: str) -> bytes:
+    """Return the current signing secret from a secure store (KMS, env vars, etc.).
+
+    During a rotation window both the current and previous secret may need to
+    coexist — see `_verify_hmac` below.
+    """
+    # Replace with your actual secret manager call. For local dev you might
+    # fall back to environment variables.
+    return os.environ[f"WEBHOOK_SECRET__{key_name}"].encode()
+
+
+# ---------------------------------------------------------------------------
+# Persistent replay-protection ledger (PostgreSQL example)
+# ---------------------------------------------------------------------------
+
+# In production use an async DB driver (asyncpg / sqlalchemy.ext.asyncio).
+# This stub demonstrates the schema and logic.
+
+class ReplayLedger:
+    """Thread-safe replay-protection layer backed by persistent storage.
+
+    Schema (PostgreSQL):
+        CREATE TABLE IF NOT EXISTS webhook_delivery_ledger (
+            event_id     TEXT PRIMARY KEY,
+            processor    TEXT NOT NULL,
+            received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            status       TEXT NOT NULL CHECK (status IN ('processed', 'error'))
+        );
+        CREATE INDEX idx_webhook_delivery_ledger_received_at
+            ON webhook_delivery_ledger (received_at);
+    """
+
+    def __init__(self, max_age_hours: int = 168):  # 7 days default
+        self._max_age = timedelta(hours=max_age_hours)
+
+    def is_duplicate(self, event_id: str) -> bool:
+        """Return True if this event_id was already processed."""
+        # Real implementation:
+        #   result = db.execute(
+        #       text("SELECT 1 FROM webhook_delivery_ledger WHERE event_id = :eid"),
+        #       {"eid": event_id},
+        #   )
+        #   return result.scalar_one_or_none() is not None
+        raise NotImplementedError("Connect a real database")
+
+    def record_event(self, event_id: str, processor: str, status: str) -> None:
+        """Persist a processed event so future duplicates are detected."""
+        # Real implementation:
+        #   db.execute(
+        #       text(
+        #           "INSERT INTO webhook_delivery_ledger (event_id, processor, status)"
+        #           " VALUES (:eid, :proc, :st) "
+        #           "ON CONFLICT (event_id) DO UPDATE SET status = EXCLUDED.status"
+        #       ),
+        #       {"eid": event_id, "proc": processor, "st": status},
+        #   )
+        #   db.commit()
+        raise NotImplementedError("Connect a real database")
+
+    def cleanup(self) -> None:
+        """Delete records older than _max_age. Call periodically."""
+        #   db.execute(
+        #       text("DELETE FROM webhook_delivery_ledger "
+        #            "WHERE received_at < :cutoff"),
+        #       {"cutoff": datetime.now(timezone.utc) - self._max_age},
+        #   )
+        pass  # Placeholder
+
+
+ledger = ReplayLedger()
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+
+def _constant_time_compare(a: bytes, b: bytes) -> bool:
+    """Constant-time equality to prevent timing side-channels."""
+    return hmac.compare_digest(a, b)
+
+
+def _build_signature_payload(raw_body: bytes, event_id: str, timestamp: str,
+                              secret: bytes) -> bytes:
+    """Build the exact string the processor signed.
+
+    Must match the processor's signing algorithm byte-for-byte. Adjust the
+    separator/order to match your vendor's spec.
+    """
+    return f"{event_id}.{timestamp}.".join([
+        raw_body.decode(errors="replace"),
+        secret.decode(errors="replace"),
+    ]).encode()
+
+
+def _extract_and_verify_header(request: Request, raw_body: bytes) -> None:
+    """Verify the HMAC signature using constant-time comparison.
+
+    Raises HTTPException(401) on failure. Tries current and previous secrets
+    to handle rotation windows gracefully.
+    """
+    signature = request.headers.get("x-webhook-signature")
+    event_id = request.headers.get("x-webhook-event-id")
+    timestamp_str = request.headers.get("x-webhook-timestamp")
+
+    # --- Header presence checks (before anything expensive) ---
+    missing = []
+    if not signature:
+        missing.append("x-webhook-signature")
+    if not event_id:
+        missing.append("x-webhook-event-id")
+    if not timestamp_str:
+        missing.append("x-webhook-timestamp")
+
+    if missing:
+        logger.warning("Missing webhook headers: %s", missing)
+        raise HTTPException(
+            status_code=401, detail="Missing required webhook headers"
+        )
+
+    # --- Replay: reject known event IDs immediately ---
+    try:
+        if ledger.is_duplicate(event_id):
+            logger.info("Duplicate event_id rejected: %s", event_id)
+            raise HTTPException(status_code=409, detail="Event already processed")
+    except Exception:  # pragma: no cover
+        # If we can't query the ledger we fail open-close to avoid accidental
+        # re-processing during infrastructure hiccups.
+        logger.error("Ledger unavailable — rejecting webhook as safety measure")
+        raise HTTPException(status_code=500, detail="Webhook processing unavailable")
+
+    # --- Timestamp freshness check ---
+    try:
+        timestamp = float(timestamp_str)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid timestamp format")
+
+    tolerance = timedelta(seconds=WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS)
+    if abs(time.time() - timestamp) > tolerance.total_seconds():
+        raise HTTPException(status_code=400, detail="Webhook timestamp expired")
+
+    # --- HMAC verification against available secrets ---
+    secrets_to_try = [
+        _get_secret(WEBHOOK_SECRET_KEY_NAME),
+        # _get_secret(previous_key_name),  # uncomment during rotation
+    ]
+
+    for secret in secrets_to_try:
+        expected_mac = hmac.new(
+            secret,
+            raw_body,  # sign the RAW bytes, never parsed JSON
+            hashlib.sha256,
+        ).hexdigest()
+
+        actual_mac = signature  # vendor typically sends hex-encoded MAC
+
+        if _constant_time_compare(expected_mac.encode(), actual_mac.encode()):
+            return  # verified ✓
+
+    logger.warning("HMAC verification failed for event_id=%s", event_id)
+    raise HTTPException(status_code=401, detail="Invalid signature")
+
+
+# ---------------------------------------------------------------------------
+# Webhook handler
+# ---------------------------------------------------------------------------
+
+
+class WebhookPayload(BaseModel):
+    """Pydantic model for deserialization AFTER verification succeeds."""
+    event_type: str
+    data: dict
+    amount: Optional[float] = None
+
+
+@app.post("/webhooks/payment")
+async def handle_payment_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    # Step 1 — Read raw body FIRST
+    raw_body = await request.body()
+
+    # Step 2 — Hard size limit (adjust per your vendor's max payload)
+    MAX_BODY_BYTES = 65_536  # 64 KB
+    if len(raw_body) > MAX_BODY_BYTES:
+        logger.warning("Webhook body too large: %d bytes", len(raw_body))
+        raise HTTPException(
+            status_code=413, detail="Request body exceeds maximum allowed size"
+        )
+
+    # Step 3 — Verify Content-Type
+    content_type = request.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise HTTPException(
+            status_code=415, detail="Unsupported content type"
+        )
+
+    # Step 4 — Verify HMAC signature (against raw bytes, before JSON parse)
+    _extract_and_verify_header(request, raw_body)
+
+    # Step 5 — Now safe to parse JSON
+    try:
+        payload = WebhookPayload.model_validate_json(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Step 6 — Process asynchronously, catch ALL errors
+    def _process_webhook():
+        try:
+            _run_business_logic(payload)
+        except PaymentProcessorError as exc:
+            # Map vendor errors to generic messages; log full detail internally
+            logger.exception(
+                "Payment processor returned error for event %s: %s",
+                request.headers.get("x-webhook-event-id"),
+                exc.detail,
+            )
+            raise
+        except Exception:
+            # Catch-all: never let internal errors propagate
+            logger.exception(
+                "Unexpected error processing webhook event %s",
+                request.headers.get("x-webhook-event-id"),
+            )
+            raise
+
+    background_tasks.add_task(_process_webhook)
+
+    # Step 7 — Record success in the ledger immediately after accepting
+    event_id = request.headers["x-webhook-event-id"]
+    try:
+        ledger.record_event(event_id, "stripe-like-processor", "processed")
+    except Exception:
+        logger.exception("Failed to persist event ledger entry for %s", event_id)
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "accepted"},
+    )
+
+
+def _run_business_logic(payload: WebhookPayload) -> None:
+    """Domain-specific webhook handling.
+
+    MUST be isolated from HTTP concerns. Raises domain exceptions (not HTTP ones)
+    so they can be caught at the boundary and mapped to appropriate responses.
+    """
+    if payload.event_type == "payment.succeeded":
+        _handle_payment_succeeded(payload)
+    elif payload.event_type == "payment.failed":
+        _handle_payment_failed(payload)
+    else:
+        logger.info("Unhandled event type: %s", payload.event_type)
+
+
+def _handle_payment_succeeded(payload: WebhookPayload) -> None:
+    logger.info("Processing successful payment: amount=%.2f", payload.amount or 0)
+    # TODO: integrate with your order/account system
+
+
+def _handle_payment_failed(payload: WebhookPayload) -> None:
+    logger.info("Processing failed payment notification")
+    # TODO: mark order as failed, notify customer
+
+
+class PaymentProcessorError(Exception):
+    """Raised when downstream payment processing fails."""
+
+    def __init__(self, detail: str, external_message: str):
+        super().__init__(detail)
+        self.detail = detail          # internal detail (logged only)
+        self.external_message = external_message  # safe for logging

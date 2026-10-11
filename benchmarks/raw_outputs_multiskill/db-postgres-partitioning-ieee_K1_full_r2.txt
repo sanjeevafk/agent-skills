@@ -1,0 +1,277 @@
+I'll design a complete zero-downtime partitioning strategy for 500M rows. This requires creating a new partitioned table, concurrent batch backfill, and seamless cutover.
+
+## 1. Setup & Parent Table DDL
+
+```sql
+-- Enable pg_partman extension
+CREATE EXTENSION IF NOT EXISTS pg_partman;
+
+-- Create the new partitioned table (same schema as original audit_logs)
+CREATE TABLE audit_logs_partitioned (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    org_id      bigint NOT NULL,
+    user_id     bigint,
+    action      text NOT NULL,
+    resource    text,
+    details     jsonb,
+    ip_address  inet,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_logs_partitioned_pkey PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Indexes that propagate to all partitions
+CREATE INDEX idx_audit_logs_partitioned_org_created 
+    ON audit_logs_partitioned (org_id, created_at);
+CREATE INDEX idx_audit_logs_partitioned_action 
+    ON audit_logs_partitioned (action, created_at);
+CREATE INDEX idx_audit_logs_partitioned_details 
+    ON audit_logs_partitioned USING gin (details);
+```
+
+## 2. pg_partman Configuration for Automated Partitions
+
+```sql
+-- Let pg_partman manage future partitions
+SELECT partman.create_parent(
+    p_parent_table := 'public.audit_logs_partitioned',
+    p_control := 'created_at',
+    p_type := 'range',
+    p_interval := '1 month',
+    p_premake := 3,           -- Create 3 months ahead
+    p_start_partition := '2024-01-01'  -- Adjust to your earliest data
+);
+
+-- Set maintenance schedule (runs daily via pg_cron or pg_partman)
+UPDATE partman.part_config 
+SET 
+    retention := '24 months',        -- Optional: auto-drop old partitions
+    retention_keep_table := false,
+    retention_keep_index := false,
+    infinite_partitions := true,
+    jobmon := true
+WHERE parent_table = 'public.audit_logs_partitioned';
+```
+
+## 3. Concurrent Backfill Script (Batched with Lock Timeouts)
+
+```sql
+-- Progress tracking table
+CREATE TABLE IF NOT EXISTS _backfill_progress (
+    table_name  text PRIMARY KEY,
+    last_id     bigint DEFAULT 0,
+    last_ts     timestamptz,
+    batch_count int DEFAULT 0,
+    started_at  timestamptz DEFAULT now(),
+    updated_at  timestamptz DEFAULT now()
+);
+
+INSERT INTO _backfill_progress (table_name) VALUES ('audit_logs_partitioned')
+ON CONFLICT DO NOTHING;
+
+-- Backfill function with adaptive batching
+CREATE OR REPLACE FUNCTION backfill_audit_logs_batch(
+    p_batch_size int DEFAULT 50000,
+    p_max_duration interval DEFAULT '30 seconds'
+) RETURNS TABLE(rows_migrated bigint, last_ts timestamptz, done bool) AS $$
+DECLARE
+    v_start timestamptz := clock_timestamp();
+    v_last_id bigint;
+    v_last_ts timestamptz;
+    v_count bigint;
+    v_total bigint := 0;
+BEGIN
+    SELECT last_id, last_ts INTO v_last_id, v_last_ts
+    FROM _backfill_progress WHERE table_name = 'audit_logs_partitioned';
+
+    LOOP
+        -- Short lock timeout to avoid blocking production
+        SET LOCAL lock_timeout = '2s';
+        SET LOCAL statement_timeout = '30s';
+        SET LOCAL idle_in_transaction_session_timeout = '60s';
+
+        WITH batch AS (
+            SELECT id, created_at
+            FROM audit_logs
+            WHERE id > v_last_id 
+              AND created_at >= COALESCE(v_last_ts, '2000-01-01'::timestamptz)
+            ORDER BY created_at, id
+            LIMIT p_batch_size
+            FOR UPDATE SKIP LOCKED
+        ),
+        moved AS (
+            INSERT INTO audit_logs_partitioned 
+                (id, org_id, user_id, action, resource, details, ip_address, created_at)
+            SELECT id, org_id, user_id, action, resource, details, ip_address, created_at
+            FROM audit_logs
+            WHERE id IN (SELECT id FROM batch)
+            ON CONFLICT (id, created_at) DO NOTHING
+            RETURNING id, created_at
+        )
+        SELECT COUNT(*), MAX(created_at) INTO v_count, v_last_ts
+        FROM moved;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        v_total := v_total + v_count;
+
+        IF v_count = 0 OR clock_timestamp() - v_start > p_max_duration THEN
+            UPDATE _backfill_progress 
+            SET last_ts = v_last_ts, 
+                batch_count = batch_count + 1,
+                updated_at = now()
+            WHERE table_name = 'audit_logs_partitioned';
+            
+            RETURN QUERY SELECT v_total, v_last_ts, 
+                (SELECT COUNT(*) FROM audit_logs WHERE created_at > v_last_ts) = 0;
+            RETURN;
+        END IF;
+
+        -- Brief pause to let production breathe
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**Run the backfill** (call repeatedly from a shell loop or pg_cron):
+
+```sql
+-- Execute batch
+SELECT * FROM backfill_audit_logs_batch(100000, '20s');
+
+-- Check progress
+SELECT 
+    bp.*,
+    (SELECT COUNT(*) FROM audit_logs) as source_rows,
+    (SELECT COUNT(*) FROM audit_logs_partitioned) as dest_rows,
+    ROUND(100.0 * (SELECT COUNT(*) FROM audit_logs_partitioned) / 
+          NULLIF((SELECT COUNT(*) FROM audit_logs), 0), 2) as pct_complete
+FROM _backfill_progress bp;
+```
+
+## 4. Dual-Write Trigger (Zero Downtime Sync)
+
+```sql
+-- Keep new table synced while backfill runs
+CREATE OR REPLACE FUNCTION audit_logs_dual_write()
+RETURNS trigger AS $$
+BEGIN
+    INSERT INTO audit_logs_partitioned 
+        (id, org_id, user_id, action, resource, details, ip_address, created_at)
+    VALUES 
+        (NEW.id, NEW.org_id, NEW.user_id, NEW.action, NEW.resource, 
+         NEW.details, NEW.ip_address, NEW.created_at);
+    RETURN NEW;
+EXCEPTION WHEN unique_violation THEN
+    RETURN NEW; -- Already migrated
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_logs_dual_write
+    AFTER INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION audit_logs_dual_write();
+```
+
+## 5. Cutover Procedure (Seconds of Downtime)
+
+```sql
+BEGIN;
+
+-- Final sync of any remaining gaps (fast, small set)
+INSERT INTO audit_logs_partitioned 
+    (id, org_id, user_id, action, resource, details, ip_address, created_at)
+SELECT id, org_id, user_id, action, resource, details, ip_address, created_at
+FROM audit_logs
+WHERE created_at > (SELECT last_ts FROM _backfill_progress WHERE table_name = 'audit_logs_partitioned')
+ON CONFLICT (id, created_at) DO NOTHING;
+
+-- Atomic rename (requires brief ACCESS EXCLUSIVE lock, ~milliseconds)
+ALTER TABLE audit_logs RENAME TO audit_logs_old;
+ALTER TABLE audit_logs_partitioned RENAME TO audit_logs;
+
+-- Rename primary key constraint
+ALTER INDEX audit_logs_partitioned_pkey RENAME TO audit_logs_pkey;
+
+COMMIT;
+
+-- Cleanup trigger (after verifying everything works)
+DROP TRIGGER trg_audit_logs_dual_write ON audit_logs_old;
+DROP FUNCTION audit_logs_dual_write();
+```
+
+## 6. Partition Pruning Verification
+
+```sql
+-- Verify pruning works (should show only relevant partitions, not full scan)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM audit_logs 
+WHERE created_at >= '2025-06-01' AND created_at < '2025-07-01'
+  AND org_id = 12345;
+
+-- Check partition sizes
+SELECT 
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size,
+    n_live_tup as rows
+FROM pg_stat_user_tables 
+WHERE tablename LIKE 'audit_logs%'
+ORDER BY tablename;
+
+-- Verify no sequential scans across partitions (pruning indicator)
+SELECT 
+    relname,
+    seq_scan,
+    seq_tup_read,
+    idx_scan,
+    idx_tup_fetch
+FROM pg_stat_user_tables
+WHERE relname LIKE 'audit_logs%_part%'
+ORDER BY relname;
+```
+
+## 7. Automated Future Maintenance (pg_partman)
+
+```sql
+-- Manual partition maintenance (or schedule via pg_cron)
+SELECT partman.run_maintenance(p_keep_table := true);
+
+-- Check partition health
+SELECT * FROM partman.check_parent_health('public.audit_logs'::regclass);
+
+-- View current partitions
+SELECT 
+    parent_table,
+    partition_name,
+    partition_range
+FROM partman.show_partitions('public.audit_logs'::regclass, p_order := 'ASC')
+LIMIT 10;
+```
+
+## Shell Runner Script (Optional)
+
+```bash
+#!/bin/bash
+# run_backfill.sh - Run until complete
+
+BATCH_SIZE=100000
+MAX_ITERATIONS=10000
+
+for i in $(seq 1 $MAX_ITERATIONS); do
+    result=$(psql -d mydb -t -A -F"," -c \
+        "SELECT rows_migrated, done FROM backfill_audit_logs_batch($BATCH_SIZE, '20s');")
+    
+    rows=$(echo $result | cut -d, -f1)
+    done=$(echo $result | cut -d, -f2)
+    
+    echo "Batch $i: migrated $rows rows"
+    
+    if [ "$done" = "t" ]; then
+        echo "Backfill complete!"
+        break
+    fi
+    
+    sleep 1
+done
+```
+
+This strategy keeps production online the entire time—backfill runs with `SKIP LOCKED` and short timeouts, dual-write captures live data, and the cutover is a sub-second rename.

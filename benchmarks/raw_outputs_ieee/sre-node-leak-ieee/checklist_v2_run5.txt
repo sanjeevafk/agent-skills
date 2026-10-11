@@ -1,0 +1,439 @@
+[exit=0 latency=24.17s]
+Updated 1.33.1 → 1.34.0
+# Production Memory Leak Diagnosis: Node.js 20 API Service
+
+## Phase 1 — Capture Heap Snapshots Safely in Production
+
+### 1.1 Enable Graceful Snapshot Collection
+
+```bash
+# Check current heap settings on the running pod
+kubectl exec -it <pod> -- node -e "console.log(require('v8').getHeapStatistics())"
+
+# Trigger a snapshot without restarting
+kubectl exec -it <pod> -- node --inspect-pid=$(pidof node) -e \
+  "const v8 = require('v8'); v8.writeHeapSnapshot('/tmp/heap-$(date +%s).heapsnapshot')"
+```
+
+### 1.2 Automated Snapshot Strategy (6-hour intervals)
+
+```bash
+#!/bin/bash
+# scripts/periodic_heap_snapshot.sh — run via crontab or systemd timer inside pod
+
+SNAPSHOT_DIR="/tmp/heapsnapshots"
+mkdir -p "$SNAPSHOT_DIR"
+MAX_AGE_HOURS=48
+
+# Take snapshot
+node -e "
+  const fs = require('fs');
+  const path = require('path');
+  const name = path.join('$SNAPSHOT_DIR', 'heap-' + Date.now() + '.heapsnapshot');
+  require('v8').writeHeapSnapshot(name);
+  console.error('Snapshot written:', name);
+"
+
+# Rotate old snapshots
+find "$SNAPSHOT_DIR" -name "heap-*.heapsnapshot" -mmin +$((MAX_AGE_HOURS * 60)) -delete
+
+echo "$(date '+%Y-%m-%dT%H:%M:%S') snapshot created" >> /var/log/heap-snapshots.log
+```
+
+Cron entry:
+```cron
+*/60 * * * * bash /scripts/periodic_heap_snapshot.sh
+```
+
+### 1.3 Pull and Diff Snapshots Locally
+
+```bash
+kubectl cp <pod>:/tmp/heapsnapshots/heap-1753459200000.heapsnapshot .
+kubectl cp <pod>:/tmp/heapsnapshots/heap-1753480800000.heapsnapshot .
+
+# Open both in Chrome DevTools simultaneously:
+#   chrome://memory → Load both .heapsnapshot files
+# Then use the "Comparison" tab to see retained object counts
+```
+
+---
+
+## Phase 2 — Identify Retainer Chains
+
+### 2.1 Closures Retained by Event Emitter Registry
+
+**What to look for in Chrome DevTools:**
+
+1. Load the two snapshots (t0 and t0+6h) into the **Comparison** view
+2. In the filter box, type: `EventEmitter` or `listener`
+3. Select the entries with highest **"Delta"** in *Retainers* column
+4. Right-click → **"Show Retainers Path"** — this reveals the chain
+
+**Expected retainer pattern:**
+
+```
+EventEmitter._events → Array of listener closures → closure captures
+  └─ request objects (full body, headers, cookies)
+  └─ large strings from response middleware
+  └─ WeakRefs that never fired cleanup
+```
+
+### 2.2 Buffers from Response-Logging Middleware
+
+In DevTools comparison:
+
+1. Filter: `Buffer` or `Uint8Array`
+2. Look at **"Shallow Size"** delta per constructor
+3. Expand the largest group → **"Retainers"** → trace back to call sites
+
+**Most likely path:**
+
+```
+ResponseLoggingMiddleware.on('response')
+  └─ captures full response Body as Buffer
+  └─ stored in module-level Set<Map> or array
+  └─ NEVER removed (no TTL, no size limit)
+```
+
+---
+
+## Phase 3 — Confirm Whether EventEmitter Leaks Listeners
+
+### 3.1 Live Diagnostic Script
+
+Run this against a live pod to check listener count over time:
+
+```javascript
+// scripts/check-listener-leak.js
+const { EventEmitter } = require('eventemitter3'); // or 'events'
+const originalOn = EventEmitter.prototype.on;
+const originalAddListener = EventEmitter.prototype.addListener;
+
+const registry = new Map();
+
+function trackEvents(emitter, label) {
+  if (!registry.has(emitter)) {
+    registry.set(emitter, { label, listeners: {}, added: 0, removed: 0 });
+  }
+
+  emitter.on = function(event, listener) {
+    const info = registry.get(this);
+    info.listeners[event] = (info.listeners[event] || 0) + 1;
+    info.added++;
+    return originalOn.apply(this, arguments);
+  };
+
+  emitter.addListener = function(event, listener) {
+    return this.on(event, listener);
+  };
+
+  // Patch removeListener too
+  const origRemove = emitter.removeListener;
+  emitter.removeListener = function(event, listener) {
+    const info = registry.get(this);
+    if (info && info.listeners[event]) {
+      info.listeners[event] = Math.max(0, info.listeners[event] - 1);
+      info.removed++;
+    }
+    return origRemove.apply(this, arguments);
+  };
+}
+
+module.exports = { trackEvents, registry };
+```
+
+**Usage in app bootstrap:**
+
+```javascript
+const { trackEvents } = require('./scripts/check-listener-leak');
+
+const eventBus = new EventEmitter();
+trackEvents(eventBus, 'app-event-bus');
+
+// Also patch any third-party emit-based libraries:
+const redisClient = require('redis').createClient();
+trackEvents(redisClient, 'redis');
+```
+
+### 3.2 Periodic Health Endpoint
+
+```javascript
+// Add to your Express/Fastify app
+app.get('/internal/memory-diag', async (req, res) => {
+  const vm = require('vm');
+  const stats = process.memoryUsage();
+
+  // Snapshot listener counts for tracked emitters
+  const leakReport = Object.entries(registry).map(([id, data]) => ({
+    label: data.label,
+    totalListeners: Object.values(data.listeners).reduce((a, b) => a + b, 0),
+    listenerBreakdown: data.listeners,
+    netGrowth: data.added - data.removed,
+  }));
+
+  // Count open handles
+  const openHandles = [...process._handleSymbols].length;
+
+  res.json({
+    timestamp: new ISODateString(),
+    rssMB: Math.round(stats.rss / 1024 / 1024),
+    heapUsedMB: Math.round(stats.heapUsed / 1024 / 1024),
+    heapTotalMB: Math.round(stats.heapTotal / 1024 / 1024),
+    externalMB: Math.round(stats.external / 1024 / 1024),
+    listenerLeaks: leakReport,
+    uptimeHours: Math.round(process.uptime() / 3600 * 100) / 100,
+    activeHandles: openHandles,
+  });
+});
+```
+
+### 3.3 Detection Thresholds
+
+| Metric | Normal | Suspicious | Confirmed Leak |
+|--------|--------|------------|----------------|
+| Listener growth/hour | 0–5 | 10–50 | 50+ |
+| Buffer allocations/min | stable | slowly rising | exponential |
+| External bytes | < 50MB | 50–500MB | > 500MB |
+
+Monitor with a simple loop:
+```bash
+for i in $(seq 1 10); do
+  curl -s http://localhost:3000/internal/memory-diag | jq '{netGrowth, rssMB, externalMB}'
+  sleep 60
+done
+```
+
+---
+
+## Phase 4 — Likely Root Causes & Fixes
+
+### Cause A: EventEmitter Listener Leak (Highest Probability)
+
+**Symptom signature:** Closure objects dominate heap delta, retainers point to `EventEmitter._eventsMap`.
+
+**Common patterns:**
+
+```javascript
+// ❌ LEAK: Anonymous function each call creates new listener
+function onRequest(req, res) {
+  const bus = getEventBus();
+  bus.on('data-ready', async function handler(data) {  // <-- anonymous, never removed
+    await processData(req.userId, data);
+  });
+  res.send('ok');
+}
+
+// ❌ LEAK: Dynamic event names accumulate keys
+bus.once(`request:${req.id}`, callback);  // key never garbage-collected
+```
+
+**Fix:**
+
+```javascript
+// ✅ Named function + explicit removal
+const handlers = new Map();  // Track and clean up
+
+function onRequest(req, res) {
+  const bus = getEventBus();
+
+  async function handler(data) {
+    try {
+      await processData(req.userId, data);
+    } finally {
+      bus.off('data-ready', handler);  // Always clean up
+    }
+  }
+
+  bus.on('data-ready', handler);
+  res.send('ok');
+}
+
+// ✅ Use Symbol-keyed temporary events instead of string templates
+const REQ_DONE = Symbol(`request-done:${Date.now()}:${Math.random()}`);
+bus.once(REQ_DONE, callback);
+
+// ✅ Or better: use once() consistently
+bus.once('data-ready', async (data) => { /* no cleanup needed */ });
+```
+
+### Cause B: Buffer Accumulation in Response Logging (High Probability)
+
+**Symptom signature:** `Buffer` objects with shallow size growing, retainer chain shows middleware module scope.
+
+**Typical buggy code:**
+
+```javascript
+// ❌ LEAK: Module-level array retains ALL responses forever
+const responseLog = [];
+
+function responseLoggingMiddleware(req, res, next) {
+  const end = res.end;
+  res.end = function(chunk, encoding) {
+    // Captures entire response buffer
+    responseLog.push({
+      url: req.originalUrl,
+      status: res.statusCode,
+      body: Buffer.from(chunk || ''),  // ← allocates & stores Buffer
+      timestamp: Date.now(),
+    });
+    end.call(this, chunk, encoding);
+  };
+  next();
+}
+```
+
+**Fixes:**
+
+```javascript
+// ✅ Option 1: Sample only, don't log everything
+const SAMPLE_RATE = 0.01;  // 1%
+
+function responseLoggingMiddleware(req, res, next) {
+  const end = res.end;
+  res.end = function(chunk, encoding) {
+    if (Math.random() < SAMPLE_RATE) {
+      logSlowResponse({
+        url: req.originalUrl,
+        status: res.statusCode,
+        duration: getResponseDuration(),
+        responseBodyLength: chunk ? Buffer.byteLength(chunk) : 0,
+      });
+    }
+    end.call(this, chunk, encoding);
+  };
+  next();
+}
+
+// ✅ Option 2: Ring buffer with fixed capacity
+const MAX_LOG_ENTRIES = 1000;
+const responseLogRing = [];
+let ringIndex = 0;
+
+function responseLoggingMiddleware(req, res, next) {
+  const end = res.end;
+  res.end = function(chunk, encoding) {
+    if (shouldLog(req)) {
+      const entry = {
+        url: req.originalUrl,
+        status: res.statusCode,
+        timestamp: Date.now(),
+      };
+      // Only store summary, NOT the full body buffer
+      if (chunk && Buffer.byteLength(chunk) > 1024 * 100) {  // > 100KB
+        entry.truncatedBodyHash = crypto.createHash('sha256')
+          .update(chunk).digest('hex');
+      } else {
+        entry.bodySnippet = chunk?.toString().slice(0, 200);
+      }
+      responseLogRing[ringIndex % MAX_LOG_ENTRIES] = entry;
+      ringIndex++;
+    }
+    end.call(this, chunk, encoding);
+  };
+  next();
+}
+
+// ✅ Option 3: Stream to disk / external sink instead of holding in memory
+function responseLoggingMiddleware(req, res, next) {
+  const logStream = fs.createWriteStream('/var/log/api-responses.log', { flags: 'a' });
+  const chunks = [];
+
+  const originalWrite = res.write;
+  res.write = function(chunk) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return originalWrite.apply(this, arguments);
+  };
+
+  const originalEnd = res.end;
+  res.end = function(chunk, encoding) {
+    if (chunk) chunks.push(Buffer.from(chunk));
+    const totalBytes = chunks.reduce((sum, c) => sum + c.length, 0);
+
+    // Write immediately, don't hold in memory
+    if (totalBytes > 0) {
+      const line = JSON.stringify({
+        url: req.originalUrl,
+        method: req.method,
+        status: res.statusCode,
+        totalBytes,
+        timestamp: new Date().toISOString(),
+      }) + '\n';
+      logStream.write(line);
+    }
+
+    // Clean up
+    chunks.length = 0;
+    originalEnd.call(this, undefined);
+  };
+
+  next();
+}
+```
+
+### Cause C: Combined Attack Vector
+
+The most dangerous scenario is when both issues interact:
+
+```
+Request arrives → middleware logs body as Buffer (Cause B)
+                → registers event listener for post-processing (Cause A)
+                → listener closure captures reference to the Buffer
+                → even when Buffer goes out of scope, closure keeps it alive
+Result: BOTH issues compound — listeners retain buffers indefinitely
+```
+
+**Defense-in-depth fix:**
+
+```javascript
+// 1. No anonymous closures capturing large objects
+// 2. All listeners use .once() OR are explicitly removed
+// 3. Response middleware streams to disk, holds nothing in memory
+// 4. Periodic health endpoint detects leaks before OOM
+```
+
+---
+
+## Phase 5 — Verification Plan
+
+### 5.1 Pre-Merge Smoke Test
+
+```bash
+# Simulate 48-hour traffic pattern locally
+node scripts/simulate-memory-pressure.js --duration 48h --requests-per-second 100
+
+# Verify RSS stays under threshold
+watch -n 5 'kubectl exec <pod> -- node -e "console.log(Math.round(require(\'os\').memoryUsage().rss / 1024 / 1024))"'
+```
+
+### 5.2 Canary Deployment Metrics
+
+Deploy with the `/internal/memory-diag` endpoint enabled first to a single pod. Monitor for 24 hours:
+
+```yaml
+# Prometheus alert (prometheus.yml)
+groups:
+  - name: node-memory
+    rules:
+      - alert: HighMemoryGrowthRate
+        expr: rate(process_resident_memory_bytes[1h]) > 50 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RSS growing >50MB/hour in {{ $labels.pod }}"
+
+      - alert: EventEmitterListenerCount
+        expr: sum(listener_growth by (pod)) > 500
+        for: 5m
+        labels:
+          severity: critical
+```
+
+### 5.3 Rollout Checklist
+
+- [ ] Fix all anonymous listener registrations → named functions with `.off()` in `finally` blocks
+- [ ] Replace response-buffer logging with sampled/disk-streamed variant
+- [ ] Add `/internal/memory-diag` endpoint (or expose via existing metrics path)
+- [ ] Add `process.on('warning', ...)` to catch V8 `JSHEAP_MEMORY_EXHAUSTED` warnings
+- [ ] Deploy to 1 pod → monitor 24h → 50% traffic → 100% traffic
+- [ ] Run k6 load test matching production RPS while monitoring heap delta between snapshots

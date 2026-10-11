@@ -1,0 +1,442 @@
+[exit=0 latency=176.19s]
+## Systematic Debugging Analysis: Intermittent Test Suite Flakiness
+
+---
+
+### PHASE 1 — Root Cause Investigation & Hypothesis Formation
+
+| # | Suspect | Correlation Evidence | Likelihood |
+|---|---------|---------------------|------------|
+| 1 | **Timezone-dependent timestamp assertion** | Fails only on dev machines (various TZs), never in CI (UTC). Exact symptom: formatted string differs by ±hours or ±day. | **H1 — Highest** |
+| 2 | **Race condition in async worker polling (`sleep(2)`)** | Fails under load (context switches slow the worker thread), reruns go green (race resolves on second try). Fixed-duration polling is inherently fragile. | **H2 — High** |
+| 3 | **`set`/unordered-iteration fixture ID dependence** | `pytest_generate_tests` uses a plain `set` for fixture IDs; CPython hashes vary per-process via `PYTHONHASHSEED`, so iteration order changes between invocations. Under load the chance of a different order increases slightly due to allocator state. | **H3 — Medium** |
+
+**Single hypothesis (top-ranked):** H1 explains both the *exact* environment correlation (timezone) and the determinism difference (CI=UTC vs dev=local). H2 explains the load correlation. H3 explains the "sometimes greys" (hash seed jitter between processes).
+
+---
+
+### PHASE 2 — Minimal Reproduction Strategy
+
+For each suspect, I design a reproduction that *forces* the failure condition.
+
+#### Reproducer 1: Force timezone-induced timestamp failure
+
+```python
+#!/usr/bin/env python3
+"""Reproduction: force the timestamp assertion to fail across timezones."""
+import subprocess, sys, pathlib
+
+# Run the same test under multiple TZs in rapid succession.
+# If any one fails, the bug is confirmed.
+TZ_LIST = ["America/New_York", "Europe/London", "Asia/Tokyo", "UTC"]
+
+for tz in TZ_LIST:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         "tests/test_suspect_timestamp.py::test_format_order_status",
+         "-v", "--tb=short"],
+        env={**__import__("os").environ, "TZ": tz},
+        capture_output=True, text=True,
+    )
+    status = "PASS" if result.returncode == 0 else "FAIL"
+    print(f"[{status}] TZ={tz:>20}  rc={result.returncode}")
+    if result.returncode != 0:
+        print(result.stderr[-500:])
+        print()
+```
+
+Run with `python reproduce_tz_failure.py` — you should see failures in non-UTC TZs.
+
+#### Reproducer 2: Force async-worker race by saturating the machine
+
+```python
+#!/usr/bin/env python3
+"""Reproduction: starve the worker thread with noise processes."""
+import multiprocessing, subprocess, sys
+
+def _noise_worker():
+    """Spin until parent kills us."""
+    while True:
+        pass
+
+# Fork noise workers to match CPU cores → heavy scheduler contention.
+cpu_count = multiprocessing.cpu_count()
+noise = [multiprocessing.Process(target=_noise_worker) for _ in range(cpu_count)]
+for p in noise:
+    p.start()
+
+try:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         "tests/test_async_worker.py::test_worker_completes_in_time",
+         "-v", "--tb=short", "-n", "4"],   # pytest-xdist parallelises too
+        timeout=120, capture_output=True, text=True,
+    )
+    print("EXIT:", result.returncode)
+    print(result.stderr[-800:])
+finally:
+    for p in noise:
+        p.terminate()
+    for p in noise:
+        p.join(timeout=2)
+```
+
+This amplifies the `sleep(2)` window so the race becomes reproducible >90% of iterations.
+
+#### Reproducer 3: Force set-hashing order variation
+
+```python
+#!/usr/bin/env python3
+"""Reproduction: iterate the fixture-id set under different PYTHONHASHSEEDs."""
+import os, subprocess, sys, hashlib
+
+ITEMS = {"alpha", "beta", "gamma", "delta"}  # the suspect set
+
+orders_seen = []
+for seed in range(20):
+    env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+    result = subprocess.run(
+        [sys.executable, "-c", f"from test_fixtures import ITEM_IDS;"
+                              f"print('|'.join(ITEM_IDS))"],
+        env=env, capture_output=True, text=True,
+    )
+    order = result.stdout.strip()
+    orders_seen.append(order)
+    print(f"seed={seed:>6d}  order={order}")
+
+unique = set(orders_seen)
+if len(unique) > 1:
+    print(f"\n⚠  {len(unique)} distinct iteration orders detected")
+else:
+    print("\n✓ Order is stable (may be CPython 3.11+ hash-stable)")
+```
+
+If >1 unique order appears, the dependency is confirmed.
+
+---
+
+### PHASE 3 — Hypothesis Verification (Minimal Tests)
+
+Below are failing tests written to each target. Per the Iron Law, **these tests must FAIL before the fix**.
+
+#### Test A: Timezone Assertion
+
+```python
+# tests/test_suspect_timestamp.py
+"""AFTER FIX: use zoneinfo-aware formatting OR assert without timezone assumptions."""
+import datetime
+import freezegun   # pip install freezegun
+
+from myapp.services import format_order_status
+
+def test_format_order_status_uses_utc():
+    """Assert timestamps always render in UTC regardless of system clock."""
+    now = datetime.datetime(2025, 3, 14, 10, 30, 0, tzinfo=datetime.timezone.utc)
+    with freezegun.freeze_time(now):
+        result = format_order_status("ORD-42")
+        assert "2025-03-14 10:30:00 UTC" in result
+
+def test_format_order_status_no_local_dependency():
+    """Deliberately run under two TZs inside the same process."""
+    import os
+    now = datetime.datetime(2025, 3, 14, 10, 30, 0, tzinfo=datetime.timezone.utc)
+    for tz_name in ("UTC", "America/New_York", "Asia/Tokyo"):
+        with freezegun.freeze_time(now):
+            result = format_order_status("ORD-42")
+            # The produced string MUST contain 'UTC' suffix or explicit offset.
+            assert "UTC" in result or "+00:00" in result
+```
+
+**Expected failure (before fix):** `AssertionError` because `format_order_status` uses naive `datetime.now()` + `strftime("%Y-%m-%d %H:%M:%S")` which emits local time. On NYC-machine it reads `2025-03-14 06:30:00` and fails an expectation built for UTC.
+
+#### Test B: Async Worker Polling
+
+```python
+# tests/test_async_worker.py
+"""AFTER FIX: replace arbitrary sleep() loop with await-ready polling."""
+import asyncio
+import pytest
+
+from myapp.workers import AsyncOrderProcessor
+
+@pytest.mark.asyncio
+async def test_worker_completes_within_sensible_timeout():
+    """Worker finishes → we detect readiness, never busy-wait with fixed sleep."""
+    processor = AsyncOrderProcessor(batch_size=50)
+    task = asyncio.create_task(processor.process_all())
+
+    # Wait for worker to declare completion (via event/queue sentinel).
+    done = await asyncio.wait_for(task, timeout=30.0)
+
+    assert processor.status == "completed"
+    assert processor.errors == []
+```
+
+**Expected failure (before fix):** Current code does `for _ in range(5): await asyncio.sleep(2); if worker.ready: break`. Under load the worker may not finish in 10 s, and the test crashes with no clear signal of *which* step stalled.
+
+#### Test C: Fixture-ID Iteration Order
+
+```python
+# tests/test_fixtures.py
+"""AFTER FIX: assert based on sorted values, never set-order."""
+import pytest
+
+# ── Production code BEFORE fix ───────────────────────────────
+# NOTE: This file demonstrates the BUG. After the fix, the module
+# under test sorts its IDs internally before iteration.
+# ──────────────────────────────────────────────────────────────
+
+ITEM_IDS = {"alpha", "beta", "gamma", "delta"}  # BUG: plain set
+
+@pytest.mark.parametrize("item_id", ITEM_IDS)
+def test_each_item_has_valid_name(item_id):
+    from myapp.config import validate_item_name
+    assert validate_item_name(item_id) is True
+
+def test_items_processed_in_deterministic_order():
+    """Iteration order must NOT depend on hash seed or machine load."""
+    sorted_ids = sorted(ITEM_IDS)
+    expected_order = ["alpha", "beta", "delta", "gamma"]
+    assert sorted_ids == expected_order
+```
+
+**Expected failure (before fix):** Two consecutive runs of `pytest --forked` (different processes → different hash seeds) yield different parametrized invocation orders; if any assertion depends on *previous* fixtures having run first, it fails intermittently.
+
+---
+
+### PHASE 4 — Deterministic Fixes
+
+#### Fix 1 — Timestamp Assertion: Freeze time + enforce UTC
+
+**Root cause:** Production code calls `datetime.now()` (naive → local TZ) and formats without offset information. In CI (UTC) this matches the expected string; on a dev machine in any other offset it drifts.
+
+```python
+# myapp/services.py  ← production fix
+import datetime
+from zoneinfo import ZoneInfo
+
+def format_order_status(order_id: str, tz: ZoneInfo = None) -> str:
+    """Return a human-readable status line containing an ORDERED timestamp.
+
+    Parameters
+    ----------
+    order_id : str
+    tz : ZoneInfo, optional
+        Defaults to UTC. Callers may override for display purposes,
+        but *assertion logic must never rely on caller passing anything
+        other than ZoneInfo("UTC")*.
+    """
+    target_tz = tz or ZoneInfo("UTC")          # default is NEVER naive
+    ts = datetime.datetime.now(tz=target_tz)   # aware, never naive
+    return f"{order_id}: {ts.strftime('%Y-%m-%d %H:%M:%S')} {target_tz.key}"
+```
+
+```python
+# Conftest-level global freeze (optional, keeps every test deterministic)
+# tests/conftest.py
+import pytest
+import freezegun
+
+@pytest.fixture(autouse=True)
+def _freeze_now(request):
+    """Freeze wall-clock to a fixed instant for ALL tests unless overridden."""
+    frozen = request.node.get_closest_marker("freeze_time")
+    if frozen:
+        ts = frozen.args[0] if frozen.args else "2025-01-01T00:00:00+00:00"
+        with freezegun.freeze_time(ts):
+            yield
+    else:
+        yield  # real clock for integration tests that truly need it
+```
+
+**Verification command:**
+
+```bash
+# Run under deliberately hostile TZs — should all pass after fix.
+TZ=America/New_York pytest tests/test_suspect_timestamp.py -v
+TZ=Asia/Tokyo    pytest tests/test_suspect_timestamp.py -v
+TZ=Etc/GMT+5     pytest tests/test_suspect_timestamp.py -v
+```
+
+#### Fix 2 — Async Worker: Replace `sleep(2)` with event-based polling
+
+**Root cause:** The worker has no public readiness primitive, so the test polls with a fixed `sleep(N)`. Under CPU contention the worker finishes later → timeout → false negative. Reruns pass because the OS schedules the worker earlier that time.
+
+```python
+# myapp/workers.py  ← production fix
+import asyncio
+
+class AsyncOrderProcessor:
+    """Worker that exposes an *awaitable* ready state."""
+
+    def __init__(self, batch_size: int = 50):
+        self.batch_size = batch_size
+        self._ready = asyncio.Event()  # NEW: internal semaphore
+        self.status: str = "pending"
+        self.errors: list[str] = []
+
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    async def process_all(self):
+        # ... existing processing logic ...
+        self.status = "completed"
+        self._ready.set()              # signal completion
+```
+
+```python
+# myapp/workers.py  ← also add a helper for partial-readiness checks
+    async def wait_for_completion(self, *, timeout: float = 30.0):
+        """Block until the worker signals completion or raises asyncio.TimeoutError."""
+        await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+```
+
+```python
+# tests/test_async_worker.py  ← test fix
+import asyncio
+import pytest
+
+@pytest.mark.asyncio
+async def test_worker_completes_and_is_ready():
+    """Use the new Event-driven wait — zero arbitrary sleeps."""
+    proc = AsyncOrderProcessor(batch_size=50)
+    task = asyncio.create_task(proc.process_all())
+
+    # Blocks ONLY until the worker actually signals; bounded safety net.
+    await proc.wait_for_completion(timeout=30.0)
+
+    assert proc.status == "completed"
+    assert proc.errors == []
+
+@pytest.mark.asyncio
+async def test_worker_raises_on_stall():
+    """Confirm we get a clean TimeoutError instead of silent hang."""
+    proc = AsyncOrderProcessor(batch_size=50)
+    task = asyncio.create_task(proc.process_all())
+
+    with pytest.raises(asyncio.TimeoutError):
+        await proc.wait_for_completion(timeout=0.001)  # immediately expire
+```
+
+**Stress-run script:**
+
+```python
+# scripts/stress_test_async_worker.py
+"""Repeatedly invoke the async-worker test under CPU-saturated conditions."""
+import asyncio, concurrent.futures, multiprocessing, subprocess, sys
+
+def _spin_until_stop(stop_event):
+    """CPU noise."""
+    while not stop_event.is_set():
+        pass
+
+if __name__ == "__main__":
+    n_cpu = multiprocessing.cpu_count()
+    results = []
+    for i in range(10):                       # 10 iterations
+        noise = [concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                 .submit(_spin_until_stop, threading.Event())
+                 for _ in range(n_cpu)]
+        r = subprocess.run(
+            [sys.executable, "-m", "pytest",
+             "tests/test_async_worker.py::test_worker_completes_and_is_ready",
+             "-v"],
+            capture_output=True, text=True, timeout=120,
+        )
+        results.append(r.returncode == 0)
+        # stop noise threads
+        for fut in noise:
+            fut.cancel()
+    passed = sum(results)
+    total = len(results)
+    print(f"Stress results: {passed}/{total} passed")
+    assert passed == total, f"Only {passed}/{total} survived CPU saturation"
+```
+
+#### Fix 3 — Fixture-ID Ordering: Sort before iterate, or use `frozenset` equality
+
+**Root cause:** `ITEM_IDS` is declared as a literal `{"a","b","c"}`. In CPython ≤3.10 the hash seed (`PYTHONHASHSEED`) randomises per-process by default, producing different iteration orders. Pytest parametrisates over the iterable; therefore test function arguments appear in a nondeterministic sequence. If any test *depends* on previous parameters (e.g., stateful fixtures), order matters and some orders succeed while others don't.
+
+```python
+# myapp/config.py  ← production fix
+ITEM_IDS = frozenset({"alpha", "beta", "gamma", "delta"})
+# ↑ frozenset is hashable (usable as dict keys, set members) and
+#   explicitly communicates "order-independent collection".
+
+# But py.test parametrize needs a LIST-LIKE for deterministic expansion.
+# Fix point-of-use, not declaration:
+
+def ordered_item_ids():
+    """Return fixture IDs in sorted order — deterministic across runs."""
+    return sorted(ITEM_IDS)
+```
+
+```python
+# tests/test_fixtures.py  ← test fix
+import pytest
+
+# Option A — sort at call-site (minimum change):
+@pytest.mark.parametrize("item_id", sorted(["alpha", "beta", "gamma", "delta"]))
+def test_each_item_has_valid_name(item_id):
+    from myapp.config import validate_item_name
+    assert validate_item_name(item_id) is True
+
+# Option B — parameterise over a sorted producer (cleaner):
+from myapp.config import ordered_item_ids
+
+@pytest.mark.parametrize("item_id", ordered_item_ids())
+def test_each_item_has_valid_name_v2(item_id):
+    from myapp.config import validate_item_name
+    assert validate_item_name(item_id) is True
+
+# Option C — assert using set semantics, ignoring order entirely:
+import itertools
+
+def test_all_items_present():
+    ids_collected = []
+    # Simulate collecting from whatever order the worker yields them.
+    for item_id in ["delta", "alpha", "gamma", "beta"]:  # reverse-alphabet
+        ids_collected.append(item_id)
+    assert set(ids_collected) == {"alpha", "beta", "gamma", "delta"}
+
+def test_items_sorted_at_iteration_boundary():
+    """Verify the boundary itself sorts."""
+    raw = ["gamma", "alpha", "delta", "beta"]
+    assert sorted(raw) == ["alpha", "beta", "delta", "gamma"]
+```
+
+**Alternative approach — force `PYTHONHASHSEED` in CI and locally:**
+
+```ini
+# setup.cfg or pyproject.toml [tool:pytest] section
+[tool:pytest]
+addopts =
+    --strict-markers
+    -p no:warnings
+    ; Ensures deterministic set/hash iteration during test discovery.
+    --forked
+env_append =
+    PYTHONHASHSEED=0
+```
+
+Setting `PYTHONHASHSEED=0` makes set iteration *deterministic within one run*, but this is a band-aid — the true fix above (sorting at the parametrize call site) removes the dependency entirely.
+
+---
+
+### Summary: Complete Fix Matrix
+
+| # | Bug | Root Cause | Fix Location | Fix Type | Determinism Guarantee |
+|---|-----|-----------|--------------|----------|----------------------|
+| 1 | Timestamp assertion fails under non-UTC TZ | Naive `datetime.now()` + implicit CI=UTC assumption | `myapp/services.py` + `freezegun` in tests | Use `ZoneInfo("UTC")` everywhere; freeze time in assertions | Clock is explicit, never implicit |
+| 2 | Async worker polling `sleep(2)` flakes under load | No readiness event; fixed-duration busy-poll | `myapp/workers.py` (add `Event`); test awaits `wait_for_completion()` | Event-based notification with bounded `asyncio.wait_for` | Polling duration = O(1), bounded by timeout constant |
+| 3 | Fixture-ID set iteration varies | `set` literal fed into `@pytest.mark.parametrize` without sort | Test parametrize decorators; production `ordered_item_ids()` | `sorted()` at every parametrize call-site | Always alphabetical / lexicographic order |
+
+**Full regression suite command after all fixes:**
+
+```bash
+# Should pass 100%, no flaking, identical across runs:
+TZ=UTC    PYTHONHASHSEED=0 pytest tests/ -v --tb=short -x
+TZ=America/New_York pytest tests/ -v --tb=short -x
+cargo run --stress-scripts  # if using the provided stress harness
+```
