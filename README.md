@@ -119,29 +119,26 @@ print(metrics["token_reduction_percentage"])
 
 ## 5. Licensing
 
-**This repository ships no single blanket license, and should not acquire one
-without scoping it.**
+See **[`LICENSE`](LICENSE)** for the full terms. It is not a standard license
+such as MIT or Apache-2.0, because this repository holds two different kinds of
+material under different terms, and a blanket license would misrepresent one of
+them.
+
+In short:
 
 | Content | Terms |
 |---|---|
-| `scripts/`, `canonical/`, and skills authored for this repository | *no license granted yet* |
-| `collections/` (15,070 files) | **retain their upstream licenses** — Apache-2.0, MIT, and CC BY-NC 4.0 are all present |
-| Any path shipping its own `LICENSE` (`skills/archify`, `skills/bro`, `skills/oil-motion`, `skills/attention-span`, …) | governed by that file |
+| `scripts/`, `canonical/`, `tests/`, `benchmarks/`, and skills authored here | the grant in **Part 1** of `LICENSE` |
+| `collections/` (15,070 files) | **their upstream licenses** — Apache-2.0, MIT, and CC BY-NC 4.0 are all present; see Part 2 for the per-collection table |
+| Any path shipping its own `LICENSE` (e.g. `skills/attention-span/`) | governed by that file |
 
-Before adding a root `LICENSE`, three things need settling:
+Three things worth knowing before you copy anything out of `collections/`:
 
-1. **`skills/attention-span/` is AGPL-3.0.** AGPL is copyleft and cannot be
-   relicensed MIT by the author for anyone who already received it under those
-   terms. Its own LICENSE file correctly isolates it.
-2. **`collections/academic-research-skills/` is CC BY-NC 4.0** (© Cheng-I Wu).
-   Non-commercial terms are incompatible with a permissive repository license,
-   so that path must retain its own.
-3. **`skills/archify/node_modules/` — 4,172 vendored files are committed.** This
-   is a dependency tree carrying dozens of third-party licenses; it should be
-   git-ignored and installed on demand rather than vendored.
-
-The recommended arrangement is **MIT for authored work with an explicit scope
-clause** excluding `collections/` and any path carrying its own `LICENSE`,
-accompanied by a `THIRD_PARTY_NOTICES.md` recording each vendored collection's
-provenance and terms. No root `LICENSE` has been added — that decision is
-outstanding.
+- `academic-research-skills/` is **CC BY-NC 4.0** — non-commercial, and
+  incompatible with any permissive grant.
+- `skills/attention-span/` is **AGPL-3.0** — copyleft; it cannot be relicensed
+  permissively.
+- Four collections (`agentic-design-patterns/`, `claude-agent-architectures/`,
+  `enterprise-ops/`, `reference-architectures/`) ship **no license file at all**.
+  With no license, default copyright applies: treat them as all rights
+  reserved, and do not redistribute them until terms are established.
