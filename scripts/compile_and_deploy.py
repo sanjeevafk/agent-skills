@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_COMPILER = REPO_ROOT / "crates" / "skills-compiler" / "target" / "release" / "skills-compiler"
+DEFAULT_COMPILER = REPO_ROOT / "scripts" / "skills_compiler.py"
 DEFAULT_SKILLS_DIR = REPO_ROOT / "skills"
 CONFIG_FILE = Path(os.path.expandvars(os.path.expanduser(os.environ.get("GLOBAL_SKILLS_CONFIG", "~/.global-skills.conf")))).resolve()
 
@@ -116,10 +116,9 @@ def clean_destination(dest_dir: Path):
         shutil.rmtree(dest_dir)
 
 
-def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = False):
-    if not compiler_bin.exists():
-        print(f"Error: Compiler binary not found at {compiler_bin}", file=sys.stderr)
-        print("Please build it first: cargo build --release --manifest-path crates/skills-compiler/Cargo.toml", file=sys.stderr)
+def compile_and_deploy(skills_dir: Path, compiler: Path, dry_run: bool = False):
+    if not compiler.exists():
+        print(f"Error: compiler not found at {compiler}", file=sys.stderr)
         sys.exit(1)
 
     skill_dirs = [d for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
@@ -150,7 +149,8 @@ def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = Fal
 
             try:
                 res = subprocess.run(
-                    [str(compiler_bin), "compile", "--keep-frontmatter", "--input", str(src_skill_md)],
+                    [sys.executable, str(compiler), "compile",
+                     "--keep-frontmatter", "--input", str(src_skill_md)],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -236,7 +236,8 @@ def compile_and_deploy(skills_dir: Path, compiler_bin: Path, dry_run: bool = Fal
 def main():
     parser = argparse.ArgumentParser(description="Compile skills preserving frontmatter and deploy to all agent environments.")
     parser.add_argument("--skills-dir", type=Path, default=DEFAULT_SKILLS_DIR, help="Path to skills directory")
-    parser.add_argument("--compiler", type=Path, default=DEFAULT_COMPILER, help="Path to skills-compiler binary")
+    parser.add_argument("--compiler", type=Path, default=DEFAULT_COMPILER,
+                        help="Path to skills_compiler.py")
     parser.add_argument("--dry-run", action="store_true", help="Compile to verify without deploying")
     args = parser.parse_args()
 
