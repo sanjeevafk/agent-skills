@@ -176,11 +176,11 @@ reports this as bounded below the noise floor rather than as a proven null.
 ## Test-count correction
 
 §7.1 states "13 unit tests pin this behavior" for the A4 eraser. The suite
-now has **27 tests, of which 16 are A4 tests** (11 behavioural guards + 3
-known-gap characterisation tests + 2 port-specific regression guards added
-during the port). They live in `tests/test_compiler_parity.py`, a direct port
-of the crate's 24 tests plus three that pin bugs the port itself introduced.
-Update the manuscript figure to match.
+now has **27 tests, of which 14 are A4 tests** (9 behavioural guards, 2
+covering type-predicate and switch/case handling, and 3 characterising known
+gaps). They live in `tests/test_compiler_parity.py`, a direct port of the
+crate's 24 tests plus three that pin bugs the port itself introduced. The
+manuscript's "14 A4-specific unit tests" figure is correct as written.
 
 ## Note on token measurement
 

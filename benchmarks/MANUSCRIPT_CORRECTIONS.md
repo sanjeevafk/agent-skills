@@ -128,7 +128,7 @@ Corrected in the previous commit. Summary:
   Python port, cross-validated against the Rust binary on all six compilation
   modes across the benchmark corpus -- 120/120 byte-identical -- before the
   crate was removed. No recorded number changed.)
-- The test count was corrected from "13 unit tests" to 16 A4-specific tests
+- The test count was corrected from "13 unit tests" to 14 A4-specific tests
   (27 total in `tests/test_compiler_parity.py`), with a breakdown of
   behavioural guards versus known-gap characterisation tests.
 
