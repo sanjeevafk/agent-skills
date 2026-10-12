@@ -1,71 +1,89 @@
 ---
 name: nasa-power-of-ten-python
 description: >
-  Apply NASA JPL's "Power of Ten" reliability coding rules to Python and FastAPI
-  codebases to eliminate entire categories of bugs. Use this skill whenever a
-  user asks to review, audit, or refactor Python code for reliability, production
-  safety, or code quality — especially for FastAPI services, background workers,
-  or any long-running Python process. Trigger even when the user says things like
-  "my code has silent failures", "I have a memory leak", "improve code quality",
-  "make this more robust", or "review this for production".
+  Audit Python, FastAPI, or long-running service code against a 12-rule
+  reliability discipline adapted from NASA JPL's Power of Ten rules and extended
+  for AI-generated code. Use whenever a user asks to review, audit, or refactor
+  code for reliability, production safety, or correctness -- especially for
+  FastAPI services, background workers, daemons, or any long-running process.
+  Trigger even when the user says things like "my code has silent failures",
+  "I have a memory leak", "improve code quality", "make this more robust",
+  "is this safe to ship", "audit this", or "review this for production".
+  Produces a severity-ranked findings report with a rule-by-rule summary and a
+  ship / do-not-ship verdict.
 ---
 
-# NASA JPL Power of Ten — Python & FastAPI Reliability Rules
-
-**Description:** A structured code-review and refactoring skill that adapts NASA's
-Jet Propulsion Laboratory "Power of Ten" safety-critical coding rules to Python and
-FastAPI applications. These rules eliminate whole *categories* of bugs rather than
-patching them one by one.
+# NASA JPL Power of Ten — 12-Rule Audit for Python & AI-Assisted Code
 
 **Category:** Code Quality | Reliability | Python Best Practices
-
 **Skill Level:** Advanced
+
+**Sources.** The rules descend from Gerard Holzmann's
+[Power of Ten — Rules for Developing Safety Critical Code](https://spinroot.com/gerard/pdf/P10.pdf)
+(NASA/JPL, 2006). The 12-rule audit structure, severity taxonomy, and rules 10–12
+are adapted from [LordMoMA/AI_skills](https://github.com/LordMoMA/AI_skills),
+extended for LLM-generated code. The Python/FastAPI translations and worked
+examples are this repository's contribution.
 
 ---
 
 ## Overview
 
-NASA's JPL uses the Power of Ten rules (authored by Gerard Holzmann) for C programs
-running on Mars rovers — software where a single bug cannot be patched after launch.
-The core insight is that **rules which remove entire classes of bugs are more valuable
-than rules that catch individual bugs**.
+NASA's JPL applies the Power of Ten rules to C programs running on Mars rovers —
+software where a single bug cannot be patched after launch. The core insight is
+that **rules which remove entire classes of bugs are more valuable than rules
+that catch individual bugs**.
 
 Applied to Python/FastAPI, these rules surface hidden failures, prevent resource
-exhaustion, and make code dramatically easier to review and test. They are not about
-risk parity with spacecraft software — they are about borrowing a proven *way of
-thinking* that pays off at any scale.
+exhaustion, and make code dramatically easier to review and test. This is not
+about risk parity with spacecraft software. It is about borrowing a proven *way
+of thinking* that pays off at any scale.
+
+**Read the actual code.** Do not audit from filenames, diffs, or assumptions.
 
 ---
 
-## Core Rules (Quick Reference)
+## The 12 Rules (Quick Reference)
 
-| # | Rule | NASA Intent | Python/FastAPI Translation |
-|---|------|------------|---------------------------|
-| 1 | Simple Control Flow | No `goto`, no recursion | No bare `except`, no exception-driven flow |
-| 2 | Fixed Loop Bounds | Every loop provably terminates | All `while` loops get a `MAX_ATTEMPTS` guard |
-| 3 | No Dynamic Memory After Init | No `malloc` post-startup | No unbounded list/dict growth in long-running processes |
-| 4 | Small, Single-Purpose Functions | ≤ 60 lines, one responsibility | Route handlers delegate; no function does 6+ things |
-| 5 | Liberal Assertions | Assert invariants explicitly | Replace `assert` with explicit `ValueError`/`raise` checks that survive `-O` |
+| # | Rule | Intent | Python / FastAPI Translation |
+|---|------|--------|------------------------------|
+| 1 | Keep it linear | No `goto`, no unbounded recursion | No nesting >2 deep; no exception-driven flow; no bare `except` |
+| 2 | Bound every loop | Every loop provably terminates | `while` gets an enforceable cap or timeout; retry/poll/crawl loops are 🔴 |
+| 3 | Know what you own | Every resource closed on every path | `with` / `async with` everywhere; bounded growth in long-lived structures |
+| 4 | One function, one job | ≤ 60 lines, one responsibility | Route handlers delegate; no function describable only with "and" |
+| 5 | State your assumptions | Assert invariants in code | Replace `assert` with `if`/`raise` that survives `-O`; validate at trust boundaries |
+| 6 | Never swallow errors | Every failure surfaces | No `except: pass`, empty catches, ignored return codes, discarded `err` |
+| 7 | Narrow your state | Scope state as tightly as possible | No module globals, wide mutable state, or class-level passthrough |
+| 8 | Surface your side effects | I/O visible at the call site | Do not hide network/DB/disk writes in innocuously-named helpers |
+| 9 | One layer of magic | Nothing obscures what runs | Stacked decorators, middleware chains, dynamic dispatch, callback pyramids |
+| 10 | Warnings are errors | Static analysis must block | Linter/typechecker must be exit-code-failing in CI, not advisory |
+| 11 | Read every line | No unreviewed AI artifacts | Dead code, commented-out "just in case", `data`/`result`/`temp` in critical paths |
+| 12 | Tests first | Production code has a failure-mode test | New behaviour ships with a test covering at least one failure |
+
+---
+
+## Severity
+
+Use these tags on every finding. Do not invent tags.
+
+- 🔴 **Critical** — silent data loss, resource leak, swallowed error, unbounded loop in a production path
+- 🟠 **High** — likely bug, missing invariant check, side-effect surprise
+- 🟡 **Medium** — maintainability hazard, comprehension cost
+- 🟢 **Low** — style / clarity nit
+- ℹ️ **Info** — observation or good practice noted
 
 ---
 
 ## Detailed Rules
 
-### Rule 1: Restrict to Simple Control Flow
+### Rule 1: Keep it linear
 
-**NASA Original Purpose:**
-Eliminate `goto`, `setjmp`/`longjmp`, and recursion. When control flow is complex,
-you cannot confidently trace what the program will actually do.
+**Original purpose.** Eliminate `goto`, `setjmp`/`longjmp`, and unbounded recursion. When control flow is complex you cannot confidently trace what the program will do.
 
-**Python/FastAPI Application:**
-Python has no `goto`, but equivalent traps exist: deeply nested `if` blocks, unbounded
-recursion, and — most commonly — using broad `except` clauses to silently swallow errors
-and redirect execution. This last pattern is the Python version of `goto`: it makes the
-real execution path invisible.
+**Python / FastAPI.** Python has no `goto`, but the equivalent traps exist: nesting more than two levels deep, recursion without an explicit base-case bound, and — most commonly — using broad `except` clauses to redirect execution. The last is Python's `goto`: it makes the real path invisible.
 
-**❌ Violates the Rule**
+**❌ Violates**
 ```python
-# Exception used as silent control flow — hides real errors
 def get_user(user_id):
     try:
         return db.query(User).filter(User.id == user_id).first()
@@ -73,9 +91,8 @@ def get_user(user_id):
         return None
 ```
 
-**✅ Follows the Rule**
+**✅ Follows**
 ```python
-# Explicit control flow — None case is visible and logged
 def get_user(user_id):
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
@@ -83,34 +100,25 @@ def get_user(user_id):
     return user
 ```
 
-**Impact:** Removing bare `except` blocks in one codebase revealed **two production
-bugs that had been silently failing for months**.
+> Reported impact: removing bare `except` blocks in one codebase exposed two production bugs that had been silently failing for months.
 
 ---
 
-### Rule 2: Give All Loops a Fixed Upper Bound
+### Rule 2: Bound every loop
 
-**NASA Original Purpose:**
-Every loop must have a provable maximum iteration count. Infinite loops can freeze
-an entire system with no recovery path.
+**Original purpose.** Every loop must have a provable maximum iteration count. An unbounded loop can freeze a system with no recovery path.
 
-**Python/FastAPI Application:**
-`while` loops without explicit termination conditions are the primary offender. Under
-specific failure modes — a task flag that never flips, a queue that never drains — they
-run forever, consuming CPU and memory until the process dies or the server runs out of
-resources.
+**Python / FastAPI.** `while` loops without explicit termination are the primary offender. Polling, retry, and crawl loops are 🔴 by default: a task flag that never flips, a queue that never drains, and the loop runs until the process dies.
 
-**❌ Violates the Rule**
+**❌ Violates**
 ```python
-# No upper bound — runs forever if task_complete never becomes True
 while not task_complete:
     process_next_item()
     time.sleep(1)
 ```
 
-**✅ Follows the Rule**
+**✅ Follows**
 ```python
-# Explicit upper bound — guaranteed to terminate; failure is logged
 MAX_ATTEMPTS = 300
 for attempt in range(MAX_ATTEMPTS):
     if task_complete:
@@ -122,74 +130,65 @@ else:
     raise TaskTimeoutError("Exceeded maximum attempts")
 ```
 
-**Impact:** Three unbounded `while` loops in background workers were found that would
-have consumed all server memory under specific failure conditions.
+For genuinely continuous workers, bound by wall-clock instead of iteration count — an unbounded `asyncio` consumer should carry a heartbeat and a shutdown deadline, not a counter.
+
+> Reported impact: three unbounded `while` loops in background workers were found that would have consumed all server memory under specific failure conditions.
 
 ---
 
-### Rule 3: Do Not Use Unbounded Dynamic Data Structures
+### Rule 3: Know what you own
 
-**NASA Original Purpose:**
-No `malloc` after initialization. In embedded systems with fixed RAM, unbounded
-allocation causes unpredictable failure.
+**Original purpose.** No `malloc` after initialization. In fixed-RAM embedded systems, unbounded allocation causes unpredictable failure.
 
-**Python/FastAPI Application:**
-The direct equivalent is any data structure that grows without limit inside a long-running
-process: lists accumulating results, dicts storing per-request state, in-memory event logs.
-These are invisible memory leaks.
+**Python / FastAPI.** Two distinct failures live here. First, **resource leaks**: every opened resource — file handle, DB connection, lock, socket, subscription — must be released on every exit path, including the error path. Second, **unbounded growth** in long-lived structures.
 
-**❌ Violates the Rule**
+**❌ Violates**
 ```python
-# processed_events grows forever — memory leak in a long-running process
 class EventProcessor:
     def __init__(self):
-        self.processed_events = []
+        self.processed_events = []          # grows forever
 
     def process(self, event):
         result = handle_event(event)
         self.processed_events.append(result)
         return result
+
+
+def load_rows(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT ...")
+    return cur.fetchall()                    # cursor never closed
 ```
 
-**✅ Follows the Rule**
+**✅ Follows**
 ```python
-# deque with maxlen automatically evicts old entries — bounded by design
 from collections import deque
 
 class EventProcessor:
     def __init__(self, max_history=1000):
-        self.processed_events = deque(maxlen=max_history)
+        self.processed_events = deque(maxlen=max_history)   # bounded by design
 
-    def process(self, event):
-        result = handle_event(event)
-        self.processed_events.append(result)
-        return result
+
+def load_rows(conn):
+    with conn.cursor() as cur:              # closed on every path
+        cur.execute("SELECT ...")
+        return cur.fetchall()
 ```
 
-**Impact:** This pattern was the direct root cause of a confirmed memory leak in a
-long-running background process.
+> **Scope note.** Unlike embedded systems, web apps legitimately use dynamic memory per request. This rule targets **long-lived, accumulating** structures and unclosed resources — not normal per-request allocation.
 
-> **Note:** Unlike embedded systems, web apps legitimately use dynamic memory for
-> request handling. This rule applies specifically to **long-lived, accumulating
-> structures** — not to normal per-request allocations.
+> Reported impact: unbounded instance-variable lists were the direct root cause of a confirmed memory leak in a long-running background process.
 
 ---
 
-### Rule 4: Keep Functions Small and Single-Purpose
+### Rule 4: One function, one job
 
-**NASA Original Purpose:**
-No function longer than one printed page (~60 lines). A function with a single clear
-responsibility is easier to verify, test, and reason about.
+**Original purpose.** No function longer than one printed page (~60 lines). A single clear responsibility is easier to verify, test, and reason about.
 
-**Python/FastAPI Application:**
-FastAPI route handlers are the most common violation. A handler that validates a user,
-checks a balance, writes to the database, sends an email, and updates inventory in one
-function is doing six jobs. Each additional responsibility adds a new failure mode and
-a new place where error handling can be silently omitted.
+**Python / FastAPI.** FastAPI route handlers are the most common violation. A handler that validates a user, checks a balance, writes the DB, sends email, and updates inventory is doing six jobs — six failure modes, six places where error handling can be silently omitted.
 
-**❌ Violates the Rule**
+**❌ Violates**
 ```python
-# One route handler doing six distinct things — impossible to test individually
 @app.post("/orders")
 async def create_order(order: OrderCreate, db: AsyncSession = Depends(get_db)):
     user = await db.execute(select(User).where(User.id == order.user_id))
@@ -207,9 +206,8 @@ async def create_order(order: OrderCreate, db: AsyncSession = Depends(get_db)):
     return new_order
 ```
 
-**✅ Follows the Rule**
+**✅ Follows**
 ```python
-# Handler orchestrates; each delegated function has one job
 @app.post("/orders")
 async def create_order(order: OrderCreate, db: AsyncSession = Depends(get_db)):
     user = await get_verified_user(db, order.user_id)
@@ -219,35 +217,26 @@ async def create_order(order: OrderCreate, db: AsyncSession = Depends(get_db)):
     return new_order
 ```
 
-**Impact:** Splitting four multi-responsibility route handlers revealed **two missing
-error-handling paths** that were unreachable in the monolithic version.
+> Reported impact: splitting four multi-responsibility handlers revealed two missing error-handling paths that were unreachable in the monolithic version.
 
 ---
 
-### Rule 5: Use Explicit Invariant Checks (Production-Safe Assertions)
+### Rule 5: State your assumptions
 
-**NASA Original Purpose:**
-Assert that every condition you believe to be true actually is. If an assertion fails,
-something went wrong that your model of the code did not anticipate.
+**Original purpose.** Assert that every condition you believe to be true actually is. If an assertion fails, your model of the code did not anticipate reality.
 
-**Python/FastAPI Application:**
-Python's built-in `assert` is **silently disabled** when running with the `-O`
-(optimized) flag — making it useless for production safety checks. The correct
-equivalent is explicit `if`/`raise` guards that are always active, plus Pydantic
-validators at API boundaries.
+**Python / FastAPI.** Python's `assert` is **silently disabled** under `-O`, giving false confidence in exactly the environments where you need it. The correct equivalent is explicit guards that always run, plus validation at trust boundaries (Pydantic models for API input, type checks at module edges).
 
-**❌ Violates the Rule**
+**❌ Violates**
 ```python
-# assert is disabled in production with -O — provides false confidence
 def calculate_discount(amount, rate):
     assert amount > 0, "Amount must be positive"
     assert 0 <= rate <= 1, "Rate must be between 0 and 1"
     return amount * rate
 ```
 
-**✅ Follows the Rule**
+**✅ Follows**
 ```python
-# Explicit checks — always run, always raise, always informative
 def calculate_discount(amount: float, rate: float) -> float:
     if amount <= 0:
         raise ValueError(f"Amount must be positive, got {amount}")
@@ -256,109 +245,357 @@ def calculate_discount(amount: float, rate: float) -> float:
     return amount * rate
 ```
 
-**Impact:** Adding explicit checks to internal utility functions caught **three cases
-of incorrect data being silently passed between functions**.
+> Reported impact: adding explicit checks to internal utilities caught three cases of incorrect data being silently passed between functions.
 
 ---
 
-## Usage Instructions
+### Rule 6: Never swallow errors
 
-When applying this skill to a code review or refactoring task:
+**Original purpose.** Every failure must be handled explicitly. Silent failure is worse than a crash, because the system keeps running on wrong data.
 
-1. **Scan for Rule 1 violations first** — bare `except` clauses are the highest-yield
-   target. Each one is a potential production bug hidden from logs.
+**Python / FastAPI.** This is the highest-yield rule in Python, and the most commonly violated. `except: pass`, empty `except` blocks, ignored return codes from `subprocess`/`os`, and discarded `err` values from Go-style callback APIs all produce code that looks correct and is not.
 
-2. **Audit all `while` loops** — for each one, ask: "Can this provably terminate?"
-   If not, add a `MAX_ATTEMPTS` bound and an `else` clause that logs/raises.
+**❌ Violates**
+```python
+try:
+    result = process_payment(order)
+except Exception:
+    pass                      # failure is invisible forever
 
-3. **Identify long-lived data structures** — any list, dict, or set that is an instance
-   variable on a class used in a background worker or daemon thread is a memory leak
-   candidate. Evaluate whether `deque(maxlen=N)` or periodic eviction is appropriate.
+try:
+    cleanup()
+except:                      # bare, catches KeyboardInterrupt too
+    pass
 
-4. **Check route handler line counts and responsibility counts** — if a handler does
-   more than one logical thing (validate, persist, notify, update), propose a refactor
-   that extracts each responsibility into a named function.
-
-5. **Replace all `assert` statements in non-test code** with explicit `if`/`raise`
-   guards using `ValueError`, `TypeError`, or a domain-specific exception.
-
-6. **Do not apply Rule 3 mechanically to request-scoped code** — per-request lists and
-   dicts are normal and correct. Only flag structures that accumulate across requests or
-   across the lifetime of a process.
-
----
-
-## Output Format
-
-When producing a code review using this skill, structure the response as:
-
-```
-## Power of Ten Code Review
-
-### Rule Violations Found
-
-| Rule | Location | Severity | Description |
-|------|----------|----------|-------------|
-| R1   | `get_user()` line 12 | High | Bare `except` swallows all errors silently |
-| R2   | `worker.py` line 47 | High | `while` loop has no termination bound |
-| R3   | `EventProcessor.__init__` | Medium | Unbounded list in long-running class |
-
-### Refactored Code
-
-[Show before/after for each violation]
-
-### Summary
-
-- X violations found across Y rules
-- Estimated risk: [Critical / High / Medium / Low]
-- Highest-priority fix: [specific item]
+subprocess.run(["migrate"], check=False)   # exit code discarded
 ```
 
+**✅ Follows**
+```python
+try:
+    result = process_payment(order)
+except PaymentDeclined as exc:
+    logger.warning("Payment declined", extra={"order_id": order.id, "reason": str(exc)})
+    raise
+except Exception:
+    logger.exception("Unexpected payment failure", extra={"order_id": order.id})
+    raise
+
+try:
+    cleanup()
+except Exception:
+    logger.exception("Cleanup failed")
+
+proc = subprocess.run(["migrate"], check=False, capture_output=True, text=True)
+if proc.returncode != 0:
+    raise MigrationError(f"migrate failed ({proc.returncode}): {proc.stderr}")
+```
+
+> Severity floor: swallowed errors in a production path are 🔴 even when the code looks clean.
+
 ---
 
-## Benefits & Observed Improvements
+### Rule 7: Narrow your state
 
-Applying these five rules to a production FastAPI application over two weeks produced
-three measurable changes:
+**Original purpose.** Keep data objects scoped as tightly as the compiler allows. Shared mutable state is the root of a large share of concurrency bugs.
 
-- **More bugs found during development** — clear control flow and bounded loops made
-  problems surface in testing rather than production.
-- **Two real production bugs discovered** — both were hidden inside bare `except` blocks
-  and had been silently failing for months before removal exposed them.
-- **Faster code reviews** — single-responsibility functions are significantly easier
-  to understand and review in pull requests.
+**Python / FastAPI.** Module-level globals, class-level mutable attributes used as passthrough, and caches with no invalidation policy. Under ASGI, module globals are also shared across concurrent tasks, so a race is not hypothetical.
+
+**❌ Violates**
+```python
+CURRENT_USER = None           # module global, shared across tasks
+_CACHE = {}
+
+def get_user(uid):
+    if uid in _CACHE:         # unbounded, never invalidated, not thread-safe
+        return _CACHE[uid]
+    user = fetch(uid)
+    _CACHE[uid] = user
+    return user
+```
+
+**✅ Follows**
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)     # bounded, explicit, has invalidation semantics
+def get_user(uid: str) -> User:
+    return fetch(uid)
+
+
+async def current_user(request: Request) -> User:
+    return request.state.user     # per-request scope
+```
+
+---
+
+### Rule 8: Surface your side effects
+
+**Original purpose.** I/O and mutation should be visible where they happen, not hidden inside a helper whose name does not promise them.
+
+**Python / FastAPI.** A function called `build_order()` that also writes to the database, sends an email, and decrements inventory will be called from somewhere that believes it is pure. The bug surfaces three files away.
+
+**❌ Violates**
+```python
+def build_order(items):
+    order = Order(items=items)
+    db.add(order)
+    db.commit()                  # writes, undeclared
+    send_email(order)            # network, undeclared
+    return order
+```
+
+**✅ Follows**
+```python
+def build_order(items) -> Order:          # pure
+    return Order(items=items)
+
+
+async def persist_and_notify(order: Order) -> None:
+    """Writes the order and sends confirmation."""
+    db.add(order)
+    await db.commit()
+    await send_email(order)
+```
+
+Name the side effect in the function name or the docstring. If the docstring needs a paragraph to mention the database, that is the smell.
+
+---
+
+### Rule 9: One layer of magic
+
+**Original purpose.** Restrict indirection. Stacked decorators and dynamic dispatch obscure what actually executes, which defeats review and debugging.
+
+**Python / FastAPI.** Stacked decorators, deep middleware chains, metaclass magic, dynamic `__getattr__` dispatch, and callback pyramids. Every layer is a hop you must trace during an incident.
+
+**❌ Violates**
+```python
+@app.post("/orders")
+@require_auth
+@rate_limit(100)
+@validate_schema(OrderCreate)
+@retry(3)
+@log_requests
+@timed
+async def create_order(order):     # six layers before the body
+    ...
+```
+
+**✅ Follows**
+```python
+async def create_order(request: Request, db: AsyncSession = Depends(get_db)):
+    payload = OrderCreate.model_validate(await request.json())
+    return await handle_order(payload, db)
+```
+
+Cross-cutting concerns belong in one dependency or one middleware — not stacked five deep.
+
+---
+
+### Rule 10: Warnings are errors
+
+**Original purpose.** Static analysis must be authoritative. Advisory tooling is decoration.
+
+**Python / FastAPI.** Check that the linter and type checker are configured *and enforcing*. A `ruff` or `mypy` block in `pyproject.toml` that CI runs without `--exit-zero` and without a failure threshold does nothing.
+
+**What to verify**
+- Does CI run the linter on every commit, or only on `main`?
+- Is the exit code checked, or is the output informational?
+- Is `mypy`/`pyright` non-optional in CI, and does the config fail on error?
+- Are tests actually gated (`--exitfirst`, coverage floor) or just reported?
+
+**❌ Violates**
+```yaml
+- run: uv run ruff check . || echo "lint issues found"   # always passes
+- run: uv run mypy src/ --ignore-errors                 # advisory only
+```
+
+**✅ Follows**
+```yaml
+- run: uv run ruff check --exit-zero=false .
+- run: uv run mypy --strict src/
+- run: uv run pytest --cov=src --cov-fail-under=80 -x
+```
+
+Missing configuration is 🟠. Configuration that does not block is 🟠.
+
+---
+
+### Rule 11: Read every line
+
+**Original purpose.** Not from NASA — added for LLM-generated code. Generated code arrives plausible and unreviewed, and reviewers skim it because it reads well.
+
+**Python / FastAPI.** The tells:
+
+- Dead code and unused imports left from an earlier draft
+- Commented-out blocks kept "just in case"
+- Over-defensive `try/except` wrapping trivial operations
+- Generic names — `data`, `result`, `temp`, `val`, `obj` — on critical paths
+- Comment density that describes *what* rather than *why*
+- Docstrings that restate the function name
+
+**❌ Violates**
+```python
+def process(payload):
+    # old approach, keeping for reference
+    # return payload.map(lambda x: x.strip())
+
+    tmp = data          # what is `data`?
+    result = transform(tmp)
+    return result
+```
+
+**✅ Follows**
+```python
+def process(raw_payload: dict) -> list[ChargeRecord]:
+    """Convert a raw Stripe payload into charge records.
+
+    Strips zero-amount entries, which Stripe emits for refunded invoices.
+    """
+    charges = [ChargeRecord.from_stripe(c) for c in raw_payload["charges"]]
+    return [c for c in charges if c.amount_cents > 0]
+```
+
+---
+
+### Rule 12: Tests first
+
+**Original purpose.** Added for AI-assisted development. Code that was generated faster than it was understood needs an executable statement of intent.
+
+**Python / FastAPI.** New or changed production behaviour ships with a test that covers **at least one failure mode**. A test that only exercises the happy path documents nothing about what the function is for.
+
+**What to verify**
+- Does the change have a corresponding test?
+- Does at least one test assert the error branch?
+- Are the failure modes from Rules 2, 5, and 6 (timeout, invalid input, swallowed error) covered?
+
+**❌ Violates**
+```python
+def test_discount():
+    assert calculate_discount(100, 0.1) == 10     # happy path only
+
+# no test for calculate_discount(-1, 0.1) -> ValueError
+```
+
+**✅ Follows**
+```python
+def test_discount_happy_path():
+    assert calculate_discount(100, 0.1) == 10
+
+
+def test_discount_rejects_non_positive_amount():
+    with pytest.raises(ValueError, match="Amount must be positive"):
+        calculate_discount(-1, 0.1)
+
+
+def test_discount_rejects_out_of_range_rate():
+    with pytest.raises(ValueError, match="Rate must be between 0 and 1"):
+        calculate_discount(100, 1.5)
+```
+
+If a change is config-, docs-, or types-only, mark Rule 12 N/A rather than inventing a finding.
+
+---
+
+## Audit Procedure
+
+1. **Establish scope.** If the user named a target (file, directory, glob, `staged`, `branch`), use it. Otherwise:
+   - git repo with staged changes → audit `git diff --cached`
+   - on a non-default branch → audit `git diff <default-branch>...HEAD`
+   - otherwise → **ask the user what to audit. Do not guess.**
+2. **Read the actual files.** Never audit from filenames or the diff alone.
+3. **Walk the 12 rules in order.** Record findings with `file:line` and the offending snippet quoted.
+4. **Assign severity** from the taxonomy above.
+5. **Report** using the output contract below.
+
+### Guidelines
+
+- **Be specific.** "This function is too long" is useless. "`handle_request` at `api.py:240` is 142 lines and mixes auth, validation, and persistence — split into three" is useful.
+- **Cite line numbers** from the actual file, not from a diff hunk header.
+- **Do not invent violations.** If the code is clean for a rule, say so in the summary table.
+- **Do not flag stylistic preference as a violation.** Every finding traces to one of the 12 rules.
+- **Skip generated code, vendored dependencies, and migrations** unless the user explicitly includes them.
+
+---
+
+## Output Contract
+
+Print to the terminal. Do not write a file unless asked.
+
+```
+# NASA Power-of-Ten Audit
+
+**Target:** <what was audited>
+**Files reviewed:** N
+
+## Findings
+
+### 🔴 Critical (N)
+- `path/to/file.ext:LINE` — Rule N (name) — one-line issue
+  ```lang
+  offending snippet
+  ```
+  **Fix:** concrete suggestion.
+
+### 🟠 High (N)
+### 🟡 Medium (N)
+
+## Rule-by-rule Summary
+
+| Rule | Status |
+|------|--------|
+| 1. Keep it linear | ✅ / N violations |
+| 2. Bound every loop | ... |
+
+## Verdict
+
+One paragraph: is this safe to ship, and what must change first?
+```
 
 ---
 
 ## Limitations
 
-Not every rule translates equally to web application context:
+Not every rule translates equally to web application context. Do not apply them mechanically.
 
 | Rule | Limitation |
 |------|------------|
-| Rule 3 (No dynamic memory) | Web apps legitimately allocate per-request. Apply only to long-lived, accumulating structures — not to normal request handling. |
-| Rule 1 (No recursion) | Python has recursion depth limits built in. Most web apps don't use recursion in ways that risk stack overflow; this is low priority. |
-| Rule 2 (Fixed loop bounds) | Some polling loops legitimately need to run indefinitely (e.g., event loop workers). Use timeout-based bounds rather than iteration counts in those cases. |
+| 3. Know what you own | Web apps legitimately allocate per request. Apply only to long-lived accumulating structures and unclosed resources. |
+| 1. Keep it linear | Python carries a recursion limit already; most web code cannot stack-overflow. Recursion without an explicit base-case bound is still worth flagging. |
+| 2. Bound every loop | Some workers legitimately run indefinitely. Bound by wall-clock or heartbeat, not iteration count. |
+| 5. State your assumptions | Over-validating internal invariants adds cost without safety. Concentrate on trust boundaries. |
+| 9. One layer of magic | Framework-mandated indirection is not a finding. Flag indirection you introduced. |
+| 10. Warnings are errors | A repo with no type checker at all is a judgement call — report it as info, not as a blocker. |
+| 12. Tests first | Absence of tests on legacy code is context, not a violation. Apply to changed code. |
 
-**The real value is not mechanical rule compliance.** It is understanding *why* each
-rule exists and applying that reasoning to the actual risk profile of your system.
+**The value is not mechanical compliance.** It is understanding *why* each rule
+exists and applying that reasoning to your system's actual risk profile.
 
 ---
 
 ## Example Usage
 
-### Example 1 — Code Review Request
+### Example 1 — Whole-repo reliability audit
 
 > "Review this FastAPI background worker for reliability issues."
 
-The agent reads the file, applies the five-rule checklist, identifies a bare `except`
-on line 23 (Rule 1) and an unbounded `while True` loop on line 41 (Rule 2), produces
-a formatted violation table, and shows refactored versions of both.
+The agent establishes scope (asks, or uses staged changes), reads the file, walks
+all 12 rules, finds a bare `except` at line 23 (Rule 1) and an unbounded
+`while True` at line 41 (Rule 2), emits both as 🟠, produces the rule-by-rule
+table marking the clean rules ✅, and returns a verdict.
 
-### Example 2 — Targeted Refactor Request
+### Example 2 — Targeted diagnosis
 
 > "I have a memory leak somewhere in my event processor class."
 
-The agent scans for long-lived instance variables (Rule 3), finds an unbounded `list`
-accumulating processed events, and proposes replacing it with `deque(maxlen=1000)` with
-an explanation of why this is the idiomatic fix.
+The agent scans for long-lived instance variables (Rule 3), finds an unbounded
+list accumulating processed events, proposes `deque(maxlen=1000)`, and notes the
+same code also drops `cur.close()` on an error path.
+
+### Example 3 — Pre-merge gate
+
+> "Is this safe to ship?"
+
+The agent runs all 12 rules, includes Rule 10 by checking whether CI actually
+enforces lint and types rather than merely running them, and returns a verdict
+paragraph naming the specific blocking findings.
