@@ -1,75 +1,49 @@
 # Agent Skills Warehouse
 
-A curated cold-storage warehouse and offline catalog of 2,700+ specialized agent skill suites across **Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi**, designed to prevent prompt bloat and context collapse in daily agent sessions.
+A curated cold-storage warehouse and offline catalog of 2,700+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
 
----
+## Architecture
 
-## 1. What This Repository Is
+1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Hardened suite of ~75 production skills wired into active coding agents (<2,500 prompt tokens per turn).
+2. **Cold-Storage Warehouse (`skills/` & `collections/`):** 556 modular skills across 9 core engineering domains and 2,200+ specialized domain playbooks (cybersecurity, Hugging Face, bioinformatics, financial modeling, reference architectures), loaded dynamically on demand.
 
-To preserve frontier LLM attention and eliminate 20,000+ token per-turn overhead, the environment uses a strict two-tier architecture:
+## Research Benchmark
 
-1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** A minimal, hardened suite of ~75 production skills wired into active coding agents (<2,500 prompt tokens per turn).
-2. **Cold-Storage Warehouse (`skills/` & `collections/`):** An offline repository housing **556 modular skills** across 9 core engineering domains and **2,200+ specialized domain playbooks** (cybersecurity MITRE/NIST, Hugging Face, bioinformatics, financial modeling, and reference architectures), bridged dynamically on-demand via `skill-router`.
+This repository serves as the artifact and benchmark testbed for the empirical software engineering paper:
 
----
+> **Measuring the Floor Before Claiming the Null: Agent Skill-File Delivery Formats in an LLM-Judged Coding Benchmark** (SANER 2027 RENE track submission)
 
-## 2. Accompanying Research Paper
+### Key Findings
 
-This repository is the artifact and benchmark testbed for an empirical software engineering paper submitted to the **SANER 2027 Reproducibility Studies and Negative Results (RENE) track**:
+- **Detection-limited null:** Evaluated five skill-file delivery strategies across 396 blind judged runs (18-task engineering benchmark; Qwen 3.7 Flash generating, DeepSeek V4 Pro judging a 35-point rubric) and 87 ablations. Total spread across arms is 0.68 points.
+- **Noise floor:** Test-retest noise floor is **sigma = 5.37** (pooled within-cell across all 396 runs).
+- **Power analysis:** Task-blocked paired SD is **sigma_d = 3.76** (17 task pairs), setting the minimum detectable effect at **MDE = 2.72 points** (80% power, alpha = 0.05). The observed 0.275-point difference is only 10.1% of the detection threshold. Distinguishing these strategies would require ~1,500 task pairs.
+- **Position bias:** Significant slot-position bias in the judging window (spread = 3.63 points, A minus D, within-window permutation p = 0.000014, sign test p = 0.000186) exceeds the treatment effect by 13x.
 
-> **Measuring the Floor Before Claiming the Null: Agent Skill-File Delivery Formats in an LLM-Judged Coding Benchmark**
+### Authoritative Figures
 
-### What the study found
-
-The study compared five skill-file delivery strategies across 396 blind judged runs on an 18-task engineering benchmark (Qwen 3.7 Flash generating, DeepSeek V4 Pro judging a 35-point rubric), plus 87 ablation runs.
-
-**The headline result is a detection-limited null.** No delivery strategy measurably changed output quality: the entire five-arm range is 0.68 points on a 35-point rubric. Rather than report that as "no significant difference," the paper measures the instrument first. The test-retest floor, pooled within-cell across all 396 runs, is **σ = 5.37**; against the task-blocked design actually used (σ_d = 3.76 over 17 task pairs) the minimum detectable effect at 80% power is **2.72 points**. The observed 0.27-point gap is **10.1% of that threshold**, so the benchmark cannot distinguish these arms — which is a statement about measurement power, not evidence of equivalence. Closing the question would take roughly 1,500 task pairs rather than 17.
-
-One component does clear the floor: aggressive rule bulletization (70.8% compression) drops the Testing & QA domain by −6.32 points at n = 11. We report this as a **preliminary warning requiring replication**, not a finding.
-
-### Claims this repository has withdrawn
-
-Three earlier results from our own work were withdrawn after re-analysis, and the corrections are recorded in [`benchmarks/MANUSCRIPT_CORRECTIONS.md`](benchmarks/MANUSCRIPT_CORRECTIONS.md):
-
-- **A syntax-collapse effect** (Δ = −8.50, n = 6) **reversed sign** when re-run at n = 15 with a matched control. An earlier version of this README presented it as a finding; that was wrong.
-- **An output-volume advantage** for `checklist_v2`, which a stray `[INSTRUCTION]` directive explains by ~82%.
-- **A router-accuracy figure** whose baseline was a mis-specified hand-weighted scorer.
-
-### Corrected figures (authoritative)
-
-| quantity | value | reproduced by |
+| Metric | Value | Verification Script |
 |:--|--:|:--|
-| noise floor σ | **5.37** | `scripts/verify_noise_floor.py` |
-| task-paired SD σ_d | **3.76** over **17 task pairs** | `scripts/verify_noise_floor.py` |
-| MDE @80% power | **2.72** (exact noncentral *t*) | `scripts/verify_noise_floor.py` |
-| headline gap, as % of MDE | **10.1%** | `scripts/verify_noise_floor.py` |
-| required n to detect 0.275 | **1,473** | `scripts/verify_noise_floor.py` |
-| position spread, block-aware | **3.63** (within-window permutation p < 0.00005) | `scripts/analyze_position_blocks.py` |
-| position spread, sign test A>D | 52/73 windows, p = 0.000186 one-sided | `scripts/analyze_position_blocks.py` |
-| position bias vs treatment effect | **13×** | both scripts |
+| Noise floor sigma | **5.37** | `scripts/verify_noise_floor.py` |
+| Task-paired SD sigma_d | **3.76** (17 pairs) | `scripts/verify_noise_floor.py` |
+| MDE (80% power, exact noncentral t) | **2.72** | `scripts/verify_noise_floor.py` |
+| Observed difference vs MDE | **10.1%** | `scripts/verify_noise_floor.py` |
+| Required task pairs | **1,473** | `scripts/verify_noise_floor.py` |
+| Window-centred position spread | **3.63** (p < 0.00005) | `scripts/analyze_position_blocks.py` |
+| Position spread sign test (A > D) | 52/73 (p = 0.000186) | `scripts/analyze_position_blocks.py` |
+| Position bias vs treatment effect | **13x** | `scripts/analyze_position_blocks.py` |
 
-Judging windows are the blocking unit (396 rows in 80 windows). Pooled
-ANOVA/Kruskal–Wallis on position are **withdrawn as inference** because they
-assume independent rows; they are retained only so the correction is
-reproducible.
-
-### Claims earlier revisions of this repository could not reproduce
-
-The paper's own headline power analysis was wrong until audited, and we report that too. An earlier draft quoted σ = 6.09 from "42 runs on byte-identical prompts", σ_d = 7.87 over "78 pairs", and an MDE of 2.53. **No run subset of size 42 exists in the archive and no code produced any of those figures.** Our first correction then introduced a *second* error, applying the two-sample MDE formula (which carries a √2 factor for independent means) to a paired design. Both errors, and the invariants that now prevent them, are documented in §7 of the paper and enforced by tests.
-
-### Reproducing the reported numbers
+### Reproducing Results
 
 ```bash
-uv run python scripts/verify_noise_floor.py    # sigma, sigma_d, MDE, required n
-uv run pytest tests/ -q                        # claim-integrity suite
-uv run python scripts/analyze_position_blocks.py # block-aware position bias
-uv run python scripts/verify_compiled_artifacts.py   # 18/18 byte-identical
-uv run python scripts/measure_tokens_real.py --check # tokenizer-measured compression
+uv run python scripts/verify_noise_floor.py        # Recompute sigma, sigma_d, MDE
+uv run pytest tests/ -q                            # Run full claim-integrity test suite
+uv run python scripts/analyze_position_blocks.py   # Run block-aware position bias analysis
+uv run python scripts/verify_compiled_artifacts.py # Verify compiled checklist reproducibility
+uv run python scripts/measure_tokens_real.py --check # Tokenizer-measured compression check
 ```
 
-Compression figures are measured with real BPE tokenizers, not a character heuristic: the cl100k_base reduction is **28.56%**, not the 30.41% the old `len//4` estimate produced.
-
-## 3. Quick Commands
+## Commands
 
 ```bash
 # Search skills by keyword
@@ -78,9 +52,6 @@ uv run python scripts/search_skills.py <keyword>
 # Rebuild catalog index (skills.json)
 uv run python scripts/build_index.py
 
-# Validate SKILL.md frontmatter blocks
+# Validate frontmatter YAML across all skills
 uv run python scripts/check_frontmatter.py
-
-# Run compiler verification on benchmarks
-uv run python scripts/verify_compiled_artifacts.py
 ```
