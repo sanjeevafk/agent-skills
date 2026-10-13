@@ -54,6 +54,28 @@ def report():
         "contrast": paired_difference(data, "full", "checklist_v2"),
     }
 
+MANUSCRIPT_CANDIDATES = ("MANUSCRIPT_SKILL_ANON.md", "MANUSCRIPT_SKILL.md")
+
+
+def manuscript_text() -> str:
+    """Return the manuscript source available in this checkout.
+
+    The anonymised source is tracked in the public repository precisely so these
+    checks execute rather than skip; a reviewer checking the artifact should
+    not have to wonder whether a check ran. The camera-ready is git-ignored
+    (it names the author) and is used only when a local checkout has it.
+    """
+    for name in MANUSCRIPT_CANDIDATES:
+        path = REPO / "paper" / name
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    pytest.skip("no manuscript source present in this checkout")
+
+
+def assert_no_identity_leak(text: str) -> None:
+    for token in ("Sanjeev", "Saveetha", "Department of Computer", "sanjeevafk"):
+        assert token not in text, f"anonymised source leaks {token!r}"
+
 
 class TestNoiseFloor:
     """§5.1: sigma, and the machinery that produces it."""
@@ -210,10 +232,7 @@ class TestManuscriptAgreement:
 
     @staticmethod
     def _manuscript() -> str:
-        path = REPO / "paper" / "MANUSCRIPT_SKILL.md"
-        if not path.exists():
-            pytest.skip("manuscript not present in this checkout")
-        return path.read_text(encoding="utf-8")
+        return manuscript_text()
 
     @staticmethod
     def _outside_disclosure_section(text: str) -> list[tuple[int, str]]:
@@ -277,3 +296,228 @@ class TestManuscriptAgreement:
             "withdrawn MDE = 2.53 quoted outside the disclosure section: "
             + "; ".join(f"line {n}: {line[:70]}" for n, line in offenders)
         )
+
+class TestPositionBiasBlocks:
+    """§5.6: position bias analysed with the judging window as a block.
+
+    The blind protocol scores all five arms of a task in one window, so the 396
+    rows are clustered and a pooled ANOVA is anti-conservative. These tests pin
+    the block-aware statistics the manuscript quotes, and assert that the
+    withdrawn pooled statistic is not what we report.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def block_report(self):
+        _scripts_on_path()
+        from analyze_position_blocks import centre, friedman, load_windows, stats
+        windows = load_windows()
+        centred = centre(windows)
+        return {
+            "windows": windows, "centred": centred,
+            "obs": stats(centred),
+            "friedman": friedman(centred),
+        }
+
+    def test_windows_are_recoverable_from_the_archive(self, block_report):
+        """80 windows, 396 scored rows: the clustering is recoverable."""
+        wins = block_report["windows"]
+        assert len(wins) == 80, f"expected 80 judging windows, got {len(wins)}"
+        assert sum(len(i) for _, i in wins) == 396
+
+    def test_block_aware_spread_matches_manuscript(self, block_report):
+        """Manuscript: window-centred spread = 3.63 points."""
+        assert block_report["obs"]["spread"] == pytest.approx(3.63, abs=0.01)
+        assert block_report["obs"]["A_minus_D"] == pytest.approx(3.63, abs=0.01)
+
+    def test_position_means_match_manuscript(self, block_report):
+        pm = block_report["obs"]["position_means"]
+        assert pm["A"] == pytest.approx(2.06, abs=0.01)
+        assert pm["D"] == pytest.approx(-1.57, abs=0.01)
+
+    def test_centring_does_not_inflate_the_effect(self, block_report):
+        """Block-aware centring must not manufacture the effect.
+
+        The uncentred spread (3.66) is the pooled figure; centring can only
+        remove between-window variance, so it must be the smaller of the two.
+        """
+        import sys as _sys
+        from analyze_position_blocks import stats as _stats
+        raw = _stats([items for _, items in block_report["windows"]])
+        assert block_report["obs"]["spread"] < raw["spread"]
+        assert raw["spread"] == pytest.approx(3.66, abs=0.01)
+
+    def test_rank_based_test_is_reported_as_not_significant(self, block_report):
+        """The paper must report the Friedman result too, not omit it.
+
+        Bias in score magnitude (significant) and in within-window ordering
+        (not significant) are different findings; reporting only the first
+        would overstate what the bias does.
+        """
+        assert block_report["friedman"]["p"] > 0.05
+        assert block_report["friedman"]["statistic"] == pytest.approx(4.84, abs=0.02)
+
+    def test_manuscript_reports_both_position_tests(self):
+        text = manuscript_text()
+        assert "0.000014" in text, "block-aware ANOVA p-value not reported"
+        assert "0.304" in text, "Friedman p-value not reported"
+        assert "7.1794" in text, "block-aware F not reported"
+        assert "within** each window" in text or "within**" in text, \
+            "within-window permutation not described"
+
+
+class TestAttritionAccounting:
+    """§4.3 / §8.4: the retention and truncation counts must reconcile.
+
+    These exist because this account was wrong twice -- once from reading file
+    lengths by list position, once from over-correcting and calling all losses
+    stub records. The numbers below are the reconciled set.
+    """
+
+    @staticmethod
+    def _partition(cap: int = 10000):
+        import json
+        root = REPO / "benchmarks" / "raw_outputs_ieee"
+        data = json.loads(
+            (REPO / "benchmarks" / "delivery_results_ieee.json").read_text())
+        drop = "db-ratelimit-redis-ieee"
+        judged_t = judged_s = 0
+        dropped, scattered_t, scattered_s = [], [], []
+        for task in data["tasks"]:
+            d = root / task["id"]
+            files = {}
+            if d.is_dir():
+                for f in d.glob("*.txt"):
+                    arm = f.stem.rsplit("_run", 1)[0]
+                    if arm == "judge_prompt":
+                        continue
+                    files[(arm, int(f.stem.rsplit("_run", 1)[1]))] = len(
+                        f.read_text(errors="ignore"))
+            if task["id"] == drop:
+                dropped = sorted(files.values())
+                continue
+            keys = {(a, r["run"]) for a, rs in task.get("strategy_runs", {}).items()
+                    for r in rs}
+            for k in keys:
+                if k in files:
+                    judged_t += files[k] > cap
+                    judged_s += files[k] <= cap
+            for k, n in files.items():
+                if k not in keys:
+                    (scattered_t if n > cap else scattered_s).append(n)
+        return {"dropped": dropped, "judged_t": judged_t, "judged_s": judged_s,
+                "scattered_t": scattered_t, "scattered_s": scattered_s}
+
+    def test_dropped_task_responses_are_all_executor_stubs(self):
+        p = self._partition()
+        assert len(p["dropped"]) == 25
+        assert set(p["dropped"]) == {23}, (
+            f"dropped-task responses should all be 23-char stubs, got "
+            f"{sorted(set(p['dropped']))}")
+
+    def test_scattered_losses_are_a_mix_not_all_stubs(self):
+        """23 stub records AND 6 full-length responses.
+
+        An earlier draft called all 29 ordinary-length; the over-correction
+        called all 29 stubs. The truth is both, and §8.4's truncation share
+        depends on the 6.
+        """
+        p = self._partition()
+        n_stub = sum(1 for n in p["scattered_s"] if n <= 30)
+        assert len(p["scattered_t"]) == 6, "6 scattered losses exceed the cap"
+        assert n_stub == 23, f"expected 23 stub records, got {n_stub}"
+        assert len(p["scattered_s"]) == 23
+        assert len(p["scattered_t"]) + len(p["scattered_s"]) == 29
+
+    def test_truncation_counts_reconcile(self):
+        """The chain that must close: 425 = 348 + 77, and 396 = 342 + 54."""
+        p = self._partition()
+        assert p["judged_t"] == 342 and p["judged_s"] == 54
+        assert p["judged_t"] + p["judged_s"] == 396
+        total_long = p["judged_t"] + len(p["scattered_t"])
+        total_short = p["judged_s"] + len(p["scattered_s"])
+        assert total_long == 348 and total_short == 77
+        assert total_long + total_short == 425
+
+    def test_judged_truncation_share(self):
+        """§8.4: 342 of 396 = 86.4% of judged responses were truncated."""
+        p = self._partition()
+        share = 100 * p["judged_t"] / (p["judged_t"] + p["judged_s"])
+        assert share == pytest.approx(86.4, abs=0.05)
+
+    def test_manuscript_states_the_reconciled_figures(self):
+        # Collapse whitespace: the manuscript hard-wraps, so a phrase can
+        # straddle a newline in the source.
+        text = " ".join(manuscript_text().split())
+        assert "342 (86.4%)" in text
+        assert "348 (81.9%)" in text
+        assert "48 are executor failures" in text, "attrition cause count not stated"
+        assert "Six further attempts generated a full-length response" in text
+
+
+class TestSqrtTwoFactor:
+    """§7.2 / abstract: the error factor is sqrt(2), never 2."""
+
+    @staticmethod
+    def _manuscript():
+        return manuscript_text()
+
+    def test_the_factor_is_sqrt_two(self):
+        import math
+        import re
+
+        text = self._manuscript()
+        assert "overstates the threshold by exactly $\\sqrt{2}$" in text, \
+            "sqrt(2) overstatement not stated in 7.2"
+        # The mis-statement we must never reintroduce: "by a factor of 2"
+        # or "by exactly 2" without the root.
+        assert not re.search(r"overstat\w+ the threshold by (a factor of |exactly )2(?![.\d])",
+                             text), "threshold overstatement stated as 2, not sqrt(2)"
+        assert math.isclose(math.sqrt(2), 1.41421356, rel_tol=1e-6)
+
+    def test_abstract_states_sqrt_two(self):
+        text = self._manuscript()
+        abstract = text.split("## Abstract")[1].split("**Keywords")[0]
+        assert "by a factor of $\\sqrt{2}$" in abstract, \
+            "abstract does not state the error factor as sqrt(2)"
+
+
+class TestAnonymisedSourceIsTrackableAndClean:
+    """The anonymised manuscript source is what makes these checks runnable.
+
+    The camera-ready names the author and stays git-ignored; this file is
+    tracked so a reviewer can execute the manuscript-agreement tests. That is
+    only safe while it carries no identity, so it is asserted here.
+    """
+
+    def test_anonymised_source_exists(self):
+        path = REPO / "paper" / "MANUSCRIPT_SKILL_ANON.md"
+        assert path.exists(), (
+            "paper/MANUSCRIPT_SKILL_ANON.md must be tracked so the "
+            "manuscript-agreement tests run in a public checkout"
+        )
+
+    def test_anonymised_source_leaks_no_identity(self):
+        assert_no_identity_leak(manuscript_text())
+
+    def test_camera_ready_stays_ignored(self):
+        """The identified manuscript must never enter the repository."""
+        import subprocess
+        r = subprocess.run(
+            ["git", "check-ignore", "paper/MANUSCRIPT_SKILL.md"],
+            cwd=REPO, capture_output=True, text=True)
+        assert r.returncode == 0, (
+            "paper/MANUSCRIPT_SKILL.md is no longer git-ignored; the camera-ready "
+            "names the author and must not be committed"
+        )
+
+    def test_manuscript_agreement_checks_actually_run(self):
+        """Guard against the silent-skip failure mode.
+
+        An earlier review found these tests skipping in the public repository,
+        so nothing verified the manuscript against the computed values. Assert
+        that the resolver returns a non-empty source rather than skipping.
+        """
+        text = manuscript_text()
+        assert len(text) > 1000, "manuscript source resolved but looks empty"
+        assert "## Abstract" in text
