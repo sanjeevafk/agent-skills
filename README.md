@@ -15,19 +15,40 @@ To preserve frontier LLM attention and eliminate 20,000+ token per-turn overhead
 
 ## 2. Accompanying Research Paper
 
-This repository also serves as the artifact and benchmark testbed for the empirical software engineering paper:
+This repository is the artifact and benchmark testbed for an empirical software engineering paper submitted to the **SANER 2027 Reproducibility Studies and Negative Results (RENE) track**:
 
-> **Compress the Prose, Keep the Syntax: What Agent Skill Files Actually Do, and Why You Probably Don't Need a Router**
+> **Measuring the Floor Before Claiming the Null: Agent Skill-File Delivery Formats in an LLM-Judged Coding Benchmark**
 
-### Core Empirical Findings
+### What the study found
 
-The study evaluated 396 blind trials across an 18-task engineering benchmark (Qwen 3.7 Flash generating, DeepSeek V4 Pro judging a 35-point rubric) plus 87 ablation runs:
+The study compared five skill-file delivery strategies across 396 blind judged runs on an 18-task engineering benchmark (Qwen 3.7 Flash generating, DeepSeek V4 Pro judging a 35-point rubric), plus 87 ablation runs.
 
-- **Compressing Prose is Free; Deleting Syntax is Not:** Structure-preserving static compilation (`checklist_v2`) cuts **30.0% of prompt tokens** (saving 680 tokens per skill/turn) with no measurable quality penalty compared to uncompressed multi-thousand-token manuals (24.96/35 vs. 25.17/35, paired $p = 0.7672$).
-- **Syntax-Stripping Context Collapse:** Aggressively stripping narrative prose in policy-centric domains (Security, Databases) is completely safe. However, removing executable code fixtures in syntax-dense tasks (e.g., TDD RED/GREEN tracer patterns) causes immediate collapse ($\Delta = -8.50$ points; 0 of 6 runs passing).
-- **You Probably Don't Need a Router:** Testing selection across the 522-skill catalogue revealed that multi-stage neural routing (dense retrieval + cross-encoder reranker) is a net loss (5/17 Top-1) compared to a tuned lexical TF-IDF baseline (8/17 Top-1). Passing the entire 522-skill catalogue in context in a single prompt achieved **14/17 Top-1**, matching the union oracle ceiling. At this catalogue scale, an in-context pass outperforms neural retrieval pipelines.
+**The headline result is a detection-limited null.** No delivery strategy measurably changed output quality: the entire five-arm range is 0.68 points on a 35-point rubric. Rather than report that as "no significant difference," the paper measures the instrument first. The test-retest floor, pooled within-cell across all 396 runs, is **σ = 5.37**; against the task-blocked design actually used (σ_d = 3.76 over 17 task pairs) the minimum detectable effect at 80% power is **2.72 points**. The observed 0.27-point gap is **10.1% of that threshold**, so the benchmark cannot distinguish these arms — which is a statement about measurement power, not evidence of equivalence. Closing the question would take roughly 1,500 task pairs rather than 17.
 
----
+One component does clear the floor: aggressive rule bulletization (70.8% compression) drops the Testing & QA domain by −6.32 points at n = 11. We report this as a **preliminary warning requiring replication**, not a finding.
+
+### Claims this repository has withdrawn
+
+Three earlier results from our own work were withdrawn after re-analysis, and the corrections are recorded in [`benchmarks/MANUSCRIPT_CORRECTIONS.md`](benchmarks/MANUSCRIPT_CORRECTIONS.md):
+
+- **A syntax-collapse effect** (Δ = −8.50, n = 6) **reversed sign** when re-run at n = 15 with a matched control. An earlier version of this README presented it as a finding; that was wrong.
+- **An output-volume advantage** for `checklist_v2`, which a stray `[INSTRUCTION]` directive explains by ~82%.
+- **A router-accuracy figure** whose baseline was a mis-specified hand-weighted scorer.
+
+### Claims this repository could not reproduce
+
+The paper's own headline power analysis was wrong until audited, and we report that too. An earlier draft quoted σ = 6.09 from "42 runs on byte-identical prompts", σ_d = 7.87 over "78 pairs", and an MDE of 2.53. **No run subset of size 42 exists in the archive and no code produced any of those figures.** Our first correction then introduced a *second* error, applying the two-sample MDE formula (which carries a √2 factor for independent means) to a paired design. Both errors, and the invariants that now prevent them, are documented in §7 of the paper and enforced by tests.
+
+### Reproducing the reported numbers
+
+```bash
+uv run python scripts/verify_noise_floor.py    # sigma, sigma_d, MDE, required n
+uv run pytest tests/ -q                        # claim-integrity suite, 67 tests
+uv run python scripts/verify_compiled_artifacts.py   # 18/18 byte-identical
+uv run python scripts/measure_tokens_real.py --check # tokenizer-measured compression
+```
+
+Compression figures are measured with real BPE tokenizers, not a character heuristic: the cl100k_base reduction is **28.56%**, not the 30.41% the old `len//4` estimate produced.
 
 ## 3. Quick Commands
 
