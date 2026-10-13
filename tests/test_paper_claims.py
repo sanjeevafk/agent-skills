@@ -2,11 +2,15 @@
 
 Scope and intent
 ----------------
-This file exists for one reason: to stop `paper/MANUSCRIPT.md` from silently
+This file exists for one reason: to stop `paper/MANUSCRIPT_SKILL.md` from silently
 driving apart from the evidence behind it. Every test here loads an archived
 artefact and asserts a number the manuscript quotes. If a re-run, a compiler
 change, or an accidental edit moves a result, the suite fails instead of the
 paper quietly going stale.
+
+(`paper/MANUSCRIPT_SKILL.md` is the current manuscript. The earlier
+`paper/MANUSCRIPT.md` is a superseded draft retained at `paper/archive/`;
+three of its claims were withdrawn and it must not be submitted.)
 
 These are not unit tests of the codebase. Arithmetic on hard-coded constants is
 deliberately *not* asserted here — such tests pass whether or not the underlying
@@ -72,7 +76,7 @@ def _routable_catalogue() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# §5, §8.1, §8.2 — the macro benchmark
+# §4.3, §5.2 — the macro benchmark
 # ---------------------------------------------------------------------------
 class TestMacroBenchmark:
     """Table 1 and Table 3 of the manuscript."""
@@ -94,7 +98,7 @@ class TestMacroBenchmark:
                     yield task, arm, (r if field is None else r.get(field))
 
     def test_counts_and_attrition(self):
-        """§5: 18 tasks defined, 17 completed, 396 evaluations, 5 arms each."""
+        """§4.3/§5.2: 18 tasks defined, 17 completed, 396 evaluations, 5 arms each."""
         data = _load("delivery_results_ieee.json")
         runs = list(self._runs(data))
         assert len(runs) == 396, "manuscript states N=396"
@@ -103,7 +107,7 @@ class TestMacroBenchmark:
                         if any(t.get("strategy_runs", {}).values())]
         assert len(contributing) == 17, "manuscript states 17 of 18 tasks completed"
 
-        # §5 names the dropout explicitly; assert the identity, not just a count.
+        # §4.3 names the dropout explicitly; assert the identity, not just a count.
         empty = [t["id"] for t in data["tasks"]
                  if not any(t.get("strategy_runs", {}).values())]
         assert empty == ["db-ratelimit-redis-ieee"]
@@ -114,7 +118,7 @@ class TestMacroBenchmark:
             )
 
     def test_arm_means_match_table_1(self):
-        """§8.1: the five per-arm mean judge scores."""
+        """§5.2: the five per-arm mean judge scores."""
         data = _load("delivery_results_ieee.json")
         by_arm: dict[str, list[int]] = {}
         for _, arm, score in self._runs(data, "judge_total"):
@@ -142,7 +146,7 @@ class TestMacroBenchmark:
         )
 
     def test_prompt_token_means_match_table_3(self):
-        """§8.2: the five per-arm prompt token means, and the 30% headline."""
+        """§4.6/§5.2: the per-arm prompt token means, and the compression headline."""
         data = _load("delivery_results_ieee.json")
         by_arm: dict[str, list[int]] = {}
         for _, arm, n in self._runs(data, "input_tokens"):
@@ -163,7 +167,7 @@ class TestMacroBenchmark:
 
 
 # ---------------------------------------------------------------------------
-# §7.1 — compiler provenance
+# §4.5 — compiler provenance
 # ---------------------------------------------------------------------------
 class TestCompilerProvenance:
     """The compiled artefacts the paper's token figures depend on."""
@@ -215,15 +219,25 @@ def hashlib_sha(path: pathlib.Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# §8.4 — component ablation and the noise floor
+# §5.4 — component ablation
 # ---------------------------------------------------------------------------
 class TestAblation:
-    """§8.4: the TDD exceeder is the manuscript's one robust RQ4 claim."""
+    """§5.4: component ablation cells and the withdrawn syntax-collapse claim."""
 
     def test_tdd_a2_replication_and_noise_floor_inputs(self):
         data = _load("ablation_results.json")
         runs = data["runs"] if isinstance(data, dict) and "runs" in data else data
-        assert len(runs) == 69, "§7.5 / abstract state 69 ablation runs"
+        # The manuscript's "87 ablations" is this file plus the dense-condition
+        # arm; pin the identity rather than restating the total.
+        assert len(runs) == 69, "judged ablation arm holds 69 runs"
+
+        dense = _load("ablation_dense_results.json")
+        dense_runs = (dense["runs"] if isinstance(dense, dict) and "runs" in dense
+                      else dense)
+        assert len(runs) + len(dense_runs) == 87, (
+            f"manuscript states 87 ablations; archive gives "
+            f"{len(runs)} + {len(dense_runs)}"
+        )
 
         tdd_a2 = [r for r in runs
                   if r.get("task_id", "").startswith("test-tdd")
@@ -232,10 +246,10 @@ class TestAblation:
 
 
 # ---------------------------------------------------------------------------
-# §9 — judge position bias and statistical power
+# §5.6 — judge position bias (power itself is pinned in test_noise_floor.py)
 # ---------------------------------------------------------------------------
 class TestJudgeInstrument:
-    """§9: the disclosed instrument flaws that bound what the paper can claim."""
+    """§5.6: the disclosed instrument flaws that bound what the paper can claim."""
 
     @staticmethod
     def _analysis():
@@ -250,7 +264,7 @@ class TestJudgeInstrument:
         return rows, effects, corrected
 
     def test_position_bias_is_large_and_significant(self):
-        """§9: slot A/D effects exceed every treatment effect, and are real."""
+        """§5.6: slot A/D effects exceed every treatment effect, and are real."""
         from scipy import stats
 
         rows, effects, _ = TestJudgeInstrument._analysis()
@@ -282,7 +296,7 @@ class TestJudgeInstrument:
 
 
 # ---------------------------------------------------------------------------
-# §8.7 — routing
+# §5.7 — routing
 # ---------------------------------------------------------------------------
 class TestRouting:
     """The corrected routing study and its catalogue preconditions."""
@@ -329,7 +343,7 @@ class TestRouting:
         assert not leaky, f"name-leaking vectors: {leaky[:5]}"
 
     def test_reranking_is_a_net_loss(self):
-        """§8.7-Finding 6: reranking lowers Top-1 and the lexical baseline wins."""
+        """§5.7: reranking lowers Top-1 and the lexical baseline wins."""
         scored = TestRouting._scored()
         stage1 = sum(1 for r in scored if r["two_stage_top5"][0] == r["gold"])
         reranked = sum(1 for r in scored if r["two_stage_top1_match"])
@@ -350,7 +364,7 @@ class TestRouting:
 
 
 class TestUnionShortlist:
-    """§8.7-D: the union lifts recall; the reranker then loses it."""
+    """§5.7: the union lifts recall; the reranker then loses it."""
 
     def test_union_lifts_recall_at_low_candidate_cost(self):
         s = _load("union_shortlist_results.json")["summary"]
@@ -367,7 +381,7 @@ class TestUnionShortlist:
 
 
 class TestDirectChoice:
-    """§8.7-F: no retrieval at all reaches the union oracle ceiling."""
+    """§5.7/§5.8: no retrieval at all reaches the union oracle ceiling."""
 
     def test_direct_choice_matches_the_oracle_ceiling(self):
         runs = _load("direct_choice_results.json")["runs"]
@@ -379,7 +393,7 @@ class TestDirectChoice:
 
 
 # ---------------------------------------------------------------------------
-# §8.2 — the withdrawn output-volume claim
+# §5.2 — the withdrawn output-volume claim
 # ---------------------------------------------------------------------------
 class TestConfoundExperiment:
     """The retraction of Finding 2 rests on this paired experiment."""
