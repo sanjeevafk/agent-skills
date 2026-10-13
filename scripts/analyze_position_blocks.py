@@ -99,6 +99,25 @@ def stats(scored):
     }
 
 
+def _require_scipy():
+    """Import scipy or fail loudly.
+
+    These scripts emit p-values that the manuscript quotes. A missing scipy
+    used to degrade silently to NaN, which reads like a result and is not one:
+    the artifact then "reproduced" p = nan. Fail instead, with the fix.
+    """
+    try:
+        from scipy import stats as _s
+    except ModuleNotFoundError as exc:  # pragma: no cover - env problem
+        raise SystemExit(
+            "scipy is required to compute the p-values the paper reports.\n"
+            "Install it, or run inside the project environment, e.g.:\n"
+            "    uv run python scripts/analyze_position_blocks.py\n"
+            "Refusing to emit NaN in place of a reported statistic."
+        ) from exc
+    return _s
+
+
 def friedman(scored_windows):
     """Friedman test on within-window ranks; distribution-free, block-aware."""
     ranks = collections.defaultdict(list)
@@ -119,11 +138,7 @@ def friedman(scored_windows):
     num = sum((r - n * (k + 1) / 2) ** 2 for r in R.values())
     den = n * k * (k * k - 1) / 12
     chi2 = num / den if den else float("nan")
-    try:
-        from scipy import stats as _s
-        p = float(_s.chi2.sf(chi2, k - 1))
-    except ModuleNotFoundError:
-        p = float("nan")
+    p = float(_require_scipy().chi2.sf(chi2, k - 1))
     return {"statistic": chi2, "df": k - 1, "p": p, "n_windows": n,
             "mean_ranks": {p: round(r / n, 3) for p, r in sorted(R.items())}}
 
@@ -160,13 +175,10 @@ def sign_test(windows, left="A", right="D"):
     }
     if n < 2:
         return out
-    try:
-        from scipy import stats as _s
-        out["p_one_sided"] = float(_s.binomtest(wins, n, alternative="greater").pvalue)
-        out["p_two_sided"] = float(_s.binomtest(wins, n, alternative="two-sided").pvalue)
-        out["alternative_reported_in_paper"] = "one-sided"
-    except ModuleNotFoundError:
-        out["p_one_sided"] = out["p_two_sided"] = float("nan")
+    _s = _require_scipy()
+    out["p_one_sided"] = float(_s.binomtest(wins, n, alternative="greater").pvalue)
+    out["p_two_sided"] = float(_s.binomtest(wins, n, alternative="two-sided").pvalue)
+    out["alternative_reported_in_paper"] = "one-sided"
     return out
 
 

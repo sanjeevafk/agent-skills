@@ -71,6 +71,27 @@ POWER = 0.80
 SCALE_MAX = 35.0
 
 
+def _require_scipy():
+    """Import scipy or fail loudly.
+
+    This script produces the paper's headline numbers. Without scipy the exact
+    noncentral-t MDE becomes NaN and `gap / MDE` silently falls back to the
+    normal approximation -- 10.7% instead of the reported 10.1%. A degraded
+    path that prints a plausible wrong headline is worse than a hard failure.
+    """
+    try:
+        from scipy import optimize, stats
+    except ModuleNotFoundError as exc:  # pragma: no cover - env problem
+        raise SystemExit(
+            "scipy is required to reproduce the reported power analysis.\n"
+            "Install it, or run inside the project environment, e.g.:\n"
+            "    uv run python scripts/verify_noise_floor.py\n"
+            "Refusing to emit a degraded headline (the normal-approximation\n"
+            "ratio would be reported as if it were the exact one)."
+        ) from exc
+    return optimize, stats
+
+
 def _load() -> dict:
     if not ARTEFACT.exists():
         sys.exit(f"archived artefact absent: {ARTEFACT}")
@@ -133,20 +154,10 @@ def paired_difference(data: dict, arm_x: str, arm_y: str) -> dict:
     # Two-sided paired t on the task-blocked design. scipy is used when
     # available; the closed form below is the fallback so this script has no
     # hard dependency for reproducing the headline numbers.
-    try:
-        from scipy import stats as _stats
-
-        t_stat, p_value = _stats.ttest_rel(means_x, means_y)
-        t_stat, p_value = float(t_stat), float(p_value)
-        z_sum = float(
-            _stats.norm.ppf(1 - ALPHA / 2) + _stats.norm.ppf(POWER)
-        )
-    except ModuleNotFoundError:
-        mean_d = st.mean(diffs)
-        sd_d = st.stdev(diffs)
-        t_stat = mean_d / (sd_d / math.sqrt(n))
-        p_value = float("nan")
-        z_sum = 1.959963985 + 0.8416212336
+    _opt, _stats = _require_scipy()
+    t_stat, p_value = _stats.ttest_rel(means_x, means_y)
+    t_stat, p_value = float(t_stat), float(p_value)
+    z_sum = float(_stats.norm.ppf(1 - ALPHA / 2) + _stats.norm.ppf(POWER))
 
     mde = z_sum * sigma_d / math.sqrt(n) if n else float("nan")
     observed = st.mean(diffs)
@@ -159,17 +170,13 @@ def paired_difference(data: dict, arm_x: str, arm_y: str) -> dict:
     # Exact paired MDE from the noncentral t distribution. At n = 17 the
     # uncertainty in sigma_d itself is not negligible, so this exceeds the
     # normal approximation; the paper reports this one and discloses the other.
-    mde_exact = float("nan")
     try:
-        from scipy import optimize as _opt
-        from scipy import stats as _st
-
-        _tcrit = _st.t.ppf(1 - ALPHA / 2, n - 1)
+        _tcrit = _stats.t.ppf(1 - ALPHA / 2, n - 1)
 
         def _power(delta: float) -> float:
             _ncp = delta * math.sqrt(n) / sigma_d
-            return (_st.nct.sf(_tcrit, n - 1, _ncp)
-                    + _st.nct.cdf(-_tcrit, n - 1, _ncp))
+            return (_stats.nct.sf(_tcrit, n - 1, _ncp)
+                    + _stats.nct.cdf(-_tcrit, n - 1, _ncp))
 
         # Bisection on a bracket that stays clear of the noncentral-t CDF's
         # numerical breakdown at very large noncentrality parameters.
@@ -184,8 +191,14 @@ def paired_difference(data: dict, arm_x: str, arm_y: str) -> dict:
                 else:
                     _hi = _mid
             mde_exact = (_lo + _hi) / 2
-    except Exception:
-        mde_exact = float("nan")
+    except Exception as exc:
+        # A failed solve would leave the headline MDE undefined. Never report
+        # the normal-approximation ratio in its place.
+        raise SystemExit(
+            f"exact noncentral-t MDE failed to converge ({exc}). The paper "
+            f"reports this value; refusing to substitute the normal "
+            f"approximation, which would report 10.7% instead of 10.1%."
+        ) from exc
 
     return {
         "arm_x": arm_x,

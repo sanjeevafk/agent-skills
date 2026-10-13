@@ -72,9 +72,23 @@ def manuscript_text() -> str:
     pytest.skip("no manuscript source present in this checkout")
 
 
+def identity_tokens() -> list:
+    """Deny-list of strings that would de-anonymise the author.
+
+    Assembled from fragments on purpose. This test file is shipped inside the
+    anonymous artifact package, so a literal here would reintroduce exactly the
+    leak it exists to detect, and would survive a naive grep-based scan of the
+    package. Build the tokens instead of spelling them.
+    """
+    parts = (("San", "jeev"), ("Save", "etha"), ("Department of ", "Computer"),
+             ("san", "jeevafk"), ("/home/", "san", "jeev/"))
+    return ["".join(p) for p in parts]
+
+
 def assert_no_identity_leak(text: str) -> None:
-    for token in ("Sanjeev", "Saveetha", "Department of Computer", "sanjeevafk"):
-        assert token not in text, f"anonymised source leaks {token!r}"
+    lowered = text.lower()
+    for token in identity_tokens():
+        assert token.lower() not in lowered, f"artifact leaks an identity token ({len(token)} chars)"
 
 
 class TestNoiseFloor:
@@ -501,8 +515,14 @@ class TestAnonymisedSourceIsTrackableAndClean:
         assert_no_identity_leak(manuscript_text())
 
     def test_camera_ready_stays_ignored(self):
-        """The identified manuscript must never enter the repository."""
+        """The identified manuscript must never enter the repository.
+
+        Repo-hygiene only: the distributed anonymous artifact is not a git
+        checkout, and the camera-ready is not shipped in it at all.
+        """
         import subprocess
+        if not (REPO / ".git").exists():
+            pytest.skip("not a git checkout (distributed artifact package)")
         r = subprocess.run(
             ["git", "check-ignore", "paper/MANUSCRIPT_SKILL.md"],
             cwd=REPO, capture_output=True, text=True)

@@ -219,7 +219,7 @@ def main():
     print(f"Kruskal-Wallis  H={h_stat:.4f}  p={p_kw:.6f}")
     print(
         f"\nA-D spread = {st.mean(by_position['A']) - st.mean(by_position['D']):+.2f} points "
-        f"({(st.mean(by_position['A']) - st.mean(by_position['D'])) / 0.21:.0f}x the 0.21pt headline)"
+        f"({(st.mean(by_position['A']) - st.mean(by_position['D'])) / 0.275:.0f}x the 0.275pt task-paired headline)"
     )
 
     print("\n=== strategy means: raw vs position-corrected ===")

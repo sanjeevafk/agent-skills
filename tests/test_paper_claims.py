@@ -271,7 +271,8 @@ class TestJudgeInstrument:
         assert effects["A"] == pytest.approx(2.08, abs=0.01)
         assert effects["D"] == pytest.approx(-1.58, abs=0.01)
         # the A-to-D spread must exceed the paper's headline treatment effect
-        assert effects["A"] - effects["D"] > 0.21 * 10
+        # headline is the task-paired difference +0.275 (§5.2); spread is ~3.66 (§5.6) ≈13x
+        assert effects["A"] - effects["D"] > 0.275 * 10
 
         by_pos: dict[str, list[float]] = {}
         for _, _, pos, value in rows:
@@ -285,8 +286,9 @@ class TestJudgeInstrument:
 
         _, _, corrected = TestJudgeInstrument._analysis()
         gap = st.mean(corrected["full"]) - st.mean(corrected["checklist_v2"])
-        assert abs(gap) < 0.21, (
-            f"corrected full-v2 gap widened to {gap:+.3f}; manuscript reports 0.21"
+        assert gap == pytest.approx(0.120, abs=0.03), (
+            f"corrected full-v2 gap is {gap:+.3f}; manuscript §5.6 reports +0.120 "
+            f"(raw unpaired +0.204, task-paired +0.275)"
         )
         for arm in ("full", "retrieved", "checklist", "checklist_v2"):
             _, p = stats.ttest_ind(corrected[arm], corrected["control"], equal_var=False)
