@@ -1,8 +1,27 @@
 # Post-Hoc Execution Calibration Report: LLM Judge Reliability & Construct Validity
 
-**Execution Date:** 2026-09-04 17:53:10 UTC
-**Sample Size:** N = 238 executable runs evaluated across tasks and delivery strategies
-**Linear Model:** `Predicted Judge Score = 24.99 + 0.65 × Pass Rate` (R² = 0.002)
+> **Status: superseded in part. Read the header before the numbers.**
+>
+> This report is a point-in-time record of the 2026-09-04 calibration run. Two
+> statements in it were subsequently withdrawn and are retained below only so
+> the correction history stays auditable:
+>
+> 1. The per-task subgroup correlations quoted below (`sec-django-hardening:
+>    r = +0.616, p = 0.001`; `arch-godclass-refactor: r = +0.344, p = 0.108`)
+>    **are not reproducible.** The per-run `syntax_rate` records this analysis
+>    depended on were held in memory and never persisted, so no machine-readable
+>    artefact exists for them. The same values were also embedded as literal
+>    text inside f-strings in the generating script, which meant re-running the
+>    calibration reproduced them regardless of the data. Do not cite them.
+> 2. The pooled `r = +0.047, p = 0.473` **does** verify against this file and is
+>    the figure the manuscript reports.
+>
+> See `benchmarks/MANUSCRIPT_CORRECTIONS.md` §A3 (withdrawal) and §I5
+> (unreproducibility of the 44-run subgroup figure).
+>
+> **Execution Date:** 2026-09-04 17:53:10 UTC
+> **Sample Size:** N = 238 executable runs evaluated across tasks and delivery strategies
+> **Linear Model:** `Predicted Judge Score = 24.99 + 0.65 × Pass Rate` (R² = 0.002)
 
 ## Executive Summary
 

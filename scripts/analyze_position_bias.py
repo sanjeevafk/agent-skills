@@ -26,16 +26,29 @@ benchmarks/delivery_results_ieee.json:
           in §8.6.A survives intact)
         - the arm ordering is essentially unchanged
 
-  * The design is underpowered for the effect size being claimed. With
-    SD(paired diff) = 7.87 over 78 pairs, the minimum detectable effect at
-    80% power / alpha = 0.05 is ~2.53 points. The headline 0.21-point gap is
-    8.3% of that floor, so "no significant difference" means "not
-    detectable", not "equivalent".
+  * The design is underpowered for the effect size under study. NOTE: the
+    numbers an earlier draft quoted here -- SD(paired diff) = 7.87 over "78
+    pairs", MDE ~2.53 -- are superseded and were not reproducible. They came
+    from pairing individual runs rather than task-level means, and no 78-pair
+    grouping exists in this study's design.
+
+    The current values are computed by scripts/verify_noise_floor.py:
+    sigma_d = 3.76 over 17 task-blocked pairs, giving a minimum detectable
+    effect of 2.72 points by the exact noncentral-t form (2.55 by the normal
+    approximation) at 80% power / alpha = 0.05. The observed task-blocked gap
+    is +0.27, i.e. 10.1% of that threshold -- so "no significant difference"
+    here means "below detection", not "equivalent".
+
+    Because the pairing unit is the task, the standard error is
+    sigma_d / sqrt(n) and carries NO factor of sqrt(2); that factor belongs to
+    a difference of independent means. Using it here overstates the threshold
+    by sqrt(2) -- an error this repository's own scripts made once.
 """
 
 import argparse
 import json
 import pathlib
+import sys
 import statistics as st
 from collections import Counter
 
@@ -125,17 +138,26 @@ def main():
     else:
         t_stat = p_paired = float("nan")
 
-    # minimum detectable effect for the full-vs-v2 contrast
-    sd_paired = st.stdev(
-        [a - b for a, b in zip(corrected["full"], corrected["checklist_v2"])]
-    ) if {"full", "checklist_v2"} <= set(corrected) else float("nan")
-    n_pairs = len(corrected.get("full", []))
-    if sd_paired == sd_paired and n_pairs > 2:
-        mde = (
-            stats.t.ppf(0.975, n_pairs - 1) + stats.t.ppf(0.80, n_pairs - 1)
-        ) * sd_paired / (n_pairs ** 0.5)
-    else:
-        mde = float("nan")
+    # Minimum detectable effect for the full-vs-checklist_v2 contrast.
+    #
+    # The pairing unit is the TASK, not the run. This block previously zipped
+    # two per-run score vectors by array index, which is not a pairing at all:
+    # it produced a spurious "78 pairs" and an SD computed across unrelated
+    # runs. The design blocks on task, so sigma_d must be the standard
+    # deviation of per-task mean differences.
+    #
+    # The computation itself is delegated to scripts/verify_noise_floor.py so
+    # that there is exactly one implementation of the power analysis and the
+    # two scripts cannot disagree.
+    sd_paired = mde = mde_normal = n_pairs = float("nan")
+    try:
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from verify_noise_floor import _load, paired_difference
+        _c = paired_difference(_load(), "full", "checklist_v2")
+        sd_paired, n_pairs = _c["sigma_d"], _c["n_pairs"]
+        mde, mde_normal = _c["mde_exact_nct"], _c["mde_normal_approx"]
+    except Exception as _e:  # pragma: no cover - diagnostic path
+        print(f"  [warn] could not compute power: {_e}")
 
     cross = Counter((arm, pos) for _, arm, pos, _ in rows)
     arms = sorted(raw_means)
@@ -188,10 +210,11 @@ def main():
     print(f"  full - checklist_v2: raw={fv['raw']:+.3f}  corrected={fv['corrected']:+.3f}")
     print(f"  paired t={fv['paired_t']:.4f}  p={fv['paired_p']:.4f}  (n_tasks={fv['n_tasks']})")
 
-    print("\n=== power ===")
-    print(f"  SD(paired diff) = {sd_paired:.2f} over {n_pairs} pairs")
-    print(f"  minimum detectable effect (80% power) = {mde:.2f} points")
-    print(f"  headline 0.21 pt gap = {0.21 / mde * 100:.1f}% of that floor")
+    print("\n=== power (task-blocked; see verify_noise_floor.py) ===")
+    print(f"  sigma_d (per-task mean differences) = {sd_paired:.3f} over "
+          f"{n_pairs:.0f} task pairs")
+    print(f"  MDE, exact noncentral t (80% power) = {mde:.3f} points")
+    print(f"  MDE, normal approximation          = {mde_normal:.3f} points")
 
     print("\n=== position x arm balance ===")
     print("  arm".ljust(20) + "".join(f"{p:>5}" for p in letters))
