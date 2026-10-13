@@ -102,6 +102,19 @@ def correct(rows, effects):
 
 
 def main():
+    """Legacy entry point.
+
+    The inferential analysis of position bias lives in
+    scripts/analyze_position_blocks.py, which treats each judging window as a
+    block. This file remains as a thin front end so existing references to the
+    old path keep working, and so there is exactly ONE implementation of the
+    position-bias analysis in the artifact.
+
+    The pooled ANOVA and Kruskal-Wallis values computed below treat clustered
+    rows as independent. They are retained ONLY to make the withdrawn claim in
+    the paper reproducible; they are labelled accordingly and are not the
+    paper's inference. The paper relies on the within-window permutation test.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
     args = parser.parse_args()
@@ -121,6 +134,15 @@ def main():
     groups = [by_position[p] for p in letters]
     f_stat, p_anova = stats.f_oneway(*groups)
     h_stat, p_kw = stats.kruskal(*groups)
+
+    # Block-aware analysis: the inferential result the paper actually uses.
+    try:
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from analyze_position_blocks import run as block_run
+        blockwise = block_run()
+    except Exception as _e:  # pragma: no cover - diagnostic path
+        print(f"  [warn] block-aware analysis unavailable: {_e}")
+        blockwise = None
 
     raw_means = {a: st.mean(v) for a, v in raw.items()}
     cor_means = {a: st.mean(v) for a, v in corrected.items()}
@@ -166,8 +188,11 @@ def main():
         "n_judged_arm_instances": len(rows),
         "position_effects": effects,
         "position_means": {p: st.mean(v) for p, v in by_position.items()},
-        "anova": {"F": f_stat, "p": p_anova},
-        "kruskal_wallis": {"H": h_stat, "p": p_kw},
+        # WITHDRAWN as inference: these ignore the judging-window blocking.
+        # Kept verbatim so a reader can reproduce the error the paper corrects.
+        "pooled_anova_WITHDRAWN_AS_INFERENTIAL": {"F": f_stat, "p": p_anova},
+        "pooled_kruskal_WITHDRAWN_AS_INFERENTIAL": {"H": h_stat, "p": p_kw},
+        "block_aware_INFERENTIAL": blockwise,
         "raw_means": raw_means,
         "corrected_means": cor_means,
         "position_x_arm": {a: {p: cross[(a, p)] for p in letters} for a in arms},

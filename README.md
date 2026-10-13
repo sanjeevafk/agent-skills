@@ -35,7 +35,25 @@ Three earlier results from our own work were withdrawn after re-analysis, and th
 - **An output-volume advantage** for `checklist_v2`, which a stray `[INSTRUCTION]` directive explains by ~82%.
 - **A router-accuracy figure** whose baseline was a mis-specified hand-weighted scorer.
 
-### Claims this repository could not reproduce
+### Corrected figures (authoritative)
+
+| quantity | value | reproduced by |
+|:--|--:|:--|
+| noise floor σ | **5.37** | `scripts/verify_noise_floor.py` |
+| task-paired SD σ_d | **3.76** over **17 task pairs** | `scripts/verify_noise_floor.py` |
+| MDE @80% power | **2.72** (exact noncentral *t*) | `scripts/verify_noise_floor.py` |
+| headline gap, as % of MDE | **10.1%** | `scripts/verify_noise_floor.py` |
+| required n to detect 0.275 | **1,473** | `scripts/verify_noise_floor.py` |
+| position spread, block-aware | **3.63** (within-window permutation p < 0.00005) | `scripts/analyze_position_blocks.py` |
+| position spread, sign test A>D | 52/73 windows, p = 0.000186 one-sided | `scripts/analyze_position_blocks.py` |
+| position bias vs treatment effect | **13×** | both scripts |
+
+Judging windows are the blocking unit (396 rows in 80 windows). Pooled
+ANOVA/Kruskal–Wallis on position are **withdrawn as inference** because they
+assume independent rows; they are retained only so the correction is
+reproducible.
+
+### Claims earlier revisions of this repository could not reproduce
 
 The paper's own headline power analysis was wrong until audited, and we report that too. An earlier draft quoted σ = 6.09 from "42 runs on byte-identical prompts", σ_d = 7.87 over "78 pairs", and an MDE of 2.53. **No run subset of size 42 exists in the archive and no code produced any of those figures.** Our first correction then introduced a *second* error, applying the two-sample MDE formula (which carries a √2 factor for independent means) to a paired design. Both errors, and the invariants that now prevent them, are documented in §7 of the paper and enforced by tests.
 
@@ -43,7 +61,8 @@ The paper's own headline power analysis was wrong until audited, and we report t
 
 ```bash
 uv run python scripts/verify_noise_floor.py    # sigma, sigma_d, MDE, required n
-uv run pytest tests/ -q                        # claim-integrity suite, 67 tests
+uv run pytest tests/ -q                        # claim-integrity suite
+uv run python scripts/analyze_position_blocks.py # block-aware position bias
 uv run python scripts/verify_compiled_artifacts.py   # 18/18 byte-identical
 uv run python scripts/measure_tokens_real.py --check # tokenizer-measured compression
 ```
