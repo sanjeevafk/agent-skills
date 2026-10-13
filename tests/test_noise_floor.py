@@ -521,3 +521,58 @@ class TestAnonymisedSourceIsTrackableAndClean:
         text = manuscript_text()
         assert len(text) > 1000, "manuscript source resolved but looks empty"
         assert "## Abstract" in text
+
+
+class TestEveryQuotedStatisticReproduces:
+    """Every number the paper quotes must be emitted by the artifact.
+
+    The sign test was asserted in the manuscript while no script computed it,
+    and the manuscript drifted ahead of the artifact for exactly this reason.
+    This pins the paper's quoted values to the artifact's emitted values, so a
+    statistic can no longer be reported without code behind it.
+    """
+
+    @staticmethod
+    def _report():
+        import json
+        import subprocess
+        r = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "analyze_position_blocks.py"), "--json"],
+            cwd=REPO, capture_output=True, text=True, check=True)
+        return json.loads(r.stdout)
+
+    def test_every_quoted_position_statistic(self):
+        b = self._report()
+        st = b["sign_test_A_vs_D"]
+        expected = {
+            "permutation spread": (b["observed"]["spread"], 3.6265),
+            "A minus D": (b["observed"]["A_minus_D"], 3.6265),
+            "raw uncentred spread": (b["raw_spread_uncentred"], 3.6590),
+            "sign test wins": (st["wins"], 52),
+            "sign test usable windows": (st["usable_windows"], 73),
+            "sign test windows scoring both": (st["windows_with_both"], 78),
+            "sign test ties discarded": (st["ties"], 5),
+            "sign test p one-sided": (round(st["p_one_sided"], 6), 0.000186),
+            "sign test p two-sided": (round(st["p_two_sided"], 6), 0.000371),
+            "friedman p": (round(b["friedman_within_window_ranks"]["p"], 3), 0.304),
+            "friedman chi2": (round(b["friedman_within_window_ranks"]["statistic"], 3), 4.843),
+            "n windows": (b["n_windows"], 80),
+            "n scored observations": (b["n_scored_observations"], 396),
+        }
+        bad = {k: v for k, v in expected.items() if abs(v[0] - v[1]) > 5e-4}
+        assert not bad, f"artifact disagrees with the manuscript: {bad}"
+
+    def test_permutation_is_reproducible_under_its_seed(self):
+        """Same seed, same p. A randomisation without a pinned seed is not a result."""
+        a = self._report()
+        b = self._report()
+        assert a["permutation_within_window"] == b["permutation_within_window"]
+        assert a["permutation_seed"] == 20261013
+        assert a["permutation_draws"] == 20000
+
+    def test_manuscript_quotes_the_one_sided_value_and_labels_it(self):
+        text = " ".join(manuscript_text().split())
+        assert "one-sided binomial $p = 0.000186$" in text
+        assert "two-sided value is $p = 0.000371$" in text, (
+            "the two-sided value must be stated so the sidedness is auditable"
+        )
