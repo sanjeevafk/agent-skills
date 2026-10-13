@@ -39,13 +39,9 @@ def build_knowledge_graph():
     for cat_id, cat_label in categories.items():
         add_node(f"cat:{cat_id}", cat_label, "Category")
 
-    books = [
-        "clean-code", "clean-architecture", "refactoring", "the-pragmatic-programmer",
-        "designing-data-intensive-applications", "a-philosophy-of-software-design",
-        "domain-driven-design", "code-complete", "working-effectively-with-legacy-code", "release-it"
-    ]
+    books = ["unified-software-engineering"]
     for b in books:
-        add_node(f"book:{b}", f"Book: {b.replace('-', ' ').title()}", "Book")
+        add_node(f"book:{b}", f"Rule: {b.replace('-', ' ').title()}", "Rule")
 
     # 2. Add Skills, Commands, and Links
     for sname, s in skills.items():

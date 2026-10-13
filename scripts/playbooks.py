@@ -18,7 +18,7 @@ DEFAULT_PLAYBOOKS = {
         "description": "Rigorous full-stack engineering workflow: Systematic Debugging + Clean Architecture + TDD + Senior Reviewer",
         "category": "playbook",
         "skills": ["systematic-debugging", "code-reviewer", "tdd-workflow", "verification-before-completion"],
-        "rules": ["clean-architecture", "clean-code", "user-global-rules"],
+        "rules": ["unified-software-engineering", "user-global-rules"],
         "agents": ["gsd-planner", "gsd-executor"]
     },
     "security-audit": {
@@ -26,7 +26,7 @@ DEFAULT_PLAYBOOKS = {
         "description": "Comprehensive security assessment: Code Security Review + Vulnerability Scan + Gateguard + Tirith Policies",
         "category": "playbook",
         "skills": ["security-review", "security-scan", "gateguard", "security-bounty-hunter", "healthcare-phi-compliance"],
-        "rules": ["release-it", "user-global-rules"],
+        "rules": ["unified-software-engineering", "user-global-rules"],
         "agents": ["gsd-nyquist-auditor"]
     },
     "fullstack-nextjs": {
@@ -34,7 +34,7 @@ DEFAULT_PLAYBOOKS = {
         "description": "Next.js 15 App Router + Supabase RLS + Tailwind & Radix UI + Vitest & Playwright E2E",
         "category": "playbook",
         "skills": ["nextjs-15-expert", "supabase-expert", "tailwind-radix-expert", "fullstack-feature-scaffold", "e2e-testing"],
-        "rules": ["clean-architecture", "designing-data-intensive-applications"],
+        "rules": ["unified-software-engineering"],
         "agents": ["gsd-planner", "gsd-executor"]
     },
     "mvp-bootstrap": {
@@ -42,7 +42,7 @@ DEFAULT_PLAYBOOKS = {
         "description": "Rapid tracer-bullet MVP scaffolding and GSD wave execution with Nyquist verification",
         "category": "playbook",
         "skills": ["orch-build-mvp", "gsd-new-project", "gsd-plan-phase", "gsd-execute-phase", "gsd-verify-work"],
-        "rules": ["the-pragmatic-programmer", "user-global-rules"],
+        "rules": ["unified-software-engineering", "user-global-rules"],
         "agents": ["gsd-planner", "gsd-executor", "gsd-verifier"]
     }
 }
