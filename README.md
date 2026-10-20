@@ -7,6 +7,15 @@ A curated cold-storage warehouse and offline catalog of 2,700+ specialized agent
 1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Hardened suite of ~75 production skills wired into active coding agents (<2,500 prompt tokens per turn).
 2. **Cold-Storage Warehouse (`skills/` & `collections/`):** 556 modular skills across 9 core engineering domains and 2,200+ specialized domain playbooks (cybersecurity, Hugging Face, bioinformatics, financial modeling, reference architectures), loaded dynamically on demand.
 
+## Skill Evaluation & Quality Gates
+
+All skills in this warehouse are evaluated and pre-screened using the 3-arm evaluation harness and pre-activation quality linter in [**`sanjeevafk/agent-skill-evals`**](https://github.com/sanjeevafk/agent-skill-evals).
+
+* **Linter & Density Gate:** Enforces directive density (>= 1.5 directives/KB), spec formatting, and security checks via `skill-lint`.
+* **3-Arm Empirical Evaluation:** Benchmarks candidate skills against Baseline (Arm A) and Length Control (Arm C) via `skill-eval`.
+* **Audit Suite:** Sweeps active directories for context bloaters via `skill-audit`.
+* **Warehouse Skill:** Available on-demand via [`canonical/skill-evals`](canonical/skill-evals) and [`skills/skill-evals`](skills/skill-evals).
+
 ## Research Benchmark
 
 This repository serves as the artifact and benchmark testbed for the empirical software engineering paper:
