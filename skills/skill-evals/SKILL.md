@@ -27,3 +27,7 @@ A quantitative, multi-arm evaluation harness and pre-activation quality gate for
   - *Arm B $\le$ Arm C:* Reject with `DROP IDEA (FOLKLORE)`. The skill delivers no causal lift beyond length expansion.
   - *Arm B $>$ Arm C $>$ Arm A:* Accept with `SHIP & PIN`. The skill demonstrates verified causal improvement.
 - **Audit Suite Inventory:** Periodically sweep `~/.gemini/config/skills` with `python3 ~/.agents/scripts/audit_suite.py` to identify context bloaters (> 20 KB) and demote them to warehouse cold storage.
+
+## Repository
+
+The complete standalone evaluation harness, linter CLI, and test suite are maintained in [**`sanjeevafk/agent-skill-evals`**](https://github.com/sanjeevafk/agent-skill-evals).
