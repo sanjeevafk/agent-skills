@@ -52,11 +52,18 @@ uv run python scripts/verify_compiled_artifacts.py # Verify compiled checklist r
 uv run python scripts/measure_tokens_real.py --check # Tokenizer-measured compression check
 ```
 
+## Skill Discovery & Search Architecture
+
+Skill retrieval is powered by a high-precision **Weighted BM25 search engine** ([`scripts/search_skills.py`](scripts/search_skills.py)):
+* **Zero Overhead:** 100% local, sub-millisecond retrieval (<0.3ms) with zero model/API calls or vector databases.
+* **Token Normalization:** Automatically splits and indexes `camelCase`, `snake_case`, and `kebab-case` code identifiers.
+* **Field Weighting:** Prioritized field scoring (Name: 3.0, Tags: 2.0, Description: 1.0) with Robertson-Spärck Jones IDF and document length normalization ($k_1=1.2, b=0.75$).
+
 ## Commands
 
 ```bash
-# Search skills by keyword
-uv run python scripts/search_skills.py <keyword>
+# Search skills via Weighted BM25
+uv run python scripts/search_skills.py <query>
 
 # Rebuild catalog index (skills.json)
 uv run python scripts/build_index.py
