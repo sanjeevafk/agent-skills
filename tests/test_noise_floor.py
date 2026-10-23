@@ -54,7 +54,11 @@ def report():
         "contrast": paired_difference(data, "full", "checklist_v2"),
     }
 
-MANUSCRIPT_CANDIDATES = ("MANUSCRIPT_SKILL_ANON.md", "MANUSCRIPT_SKILL.md")
+MANUSCRIPT_CANDIDATES = (
+    "MANUSCRIPT_SKILL_V2_ANON.md",
+    "MANUSCRIPT_SKILL_ANON.md",
+    "MANUSCRIPT_SKILL.md",
+)
 
 
 def manuscript_text() -> str:
@@ -246,14 +250,16 @@ class TestManuscriptAgreement:
         lines = text.splitlines()
         start = next(
             (i for i, l in enumerate(lines)
-             if l.startswith("## 7.") and "Reproduce" in l),
+             if l.lstrip().startswith("#") and "Reproduce" in l),
             None,
         )
         if start is None:
             pytest.skip("disclosure section not found; nothing to scope against")
+        level = len(lines[start]) - len(lines[start].lstrip("#"))
         end = next(
             (i for i in range(start + 1, len(lines))
-             if lines[i].startswith("## 8.")),
+             if lines[i].lstrip().startswith("#")
+             and len(lines[i]) - len(lines[i].lstrip("#")) <= level),
             len(lines),
         )
         return [
@@ -456,7 +462,7 @@ class TestAttritionAccounting:
 
 
 class TestSqrtTwoFactor:
-    """§7.2 / abstract: the error factor is sqrt(2), never 2."""
+    """§5.1.2 / abstract: the error factor is sqrt(2), never 2."""
 
     @staticmethod
     def _manuscript():
@@ -468,7 +474,7 @@ class TestSqrtTwoFactor:
 
         text = self._manuscript()
         assert "overstates the threshold by exactly $\\sqrt{2}$" in text, \
-            "sqrt(2) overstatement not stated in 7.2"
+            "sqrt(2) overstatement not stated in 5.1.2"
         # The mis-statement we must never reintroduce: "by a factor of 2"
         # or "by exactly 2" without the root.
         assert not re.search(r"overstat\w+ the threshold by (a factor of |exactly )2(?![.\d])",

@@ -5,20 +5,14 @@ metadata:
   origin: ECC
 ---
 
-# /search-first — Research Before You Code
-
-Systematizes the "search for existing solutions before implementing" workflow.
+[ENGINEERING IMPLEMENTATION STANDARDS & ARCHITECTURAL CONSTRAINTS]
 
 ## Trigger
-
-Use this skill when:
 - Starting a new feature that likely has existing solutions
 - Adding a dependency or integration
 - The user asks "add X functionality" and you're about to write code
 - Before creating a new utility, helper, or abstraction
-
 ## Workflow
-
 ```
 ┌─────────────────────────────────────────────┐
 │  0. TOOL AVAILABILITY PREFLIGHT             │
@@ -31,42 +25,19 @@ Use this skill when:
 ├─────────────────────────────────────────────┤
 │  2. PARALLEL SEARCH (researcher agent)      │
 │     ┌──────────┐ ┌──────────┐ ┌──────────┐  │
-│     │  npm /   │ │  MCP /   │ │  GitHub / │  │
-│     │  PyPI    │ │  Skills  │ │  Web      │  │
-│     └──────────┘ └──────────┘ └──────────┘  │
-├─────────────────────────────────────────────┤
-│  3. EVALUATE                                │
-│     Score candidates (functionality, maint, │
-│     community, docs, license, deps)         │
-├─────────────────────────────────────────────┤
-│  4. DECIDE                                  │
-│     ┌─────────┐  ┌──────────┐  ┌─────────┐  │
-│     │  Adopt  │  │  Extend  │  │  Build   │  │
-│     │ as-is   │  │  /Wrap   │  │  Custom  │  │
-│     └─────────┘  └──────────┘  └─────────┘  │
-├─────────────────────────────────────────────┤
-│  5. IMPLEMENT                               │
-│     Install package / Configure MCP /       │
+  # ... [syntax pattern continues] ...
 │     Write minimal custom code               │
 └─────────────────────────────────────────────┘
 ```
 
 ## Decision Matrix
-
 | Signal | Action |
 |--------|--------|
 | Exact match, well-maintained, MIT/Apache | **Adopt** — install and use directly |
 | Partial match, good foundation | **Extend** — install + write thin wrapper |
 | Multiple weak matches | **Compose** — combine 2-3 small packages |
 | Nothing suitable found | **Build** — write custom, but informed by research |
-
-## How to Use
-
 ### Step 0: Tool Availability Preflight
-
-This is agent guidance, not an executable setup script. Check only the channels
-that are relevant to the task and project in front of you.
-
 | Channel | Check | If missing |
 |---------|-------|------------|
 | Repository search | `rg --files` and targeted `rg` queries | State that only visible files were inspected |
@@ -74,21 +45,13 @@ that are relevant to the task and project in front of you.
 | GitHub CLI | `gh auth status` | Use public web or local git history only |
 | MCP/docs tools | Available tool list or local MCP config | Fall back to official docs/web search |
 | Skills directory | `ls ~/.claude/skills ~/.codex/skills` where applicable | Say no local skill catalog was available |
-
 ### Quick Mode (inline)
-
-Before writing a utility or adding functionality, mentally run through:
-
-0. Does this already exist in the repo? → `rg` through relevant modules/tests first
-1. Is this a common problem? → Search npm/PyPI
-2. Is there an MCP for this? → Check `~/.claude/settings.json` and search
-3. Is there a skill for this? → Check `~/.claude/skills/`
-4. Is there a GitHub implementation/template? → Run GitHub code search for maintained OSS before writing net-new code
-
+- Does this already exist in the repo? → `rg` through relevant modules/tests first
+- Is this a common problem? → Search npm/PyPI
+- Is there an MCP for this? → Check `~/.claude/settings.json` and search
+- Is there a skill for this? → Check `~/.claude/skills/`
+- Is there a GitHub implementation/template? → Run GitHub code search for maintained OSS before writing net-new code
 ### Full Mode (agent)
-
-For non-trivial functionality, launch the researcher agent:
-
 ```
 Agent(subagent_type="general-purpose", prompt="
   Research existing tools for: [DESCRIPTION]
@@ -100,53 +63,34 @@ Agent(subagent_type="general-purpose", prompt="
 ")
 ```
 
-Older Claude Code docs may call this `Task(...)`; use the current agent/subagent
-tool name exposed by the active harness.
-
-## Search Shortcuts by Category
-
 ### Development Tooling
 - Linting → `eslint`, `ruff`, `textlint`, `markdownlint`
 - Formatting → `prettier`, `black`, `gofmt`
 - Testing → `jest`, `pytest`, `go test`
 - Pre-commit → `husky`, `lint-staged`, `pre-commit`
-
 ### AI/LLM Integration
 - Claude SDK → Context7 for latest docs
 - Prompt management → Check MCP servers
 - Document processing → `unstructured`, `pdfplumber`, `mammoth`
-
 ### Data & APIs
 - HTTP clients → `httpx` (Python), `ky`/`undici` (Node)
 - Validation → `zod` (TS), `pydantic` (Python)
 - Database → Check for MCP servers first
-
 ### Content & Publishing
 - Markdown processing → `remark`, `unified`, `markdown-it`
 - Image optimization → `sharp`, `imagemin`
-
-## Integration Points
-
 ### With planner agent
-The planner should invoke researcher before Phase 1 (Architecture Review):
 - Researcher identifies available tools
 - Planner incorporates them into the implementation plan
 - Avoids "reinventing the wheel" in the plan
-
 ### With architect agent
-The architect should consult researcher for:
 - Technology stack decisions
 - Integration pattern discovery
 - Existing reference architectures
-
 ### With iterative-retrieval skill
-Combine for progressive discovery:
 - Cycle 1: Broad search (npm, PyPI, MCP)
 - Cycle 2: Evaluate top candidates in detail
 - Cycle 3: Test compatibility with project constraints
-
-## Examples
-
 ### Example 1: "Add dead link checking"
 ```
 Need: Check markdown files for broken links
@@ -175,7 +119,6 @@ Result: 1 package + 1 schema file, no custom validation logic
 ```
 
 ## Anti-Patterns
-
 - **Jumping to code**: Writing a utility without checking if one exists
 - **Ignoring MCP**: Not checking if an MCP server already provides the capability
 - **Silent skipping**: Reporting "nothing found" when a search channel was unavailable
