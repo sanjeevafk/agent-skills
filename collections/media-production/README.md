@@ -11,4 +11,5 @@ A curated collection of programmatic video creation, animation, AI generation, a
 - **video-editing**: Automated FFmpeg video pipelines, subtitle burning, and clip composition.
 - **videodb**: Video indexing, scene search, transcription, and streaming infrastructure.
 - **screenshot**: System screen and window capture utility.
+- **openscreen-demo**: Screen recording, trimming, zooming, and demo video production via OpenScreen MCP.
 - **diagrams**: Scribbly hand-drawn whiteboard visual sketches.
