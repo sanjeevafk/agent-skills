@@ -1,11 +1,25 @@
 # Agent Skills Warehouse
 
-A curated cold-storage warehouse and offline catalog of 2,700+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
+A curated cold-storage warehouse and offline catalog of 2,140+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
 
 ## Architecture
 
-1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Hardened suite of ~75 production skills wired into active coding agents (<2,500 prompt tokens per turn).
-2. **Cold-Storage Warehouse (`skills/` & `collections/`):** 556 modular skills across 9 core engineering domains and 2,200+ specialized domain playbooks (cybersecurity, Hugging Face, bioinformatics, financial modeling, reference architectures), loaded dynamically on demand.
+1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **16 core daily drivers** (<1,200 prompt tokens per turn) including `agent-reach`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
+2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,125 specialized domain playbooks** across **28 domain collections** (LLM security & red-teaming, Golang, Rust, design systems, cybersecurity, Hugging Face, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
+
+## Recent Upgrades & Ingestions
+
+- **Promptfoo Red-Teaming & Evals Suite (`collections/ai-evals-promptfoo`):** Ingested first-party agent skills from Promptfoo for non-adversarial eval suites, target provider setups, threat mapping, and redteam vulnerability scans.
+- **Golang Production Skills (`collections/golang-skills`):** Ingested 46 Go playbooks by Samuel Berthe (`samber/cc-skills-golang`) covering concurrency, DI, and performance.
+- **BeautifulRust Idiomatic Suite (`collections/rust-skills`):** Ingested Rust guidelines distilled from Google, Microsoft, and official API conventions.
+- **Design & UI-to-Motion Systems (`collections/design-skills`):** Ingested landing page architecture and showcase motion design playbooks from `elayadesign`.
+- **Web Security SAST (`collections/web-security`):** Ingested Song Jianyang's 14-layer static XSS SAST audit skill (`songjianyang/xss-audit`).
+- **Media Production Additions (`collections/media-production`):** Added `openscreen-demo` for screen recording, zooming, and demo video production via OpenScreen MCP.
+- **English-First Purge & Hardening:** Pruned 1,400+ translation duplicates across 14 language subdirectories to enforce English-first catalog integrity.
+- **Search Engine Optimization (`bin/agent-skills`):** Upgraded SQLite FTS5 engine to weighted BM25 (`bm25(skills_fts, 10.0, 2.0, 1.0, 0.0)`) with exact-match bonus and sub-millisecond retrieval (<0.5 ms).
+- **Active Runtime Streamlining:** Pruned 52+ redundant/niche skills to cold storage, leaving a focused 16-skill active core and saving ~3,000 prompt tokens per turn.
+- **English Anti-Slop Standard:** Deployed official 60.5k-star English [`blader/humanizer`](https://github.com/blader/humanizer) v3.1.0 into active runtime.
+- **Harness Scripts Preserved:** Archived skill evaluation and linting harnesses to `bin/eval_harness/`.
 
 ## Skill Evaluation & Quality Gates
 
@@ -62,12 +76,19 @@ Skill retrieval is powered by a high-precision **Weighted BM25 search engine** (
 ## Commands
 
 ```bash
-# Search skills via Weighted BM25
+# High-speed FTS5 search (<0.5ms) across 2,100+ skills
+agent-skills find <query>
+
+# Print full skill content or file path
+agent-skills show <skill-name>
+agent-skills show <skill-name> -p
+
+# Rebuild catalog SQLite FTS5 index
+agent-skills index --force
+
+# Inspect warehouse statistics
+agent-skills stats
+
+# Search skills via legacy Weighted BM25 Python script
 uv run python scripts/search_skills.py <query>
-
-# Rebuild catalog index (skills.json)
-uv run python scripts/build_index.py
-
-# Validate frontmatter YAML across all skills
-uv run python scripts/check_frontmatter.py
 ```
