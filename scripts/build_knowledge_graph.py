@@ -35,11 +35,11 @@ def build_knowledge_graph():
     def add_link(source, target, relation):
         links.append({"source": source, "target": target, "relation": relation})
 
-    # 1. Add Category & Rule Book nodes
+    # 1. Add Category nodes
     for cat_id, cat_label in categories.items():
         add_node(f"cat:{cat_id}", cat_label, "Category")
 
-    books = ["unified-software-engineering"]
+    books = []
     for b in books:
         add_node(f"book:{b}", f"Rule: {b.replace('-', ' ').title()}", "Rule")
 
