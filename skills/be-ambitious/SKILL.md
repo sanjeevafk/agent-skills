@@ -10,7 +10,7 @@ description: >
 
 # Be Ambitious: Full-Spectrum Task Elevation
 
-Adapted and expanded from Felix Rieseberg (Anthropic) and DannyMac180:
+Adapted and expanded from Felix Rieseberg's [*How to Be More Ambitious: A Tutorial for Humans with Models*](https://felixrieseberg.com/how-to-be-more-ambitious-a-tutorial-for-humans-with-models/) and DannyMac180's [`be-ambitious`](https://github.com/DannyMac180/skills/tree/main/be-ambitious):
 
 > Most AI interactions fail not from model limitations, but from human self-censorship—settling for task execution rather than outcome mastery.
 > True ambition is not scope creep; it is elevating the caliber of execution across **Altitude**, **Depth**, and **Range**.
