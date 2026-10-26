@@ -1,14 +1,16 @@
 # Agent Skills Warehouse
 
-A curated cold-storage warehouse and offline catalog of 2,140+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
+A curated cold-storage warehouse and offline catalog of 2,310+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
 
 ## Architecture
 
-1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **16 core daily drivers** (<1,200 prompt tokens per turn) including `agent-reach`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
-2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,125 specialized domain playbooks** across **28 domain collections** (LLM security & red-teaming, Golang, Rust, design systems, cybersecurity, Hugging Face, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
+1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **17 core daily drivers** (<1,200 prompt tokens per turn) including `agent-reach`, `be-ambitious`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
+2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,300 specialized domain playbooks** across **29 domain collections** (LLM fine-tuning & MLOps, red-teaming & security, Golang, Rust, design systems, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
 
 ## Recent Upgrades & Ingestions
 
+- **NousResearch Hermes Agent Suite (`collections/hermes-agent`):** Ingested 175 novel, production-tested MLOps, LLM fine-tuning (`axolotl`, `accelerate`, `vllm`, `unsloth`, `peft`), multi-agent arbitration (`agent-merge-conflict-arbiter`, `adversarial-ux-test`), recursive knowledge vaults (`llm-wiki`), and domain research playbooks (`arxiv`, `grounded-citations`, `bioinformatics`, `evm`, `solana`), de-duplicating 35 overlaps.
+- **`be-ambitious` Task Elevation (`skills/be-ambitious` & `canonical/be-ambitious`):** Autonomous and flagged (`--depth`, `--altitude`, `--range`, `--all`) meta-skill elevating prompts across Altitude (durable systems), Depth (primary sources, expert tools, outside judge), and Range (noun-to-verb, adversarial red teaming). Inspired by Felix Rieseberg's essay [How to Be More Ambitious: A Tutorial for Humans with Models](https://felixrieseberg.com/how-to-be-more-ambitious-a-tutorial-for-humans-with-models/) and DannyMac180's [`be-ambitious`](https://github.com/DannyMac180/skills/tree/main/be-ambitious).
 - **Promptfoo Red-Teaming & Evals Suite (`collections/ai-evals-promptfoo`):** Ingested first-party agent skills from Promptfoo for non-adversarial eval suites, target provider setups, threat mapping, and redteam vulnerability scans.
 - **Golang Production Skills (`collections/golang-skills`):** Ingested 46 Go playbooks by Samuel Berthe (`samber/cc-skills-golang`) covering concurrency, DI, and performance.
 - **BeautifulRust Idiomatic Suite (`collections/rust-skills`):** Ingested Rust guidelines distilled from Google, Microsoft, and official API conventions.
