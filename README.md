@@ -1,11 +1,21 @@
 # Agent Skills Warehouse
 
-A curated cold-storage warehouse and offline catalog of 2,310+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
+A curated cold-storage warehouse and offline catalog of 2,330+ specialized agent skill suites across Claude Code, Google Antigravity, OpenAI Codex, OpenCode, and Pi.
+
+## Quick Start
+
+```bash
+./bin/agent-skills find "red teaming"   # keyword search (SQLite FTS5, BM25)
+./bin/agent-skills show <skill>         # print a skill's content or path
+./bin/agent-skills list                 # list collections
+./bin/agent-skills stats                # index statistics
+./bin/agent-skills index                # rebuild the search index
+```
 
 ## Architecture
 
-1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **17 core daily drivers** (<1,200 prompt tokens per turn) including `agent-reach`, `be-ambitious`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
-2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,300 specialized domain playbooks** across **29 domain collections** (LLM fine-tuning & MLOps, red-teaming & security, Golang, Rust, design systems, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
+1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **28 core daily drivers** (symlinks into `skills/` and `collections/`) including `agent-reach`, `be-ambitious`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
+2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,300+ specialized domain playbooks** across **34 domain collections** (LLM fine-tuning & MLOps, red-teaming & security, Golang, Rust, design systems, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
 
 ## Recent Upgrades & Ingestions
 
