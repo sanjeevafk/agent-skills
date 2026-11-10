@@ -1,6 +1,7 @@
 ---
 name: shiori
-description: Connect to the user's Shiori link library via MCP. Use when they want to search, save, list, tag, favorite, or manage saved links and RSS subscriptions. Prefer the remote MCP server at https://www.shiori.sh/mcp. Call whoami before treating the connection as live. Use search_links for topics, list_links for metadata filters (including favorites), get_links for full content, save_link to capture URLs, and save_markdown when they have text and no URL. Optional CLI: shiori auth.
+description: >-
+  Connect to the user's Shiori link library via MCP. Use when they want to search, save, list, tag, favorite, or manage saved links and RSS subscriptions. Prefer the remote MCP server at https://www.shiori.sh/mcp. Call whoami before treating the connection as live. Use search_links for topics, list_links for metadata filters (including favorites), get_links for full content, save_link to capture URLs, and save_markdown when they have text and no URL. Optional CLI: shiori auth.
 ---
 
 # Shiori
