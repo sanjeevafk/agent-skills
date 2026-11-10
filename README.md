@@ -4,6 +4,8 @@ A curated cold-storage warehouse and offline catalog of 2,330+ specialized agent
 
 ## Quick Start
 
+Binary media (images, audio, video) is kept out of git and published as release assets. After cloning, run `python3 scripts/fetch_media.py` once to restore it (checksums in `media.lock`). Search, indexing and skill text work without it.
+
 ```bash
 ./bin/agent-skills find "red teaming"   # keyword search (SQLite FTS5, BM25)
 ./bin/agent-skills show <skill>         # print a skill's content or path
