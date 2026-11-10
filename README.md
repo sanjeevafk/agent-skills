@@ -12,6 +12,8 @@ A curated cold-storage warehouse and offline catalog of 2,330+ specialized agent
 ./bin/agent-skills index                # rebuild the search index
 ```
 
+> **Frozen benchmark snapshot.** `skills.json`, `skills_manifest.json`, `skills_canonical.json` and `skills_embeddings.npy` hold the 522-skill routable catalogue (531 before dedup) that the paper's router experiments and `tests/test_paper_claims.py` rely on. They are deliberately **not** regenerated when the warehouse grows. The live search index (`agent-skills index`) covers the full warehouse and is the source of the skill counts above.
+
 ## Architecture
 
 1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **28 core daily drivers** (symlinks into `skills/` and `collections/`) including `agent-reach`, `be-ambitious`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
