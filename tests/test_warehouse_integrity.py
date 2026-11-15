@@ -21,29 +21,28 @@ def _same_tree(a, b):
 
 
 class TestWarehouseIntegrity(unittest.TestCase):
-    def test_canonical_matches_manifest_and_resolves(self):
-        listed = set(_manifest()["canonical"]["skills"])
-        actual = set(os.listdir(os.path.join(ROOT, "canonical")))
-        self.assertEqual(listed, actual)
-        for name in actual:
-            path = os.path.join(ROOT, "canonical", name)
-            self.assertTrue(os.path.islink(path), f"canonical/{name} must be a symlink")
-            self.assertTrue(os.path.isfile(os.path.join(path, "SKILL.md")), f"canonical/{name} is broken")
-
     def test_no_untracked_duplicates(self):
         """A real dir in skills/ that also exists in collections/ must be a declared fork."""
         forks = _manifest()["forks"]
+        # Index all SKILL.md directories at any depth under collections/
+        col_skills = {}
+        for dirpath, _, filenames in os.walk(os.path.join(ROOT, "collections")):
+            if "SKILL.md" in filenames:
+                col_skills.setdefault(os.path.basename(dirpath), []).append(dirpath)
+
         for name in sorted(os.listdir(os.path.join(ROOT, "skills"))):
             local = os.path.join(ROOT, "skills", name)
             if os.path.islink(local) or not os.path.isdir(local):
                 continue
+            for up in col_skills.get(name, []):
+                if _same_tree(local, up):
+                    if name in forks:
+                        self.fail(f"fork '{name}' is identical to upstream; symlink it and drop it from [forks]")
+                    self.fail(f"skills/{name} duplicates {os.path.relpath(up, ROOT)}; replace with a symlink")
             for up in glob.glob(os.path.join(ROOT, "collections", "*", name)):
                 if not os.path.isdir(up):
                     continue
-                if name in forks:
-                    self.assertFalse(_same_tree(local, up), f"fork '{name}' is identical to upstream; symlink it and drop it from [forks]")
-                else:
-                    self.assertFalse(_same_tree(local, up), f"skills/{name} duplicates {os.path.relpath(up, ROOT)}; replace with a symlink")
+                if name not in forks:
                     self.fail(f"skills/{name} diverges from {os.path.relpath(up, ROOT)}; add it to [forks] in warehouse.toml")
 
     def test_forks_still_exist(self):
@@ -52,11 +51,10 @@ class TestWarehouseIntegrity(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(ROOT, upstream)), upstream)
 
     def test_no_broken_symlinks(self):
-        for base in ("skills", "canonical"):
-            for name in os.listdir(os.path.join(ROOT, base)):
-                p = os.path.join(ROOT, base, name)
-                if os.path.islink(p):
-                    self.assertTrue(os.path.exists(p), f"{base}/{name} is a broken symlink")
+        for name in os.listdir(os.path.join(ROOT, "skills")):
+            p = os.path.join(ROOT, "skills", name)
+            if os.path.islink(p):
+                self.assertTrue(os.path.exists(p), f"skills/{name} is a broken symlink")
 
 
 if __name__ == "__main__":

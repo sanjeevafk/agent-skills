@@ -18,8 +18,8 @@ Binary media (images, audio, video) is kept out of git and published as release 
 
 ## Architecture
 
-1. **Active Runtime Tier (`canonical/`, mirrored to `~/.agents/skills/`):** Streamlined set of **28 core daily drivers** (symlinks into `skills/` and `collections/`) including `agent-reach`, `be-ambitious`, `skill-router`, `code-review`, `systematic-debugging`, `tdd`, `humanizer`, and `bro`.
-2. **Cold-Storage Warehouse (`collections/` & `skills/`):** **2,300+ specialized domain playbooks** across **34 domain collections** (LLM fine-tuning & MLOps, red-teaming & security, Golang, Rust, design systems, bioinformatics, financial modeling), retrievable JIT in <0.5 ms.
+1. **On-Demand Router (`skills/skill-router` + `./bin/agent-skills`):** Single active entry point that discovers and loads specialized skills JIT in <0.5 ms without bloating the system prompt.
+2. **Warehouse Storage (`collections/` & `skills/`):** **2,300+ specialized domain playbooks** across **34 domain collections** (LLM fine-tuning & MLOps, red-teaming & security, Golang, Rust, design systems, bioinformatics, financial modeling). Identical skills in `skills/` symlink to `collections/`.
 
 ## Recent Upgrades & Ingestions
 
