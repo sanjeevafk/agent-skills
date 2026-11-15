@@ -10,7 +10,7 @@ description: >-
 
 # Skill Router (Dynamic Warehouse Bridge)
 
-The active environment maintains exactly 76 canonical production skills to preserve context memory and eliminate prompt bloat. All remaining 2,000+ domain skills reside in the offline **Agent Skills Warehouse** (`agent-skills`).
+To preserve context memory and eliminate prompt bloat, `skill-router` acts as the single active entry point into the offline **Agent Skills Warehouse** (`collections/` and `skills/`, 2,000+ domain playbooks).
 
 Use this router to dynamically discover and load any specialized warehouse skill into your working context on-demand.
 
@@ -18,7 +18,7 @@ Use this router to dynamically discover and load any specialized warehouse skill
 
 ## 1. When to Use the Router
 
-Trigger this router whenever the user asks for a capability outside the 76 canonical engineering skills, including:
+Trigger this router whenever a task requires specialized domain knowledge or playbooks, including:
 - **Financial Services & Valuation:** DCF modeling, LBO transactions, 3-statement modeling, equity research, credit analysis, pitch decks.
 - **AI / Machine Learning Ecosystems:** Hugging Face Hub, TRL fine-tuning (SFT, DPO, GRPO), Kaggle benchmarks/judging (`kbench`), Gradio apps.
 - **Media & Creative:** `fframes-video` (GPU Skia/Rust/SVG rendering), Fal.ai media pipelines, VideoDB indexing.
