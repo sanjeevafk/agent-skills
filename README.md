@@ -42,6 +42,7 @@ All skills in this warehouse are evaluated and pre-screened using the 3-arm eval
 * **Linter & Density Gate:** Enforces directive density (>= 1.5 directives/KB), spec formatting, and security checks via `skill-lint`.
 * **3-Arm Empirical Evaluation:** Benchmarks candidate skills against Baseline (Arm A) and Length Control (Arm C) via `skill-eval`.
 * **Audit Suite:** Sweeps active directories for context bloaters via `skill-audit`.
+* **NVIDIA SkillEvaluator CI (Tier 1, Advisory):** Runs no-LLM static, security (`SkillSpector`, `Gitleaks`, `Semgrep`, `bandit`), PII/Unicode, and cross-harness compatibility checks on changed `skills/**` and `collections/**` in PRs via [`.github/workflows/skill-checks.yml`](.github/workflows/skill-checks.yml).
 * **Warehouse Skill:** Available on-demand via [`skills/skill-evals`](skills/skill-evals).
 
 ## Skill Discovery & Search Architecture
